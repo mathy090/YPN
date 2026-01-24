@@ -1,12 +1,82 @@
-const mongoose = require("mongoose");
+// backend/server.js
+const express = require('express');
+const { MongoClient } = require('mongodb');
+const cors = require('cors');
+const multer = require('multer');
+const GridFsStorage = require('multer-gridfs-storage');
+const Grid = require('gridfs-stream');
 
-const UserSchema = new mongoose.Schema({
-  phone: { type: String, unique: true, required: true },
-  username: { type: String },
-  emailBackup: { type: String }, // optional
-  otp: String,
-  otpExpires: Date,
-  isVerified: { type: Boolean, default: false },
-}, { timestamps: true });
+const app = express();
+app.use(express.json());
+app.use(cors());
 
-module.exports = mongoose.model("User", UserSchema);
+// MongoDB connection
+const uri = "mongodb+srv://tafadzwarunowanda_db_user:mathews##$090@ypn.owiuemn.mongodb.net/?appName=YPN";
+const client = new MongoClient(uri);
+
+let db;
+let gfs;
+
+async function connectDB() {
+  await client.connect();
+  db = client.db('ypn_users');
+  gfs = Grid(db, client);
+  gfs.collection('photos');
+  console.log('Connected to MongoDB');
+}
+
+connectDB();
+
+// Multer setup for GridFS
+const storage = new GridFsStorage({
+  client,
+  db: 'ypn_users',
+  file: (req, file) => {
+    return {
+      filename: `${req.body.uid}_${Date.now()}`,
+      bucketName: 'photos'
+    };
+  }
+});
+
+const upload = multer({ storage });
+
+// Save user profile endpoint
+app.post('/api/users', upload.single('photo'), async (req, res) => {
+  try {
+    const { uid, name, email } = req.body;
+    const photoPath = req.file ? `/photos/${req.file.filename}` : null;
+
+    const userData = {
+      uid,
+      name,
+      email,
+      photoPath,
+      createdAt: new Date()
+    };
+
+    const result = await db.collection('profiles').insertOne(userData);
+    res.json({ success: true, id: result.insertedId });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Serve photos
+app.get('/photos/:filename', async (req, res) => {
+  try {
+    const { filename } = req.params;
+    const file = await gfs.findOne({ filename });
+
+    if (!file) return res.status(404).send('File not found');
+
+    const readStream = gfs.createReadStream(file.filename);
+    readStream.pipe(res);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.listen(process.env.PORT || 3000, () => {
+  console.log(`Server running on port ${process.env.PORT || 3000}`);
+});
