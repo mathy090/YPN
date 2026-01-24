@@ -56,8 +56,13 @@ export default function OTP() {
       
       router.replace('/auth/device');
     } catch (err: any) {
-      // Hide server error messages - only show generic message
-      setError('Invalid email or password');
+      // Handle network error specifically
+      if (err.code === 'auth/network-request-failed') {
+        setError('No internet connection. Please check your network and try again.');
+      } else {
+        // Hide other server error messages - only show generic message
+        setError('Invalid email or password');
+      }
       console.error('Login error:', err); // Log for debugging but don't show to user
     }
   };

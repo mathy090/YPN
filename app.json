@@ -47,7 +47,10 @@
       "expo-font",
       "expo-secure-store",
       "expo-sqlite",
-      "expo-barcode-scanner"
+      
+      "@react-native-google-signin/google-signin",
+      "react-native-localize",
+      "@react-native-community/datetimepicker"
     ],
     "experiments": {
       "typedRoutes": true,

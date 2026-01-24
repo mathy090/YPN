@@ -1,11 +1,11 @@
+// app/auth/device.tsx
+
 import * as ImagePicker from 'expo-image-picker';
 import { useRouter } from 'expo-router';
 import { getAuth, updateProfile } from 'firebase/auth';
-import { doc, serverTimestamp, setDoc } from 'firebase/firestore';
-import { getDownloadURL, ref, uploadBytes } from 'firebase/storage';
 import { useEffect, useState } from 'react';
 import {
-  ActivityIndicator,
+  Alert,
   BackHandler,
   Image,
   Platform,
@@ -15,8 +15,6 @@ import {
   View,
 } from 'react-native';
 
-import { db } from '../../src/firebase/firestore';
-import { storage } from '../../src/firebase/storage';
 import { useAuth } from '../../src/store/authStore';
 import { colors } from '../../src/theme/colors';
 import Screen from '../../src/ui/Screen';
@@ -58,17 +56,32 @@ export default function Device() {
     }
   };
 
-  /* Upload photo (optional) */
-  const uploadProfilePhoto = async (uid: string): Promise<string | null> => {
-    if (!photo) return null;
+  /* Save to MongoDB */
+  const saveToMongoDB = async (uid: string, name: string, photoUri: string | null) => {
+    const formData = new FormData();
+    formData.append('uid', uid);
+    formData.append('name', name);
+    formData.append('email', getAuth().currentUser?.email || '');
+    
+    if (photoUri) {
+      formData.append('photo', {
+        uri: photoUri,
+        type: 'image/jpeg',
+        name: 'profile.jpg'
+      });
+    }
 
-    const response = await fetch(photo);
-    const blob = await response.blob();
-
-    const fileRef = ref(storage, `profiles/${uid}.jpg`);
-    await uploadBytes(fileRef, blob);
-
-    return await getDownloadURL(fileRef);
+    try {
+      const response = await fetch('YOUR_RENDER_URL/api/users', {
+        method: 'POST',
+        body: formData,
+        headers: { 'Accept': 'application/json' }
+      });
+      return await response.json();
+    } catch (error) {
+      console.error('MongoDB save error:', error);
+      throw error;
+    }
   };
 
   /* Finish setup */
@@ -82,33 +95,20 @@ export default function Device() {
       const user = auth.currentUser;
       if (!user) throw new Error('No user');
 
-      // Upload photo if exists
-      const photoURL = await uploadProfilePhoto(user.uid);
-
       // Update Auth profile
       await updateProfile(user, {
         displayName: name.trim(),
-        photoURL: photoURL ?? undefined,
+        photoURL: photo ? photo : undefined,
       });
 
-      // Save Firestore profile
-      await setDoc(
-        doc(db, 'users', user.uid),
-        {
-          uid: user.uid,
-          name: name.trim(),
-          email: user.email,
-          photoURL: photoURL ?? null,
-          createdAt: serverTimestamp(),
-          lastSeen: serverTimestamp(),
-        },
-        { merge: true }
-      );
+      // Save to MongoDB
+      await saveToMongoDB(user.uid, name.trim(), photo || null);
 
       login(); // local auth store
-      router.replace('/tabs/chats'); // 🚀 INSTANT like WhatsApp
+      router.replace('/tabs/chats'); // Navigate to main app
     } catch (e) {
       console.error(e);
+      Alert.alert('Error', 'Failed to save profile. Please try again.');
       setLoading(false);
     }
   };
@@ -172,7 +172,7 @@ export default function Device() {
           }}
         >
           {loading ? (
-            <ActivityIndicator color="#000" />
+            <Text style={{ color: '#000', fontWeight: 'bold' }}>Saving...</Text>
           ) : (
             <Text style={{ color: '#000', fontWeight: 'bold' }}>Next</Text>
           )}
