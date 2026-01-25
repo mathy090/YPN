@@ -3,15 +3,15 @@ const express = require('express');
 const { MongoClient } = require('mongodb');
 const cors = require('cors');
 const multer = require('multer');
-const GridFsStorage = require('multer-gridfs-storage');
+const { GridFsStorage } = require('multer-gridfs-storage');
 const Grid = require('gridfs-stream');
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-// MongoDB connection
-const uri = "mongodb+srv://tafadzwarunowanda_db_user:mathews##$090@ypn.owiuemn.mongodb.net/?appName=YPN";
+// MongoDB connection with encoded password
+const uri = "mongodb+srv://tafadzwarunowanda_db_user:mathews%23%23%24090@ypn.owiuemn.mongodb.net/?appName=YPN";
 const client = new MongoClient(uri);
 
 let db;
@@ -29,13 +29,13 @@ connectDB();
 
 // Multer setup for GridFS
 const storage = new GridFsStorage({
-  client,
+  client: client,
   db: 'ypn_users',
-  file: (req, file) => {
-    return {
-      filename: `${req.body.uid}_${Date.now()}`,
-      bucketName: 'photos'
-    };
+  options: {
+    bucketName: 'photos'
+  },
+  filename: (req, file) => {
+    return `${req.body.uid}_${Date.now()}`;
   }
 });
 
@@ -77,6 +77,7 @@ app.get('/photos/:filename', async (req, res) => {
   }
 });
 
-app.listen(process.env.PORT || 3000, () => {
-  console.log(`Server running on port ${process.env.PORT || 3000}`);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
