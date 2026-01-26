@@ -1,15 +1,20 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
 from openai import OpenAI
 
-# Load environment variables
+# =====================
+# Load environment
+# =====================
 load_dotenv()
 
 # OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# =====================
+# FastAPI app
+# =====================
 app = FastAPI()
 
 # =====================
@@ -22,8 +27,13 @@ class ChatRequest(BaseModel):
 # Root / health check
 # =====================
 @app.get("/")
-async def root():
+async def root_get():
     return {"status": "YPN AI service alive"}
+
+# HEAD / endpoint for monitors → returns 200 OK instead of 405
+@app.head("/")
+async def root_head():
+    return Response(status_code=200)
 
 # =====================
 # Chat endpoint
@@ -52,14 +62,14 @@ async def chat(request: ChatRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 # =====================
 # Run server (Render)
 # =====================
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 10000))
     import uvicorn
+    port = int(os.getenv("PORT", 10000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
+
 
 
 
