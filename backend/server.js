@@ -1,83 +1,111 @@
 // backend/server.js
 const express = require('express');
-const { MongoClient } = require('mongodb');
+const { MongoClient, GridFSBucket } = require('mongodb');
 const cors = require('cors');
 const multer = require('multer');
 const { GridFsStorage } = require('multer-gridfs-storage');
-const Grid = require('gridfs-stream');
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-// MongoDB connection with encoded password
-const uri = "mongodb+srv://tafadzwarunowanda_db_user:mathews%23%23%24090@ypn.owiuemn.mongodb.net/?appName=YPN";
+// MongoDB URI (encoded password is correct ✅)
+const uri =
+  "mongodb+srv://tafadzwarunowanda_db_user:mathews%23%23%24090@ypn.owiuemn.mongodb.net/ypn_users?retryWrites=true&w=majority";
+
 const client = new MongoClient(uri);
 
 let db;
-let gfs;
+let gfsBucket;
 
+/* =========================
+   CONNECT ONCE
+========================= */
 async function connectDB() {
   await client.connect();
-  db = client.db('ypn_users');
-  gfs = Grid(db, client);
-  gfs.collection('photos');
-  console.log('Connected to MongoDB');
+
+  db = client.db(); // ✅ native Db
+  gfsBucket = new GridFSBucket(db, { bucketName: 'photos' });
+
+  console.log('✅ MongoDB connected with GridFSBucket');
 }
 
 connectDB();
 
-// Multer setup for GridFS
+/* =========================
+   MULTER GRIDFS STORAGE
+========================= */
 const storage = new GridFsStorage({
-  client: client,
-  db: 'ypn_users',
-  options: {
-    bucketName: 'photos'
+  url: uri,
+  file: (req, file) => {
+    return {
+      bucketName: 'photos',
+      filename: `${req.body.uid}_${Date.now()}_${file.originalname}`,
+    };
   },
-  filename: (req, file) => {
-    return `${req.body.uid}_${Date.now()}`;
-  }
 });
 
 const upload = multer({ storage });
 
-// Save user profile endpoint
+/* =========================
+   SAVE USER PROFILE
+========================= */
 app.post('/api/users', upload.single('photo'), async (req, res) => {
   try {
     const { uid, name, email } = req.body;
-    const photoPath = req.file ? `/photos/${req.file.filename}` : null;
+
+    const photoPath = req.file
+      ? `/photos/${req.file.filename}`
+      : null;
 
     const userData = {
       uid,
       name,
       email,
       photoPath,
-      createdAt: new Date()
+      createdAt: new Date(),
     };
 
     const result = await db.collection('profiles').insertOne(userData);
-    res.json({ success: true, id: result.insertedId });
+
+    res.json({
+      success: true,
+      id: result.insertedId,
+      photoPath,
+    });
   } catch (error) {
+    console.error(error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Serve photos
+/* =========================
+   STREAM PHOTO
+========================= */
 app.get('/photos/:filename', async (req, res) => {
   try {
     const { filename } = req.params;
-    const file = await gfs.findOne({ filename });
 
-    if (!file) return res.status(404).send('File not found');
+    const files = await db
+      .collection('photos.files')
+      .findOne({ filename });
 
-    const readStream = gfs.createReadStream(file.filename);
+    if (!files) {
+      return res.status(404).send('File not found');
+    }
+
+    const readStream = gfsBucket.openDownloadStreamByName(filename);
     readStream.pipe(res);
   } catch (error) {
+    console.error(error);
     res.status(500).json({ error: error.message });
   }
 });
 
+/* =========================
+   START SERVER
+========================= */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
