@@ -4,27 +4,30 @@ from dotenv import load_dotenv
 import os
 from openai import OpenAI
 
-# Load environment variables from .env
+# Load environment variables
 load_dotenv()
 
 # OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-app = FastAPI(title="YPN AI Backend", version="1.0")
+app = FastAPI()
 
-# ----------------------
-# Root / Health Endpoint
-# ----------------------
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "YPN AI Backend"}
-
-# ----------------------
-# Chat Endpoint
-# ----------------------
+# =====================
+# Models
+# =====================
 class ChatRequest(BaseModel):
     message: str
 
+# =====================
+# Root / health check
+# =====================
+@app.get("/")
+async def root():
+    return {"status": "YPN AI service alive"}
+
+# =====================
+# Chat endpoint
+# =====================
 @app.post("/chat")
 async def chat(request: ChatRequest):
     user_message = request.message.strip()
@@ -34,7 +37,7 @@ async def chat(request: ChatRequest):
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",  # fast + cheap + strong
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a helpful AI assistant for YPN Zimbabwe."},
                 {"role": "user", "content": user_message}
@@ -49,14 +52,14 @@ async def chat(request: ChatRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ----------------------
-# Optional: favicon to reduce 404 spam
-# ----------------------
-from fastapi.responses import FileResponse
 
-@app.get("/favicon.ico")
-def favicon():
-    # Create an empty favicon file or place one in your assets folder
-    return FileResponse(os.path.join("assets", "favicon.ico"))  # optional
+# =====================
+# Run server (Render)
+# =====================
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 10000))
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
+
 
 
