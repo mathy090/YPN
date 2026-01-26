@@ -1,10 +1,9 @@
 // backend/server.js
 const express = require('express');
-const { MongoClient } = require('mongodb');
+const { MongoClient, GridFSBucket } = require('mongodb');
 const cors = require('cors');
 const multer = require('multer');
 const { GridFsStorage } = require('multer-gridfs-storage');
-const Grid = require('gridfs-stream');
 
 const app = express();
 
@@ -34,14 +33,13 @@ const uri =
 const client = new MongoClient(uri);
 
 let db;
-let gfs;
+let bucket;
 
 async function connectDB() {
   await client.connect();
-  db = client.db('ypn_users');
-  gfs = Grid(db, client);
-  gfs.collection('photos');
-  console.log('✅ Connected to MongoDB');
+  db = client.db('ypn_users'); // 🔥 must be Db object
+  bucket = new GridFSBucket(db, { bucketName: 'photos' });
+  console.log('✅ Connected to MongoDB with GridFSBucket');
 }
 
 connectDB().catch(err => {
@@ -52,11 +50,10 @@ connectDB().catch(err => {
    Multer GridFS
 ===================== */
 const storage = new GridFsStorage({
-  client,
-  db: 'ypn_users',
+  db: db, // pass Db object, not client
   file: (req, file) => ({
-    filename: `${Date.now()}_${file.originalname}`,
     bucketName: 'photos',
+    filename: `${req.body.uid || 'user'}_${Date.now()}`,
   }),
 });
 
@@ -108,14 +105,16 @@ app.post('/api/users', upload.single('photo'), async (req, res) => {
 });
 
 /* =====================
-   Serve Photos
+   Serve Photos (GridFSBucket)
 ===================== */
 app.get('/photos/:filename', async (req, res) => {
   try {
-    const file = await gfs.findOne({ filename: req.params.filename });
-    if (!file) return res.status(404).send('Not found');
+    const { filename } = req.params;
 
-    gfs.createReadStream(file.filename).pipe(res);
+    const files = await db.collection('photos.files').find({ filename }).toArray();
+    if (!files.length) return res.status(404).send('Not found');
+
+    bucket.openDownloadStreamByName(filename).pipe(res);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -128,5 +127,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on ${PORT}`);
 });
-
-
