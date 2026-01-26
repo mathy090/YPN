@@ -14,7 +14,7 @@ app.use(cors());
 app.use(express.json());
 
 /* =====================
-   Health Check (REQUIRED)
+   Health Check
 ===================== */
 app.get('/', (req, res) => {
   res.status(200).json({
@@ -34,33 +34,31 @@ const client = new MongoClient(uri);
 
 let db;
 let bucket;
+let upload; // multer upload will be initialized after DB connects
 
 async function connectDB() {
   await client.connect();
-  db = client.db('ypn_users'); // 🔥 must be Db object
+  db = client.db('ypn_users');
   bucket = new GridFSBucket(db, { bucketName: 'photos' });
+
   console.log('✅ Connected to MongoDB with GridFSBucket');
+
+  // Initialize multer-gridfs-storage AFTER db is ready
+  const storage = new GridFsStorage({
+    db: db,
+    file: (req, file) => ({
+      bucketName: 'photos',
+      filename: `${req.body.uid || 'user'}_${Date.now()}`,
+    }),
+  });
+
+  upload = multer({ storage });
 }
 
-connectDB().catch(err => {
-  console.error('Mongo failed:', err);
-});
+connectDB().catch(err => console.error('Mongo failed:', err));
 
 /* =====================
-   Multer GridFS
-===================== */
-const storage = new GridFsStorage({
-  db: db, // pass Db object, not client
-  file: (req, file) => ({
-    bucketName: 'photos',
-    filename: `${req.body.uid || 'user'}_${Date.now()}`,
-  }),
-});
-
-const upload = multer({ storage });
-
-/* =====================
-   AI CHAT ENDPOINT (FIXED)
+   AI CHAT ENDPOINT
 ===================== */
 app.post('/ai-response', async (req, res) => {
   try {
@@ -70,49 +68,52 @@ app.post('/ai-response', async (req, res) => {
       return res.status(400).json({ error: 'Message is required' });
     }
 
-    // 🔹 TEMP SAFE AI RESPONSE
     res.status(200).json({
       reply: `YPN Team received: ${message}`,
     });
   } catch (err) {
     console.error('AI error:', err);
-    res.status(500).json({
-      error: 'AI failed',
-    });
+    res.status(500).json({ error: 'AI failed' });
   }
 });
 
 /* =====================
    Profile Upload
 ===================== */
-app.post('/api/users', upload.single('photo'), async (req, res) => {
-  try {
-    const { uid, name, email } = req.body;
+app.post('/api/users', async (req, res) => {
+  if (!upload) return res.status(503).send('Server still starting, try again');
 
-    const user = {
-      uid,
-      name,
-      email,
-      photoPath: req.file ? `/photos/${req.file.filename}` : null,
-      createdAt: new Date(),
-    };
+  upload.single('photo')(req, res, async (err) => {
+    if (err) return res.status(500).json({ error: err.message });
 
-    const result = await db.collection('profiles').insertOne(user);
-    res.json({ success: true, id: result.insertedId });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    try {
+      const { uid, name, email } = req.body;
+
+      const user = {
+        uid,
+        name,
+        email,
+        photoPath: req.file ? `/photos/${req.file.filename}` : null,
+        createdAt: new Date(),
+      };
+
+      const result = await db.collection('profiles').insertOne(user);
+      res.json({ success: true, id: result.insertedId, filename: req.file?.filename || null });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
 });
 
 /* =====================
-   Serve Photos (GridFSBucket)
+   Serve Photos
 ===================== */
 app.get('/photos/:filename', async (req, res) => {
   try {
     const { filename } = req.params;
 
     const files = await db.collection('photos.files').find({ filename }).toArray();
-    if (!files.length) return res.status(404).send('Not found');
+    if (!files.length) return res.status(404).send('File not found');
 
     bucket.openDownloadStreamByName(filename).pipe(res);
   } catch (e) {
@@ -125,5 +126,6 @@ app.get('/photos/:filename', async (req, res) => {
 ===================== */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
+
