@@ -59,3 +59,4 @@ def favicon():
     # Create an empty favicon file or place one in your assets folder
     return FileResponse(os.path.join("assets", "favicon.ico"))  # optional
 
+
