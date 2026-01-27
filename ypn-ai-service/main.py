@@ -2,7 +2,6 @@ from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
-from openai import OpenAI
 import cohere  # Cohere Chat API
 
 # =====================
@@ -10,11 +9,7 @@ import cohere  # Cohere Chat API
 # =====================
 load_dotenv()
 
-# OpenAI clients
-client1 = OpenAI(api_key=os.getenv("OPENAI_API_KEY1"))
-client2 = OpenAI(api_key=os.getenv("OPENAI_API_KEY2"))
-
-# Cohere client (fallback)
+# Cohere client
 co = cohere.Client(api_key=os.getenv("COHERE_API_KEY"))
 
 # =====================
@@ -48,44 +43,22 @@ async def chat(request: ChatRequest):
     if not user_message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
-    last_exception = None
-
-    # Try OpenAI keys first
-    for api_name, client in [("OpenAI Key 1", client1), ("OpenAI Key 2", client2)]:
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a helpful AI assistant for YPN Zimbabwe."},
-                    {"role": "user", "content": user_message}
-                ],
-                max_tokens=300,
-                temperature=0.7
-            )
-            reply = response.choices[0].message.content
-            return {"reply": reply}
-        except Exception as e:
-            last_exception = e
-            continue
-
-    # Fallback to Cohere Chat API
     try:
+        # Cohere chat expects message as a string
+        prompt = f"You are a helpful AI assistant for YPN Zimbabwe.\nUser: {user_message}\nAI:"
+
         response = co.chat(
             model="command-xlarge-nightly",
-            message={
-                "role": "user",
-                "content": "You are a helpful AI assistant for YPN Zimbabwe.\n" + user_message
-            },
+            message=prompt,
             max_tokens=300,
             temperature=0.7
         )
+
         reply = response.output[0].content.strip()
         return {"reply": reply}
-    except Exception as e:
-        last_exception = e
 
-    # If all APIs fail
-    raise HTTPException(status_code=500, detail=f"All AI APIs failed. Last error: {last_exception}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cohere API failed: {e}")
 
 # =====================
 # Run server (Render)
@@ -94,5 +67,6 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 10000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
+
 
 
