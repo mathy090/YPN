@@ -10,15 +10,11 @@ import cohere  # Cohere Chat API
 # =====================
 load_dotenv()
 
-# =====================
 # OpenAI clients
-# =====================
 client1 = OpenAI(api_key=os.getenv("OPENAI_API_KEY1"))
 client2 = OpenAI(api_key=os.getenv("OPENAI_API_KEY2"))
 
-# =====================
 # Cohere client (fallback)
-# =====================
 co = cohere.Client(api_key=os.getenv("COHERE_API_KEY"))
 
 # =====================
@@ -49,13 +45,12 @@ async def root_head():
 @app.post("/chat")
 async def chat(request: ChatRequest):
     user_message = request.message.strip()
-
     if not user_message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
     last_exception = None
 
-    # --- Try OpenAI first ---
+    # Try OpenAI keys first
     for api_name, client in [("OpenAI Key 1", client1), ("OpenAI Key 2", client2)]:
         try:
             response = client.chat.completions.create(
@@ -71,25 +66,25 @@ async def chat(request: ChatRequest):
             return {"reply": reply}
         except Exception as e:
             last_exception = e
-            continue  # try next key if quota or other error
+            continue
 
-    # --- Fallback to Cohere Chat API ---
+    # Fallback to Cohere Chat API
     try:
         response = co.chat(
             model="command-xlarge-nightly",
-            messages=[
-                {"role": "system", "content": "You are a helpful AI assistant for YPN Zimbabwe."},
-                {"role": "user", "content": user_message}
-            ],
-            max_output_tokens=300
+            message={
+                "role": "user",
+                "content": "You are a helpful AI assistant for YPN Zimbabwe.\n" + user_message
+            },
+            max_tokens=300,
+            temperature=0.7
         )
-        reply = response.output[0].content
+        reply = response.output[0].content.strip()
         return {"reply": reply}
-
     except Exception as e:
         last_exception = e
 
-    # --- If all APIs fail ---
+    # If all APIs fail
     raise HTTPException(status_code=500, detail=f"All AI APIs failed. Last error: {last_exception}")
 
 # =====================
@@ -99,4 +94,5 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 10000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
+
 
