@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
-import cohere  # Cohere Chat API
+import cohere
 
 # =====================
 # Load environment
@@ -40,21 +40,26 @@ async def root_head():
 @app.post("/chat")
 async def chat(request: ChatRequest):
     user_message = request.message.strip()
+
     if not user_message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
     try:
-        # Cohere chat expects message as a string
-        prompt = f"You are a helpful AI assistant for YPN Zimbabwe.\nUser: {user_message}\nAI:"
+        prompt = (
+            "You are a helpful AI assistant for YPN Zimbabwe.\n"
+            f"User: {user_message}\n"
+            "AI:"
+        )
 
         response = co.chat(
             model="command-xlarge-nightly",
             message=prompt,
-            max_tokens=300,
-            temperature=0.7
+            temperature=0.7,
+            max_tokens=300
         )
 
-        reply = response.output[0].content.strip()
+        # ✅ CORRECT FIELD
+        reply = response.text.strip()
         return {"reply": reply}
 
     except Exception as e:
@@ -67,6 +72,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 10000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
+
 
 
 
