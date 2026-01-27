@@ -3,18 +3,22 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
 from openai import OpenAI
-import cohere  # fallback API
+import cohere  # Cohere Chat API
 
 # =====================
 # Load environment
 # =====================
 load_dotenv()
 
+# =====================
 # OpenAI clients
+# =====================
 client1 = OpenAI(api_key=os.getenv("OPENAI_API_KEY1"))
 client2 = OpenAI(api_key=os.getenv("OPENAI_API_KEY2"))
 
+# =====================
 # Cohere client (fallback)
+# =====================
 co = cohere.Client(api_key=os.getenv("COHERE_API_KEY"))
 
 # =====================
@@ -49,8 +53,9 @@ async def chat(request: ChatRequest):
     if not user_message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
-    # Try OpenAI keys first
     last_exception = None
+
+    # --- Try OpenAI first ---
     for api_name, client in [("OpenAI Key 1", client1), ("OpenAI Key 2", client2)]:
         try:
             response = client.chat.completions.create(
@@ -66,23 +71,25 @@ async def chat(request: ChatRequest):
             return {"reply": reply}
         except Exception as e:
             last_exception = e
-            continue  # try next key if quota or error
+            continue  # try next key if quota or other error
 
-    # Fallback to Cohere
+    # --- Fallback to Cohere Chat API ---
     try:
-        response = co.generate(
+        response = co.chat(
             model="command-xlarge-nightly",
-            prompt=f"You are a helpful AI assistant for YPN Zimbabwe.\nUser: {user_message}\nAI:",
-            max_tokens=300,
-            temperature=0.7,
-            stop_sequences=["\nUser:", "\nAI:"]
+            messages=[
+                {"role": "system", "content": "You are a helpful AI assistant for YPN Zimbabwe."},
+                {"role": "user", "content": user_message}
+            ],
+            max_output_tokens=300
         )
-        reply = response.generations[0].text.strip()
+        reply = response.output[0].content
         return {"reply": reply}
+
     except Exception as e:
         last_exception = e
 
-    # If all APIs fail
+    # --- If all APIs fail ---
     raise HTTPException(status_code=500, detail=f"All AI APIs failed. Last error: {last_exception}")
 
 # =====================
@@ -92,3 +99,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 10000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
+
