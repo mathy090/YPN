@@ -3,14 +3,19 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
 from openai import OpenAI
+import cohere  # fallback API
 
 # =====================
 # Load environment
 # =====================
 load_dotenv()
 
-# OpenAI client
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# OpenAI clients
+client1 = OpenAI(api_key=os.getenv("OPENAI_API_KEY1"))
+client2 = OpenAI(api_key=os.getenv("OPENAI_API_KEY2"))
+
+# Cohere client (fallback)
+co = cohere.Client(api_key=os.getenv("COHERE_API_KEY"))
 
 # =====================
 # FastAPI app
@@ -30,7 +35,6 @@ class ChatRequest(BaseModel):
 async def root_get():
     return {"status": "YPN AI service alive"}
 
-# HEAD / endpoint for monitors → returns 200 OK instead of 405
 @app.head("/")
 async def root_head():
     return Response(status_code=200)
@@ -45,22 +49,41 @@ async def chat(request: ChatRequest):
     if not user_message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
+    # Try OpenAI keys first
+    last_exception = None
+    for api_name, client in [("OpenAI Key 1", client1), ("OpenAI Key 2", client2)]:
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a helpful AI assistant for YPN Zimbabwe."},
+                    {"role": "user", "content": user_message}
+                ],
+                max_tokens=300,
+                temperature=0.7
+            )
+            reply = response.choices[0].message.content
+            return {"reply": reply}
+        except Exception as e:
+            last_exception = e
+            continue  # try next key if quota or error
+
+    # Fallback to Cohere
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a helpful AI assistant for YPN Zimbabwe."},
-                {"role": "user", "content": user_message}
-            ],
+        response = co.generate(
+            model="command-xlarge-nightly",
+            prompt=f"You are a helpful AI assistant for YPN Zimbabwe.\nUser: {user_message}\nAI:",
             max_tokens=300,
-            temperature=0.7
+            temperature=0.7,
+            stop_sequences=["\nUser:", "\nAI:"]
         )
-
-        reply = response.choices[0].message.content
+        reply = response.generations[0].text.strip()
         return {"reply": reply}
-
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        last_exception = e
+
+    # If all APIs fail
+    raise HTTPException(status_code=500, detail=f"All AI APIs failed. Last error: {last_exception}")
 
 # =====================
 # Run server (Render)
@@ -69,7 +92,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 10000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
-
-
-
-

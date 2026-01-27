@@ -1,19 +1,7 @@
-// app/auth/device.tsx
-
-import * as ImagePicker from 'expo-image-picker';
 import { useRouter } from 'expo-router';
 import { getAuth, updateProfile } from 'firebase/auth';
-import { useEffect, useState } from 'react';
-import {
-  Alert,
-  BackHandler,
-  Image,
-  Platform,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
-} from 'react-native';
+import { useState } from 'react';
+import { ActivityIndicator, Alert, Text, TextInput, TouchableOpacity, View } from 'react-native';
 
 import { useAuth } from '../../src/store/authStore';
 import { colors } from '../../src/theme/colors';
@@ -24,67 +12,35 @@ export default function Device() {
   const { login } = useAuth();
 
   const [name, setName] = useState('');
-  const [photo, setPhoto] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-  /* Android back = exit */
-  useEffect(() => {
-    if (Platform.OS !== 'android') return;
-    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
-      BackHandler.exitApp();
-      return true;
-    });
-    return () => sub.remove();
-  }, []);
-
-  /* Permissions */
-  useEffect(() => {
-    ImagePicker.requestMediaLibraryPermissionsAsync();
-  }, []);
-
-  /* Pick image */
-  const pickImage = async () => {
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['images'],
-      allowsEditing: true,
-      aspect: [1, 1],
-      quality: 0.8,
-    });
-
-    if (!result.canceled && result.assets?.length) {
-      setPhoto(result.assets[0].uri);
-    }
-  };
-
-  /* Save to MongoDB */
-  const saveToMongoDB = async (uid: string, name: string, photoUri: string | null) => {
-    const formData = new FormData();
-    formData.append('uid', uid);
-    formData.append('name', name);
-    formData.append('email', getAuth().currentUser?.email || '');
-    
-    if (photoUri) {
-      formData.append('photo', {
-        uri: photoUri,
-        type: 'image/jpeg',
-        name: 'profile.jpg'
-      });
-    }
-
+  /* Save username to backend */
+  const saveToMongoDB = async (uid: string, name: string) => {
     try {
-      const response = await fetch('YOUR_RENDER_URL/api/users', {
+      const response = await fetch('https://ypn.onrender.com/api/users', {
         method: 'POST',
-        body: formData,
-        headers: { 'Accept': 'application/json' }
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          uid,
+          name,
+          email: getAuth().currentUser?.email || '',
+        }),
       });
+
+      if (!response.ok) {
+        throw new Error('Could not sync. Try again later.');
+      }
+
       return await response.json();
     } catch (error) {
       console.error('MongoDB save error:', error);
-      throw error;
+      throw new Error('Could not sync. Try again later.');
     }
   };
 
-  /* Finish setup */
+  /* Finish profile setup */
   const finishSetup = async () => {
     if (!name.trim() || loading) return;
 
@@ -93,57 +49,30 @@ export default function Device() {
     try {
       const auth = getAuth();
       const user = auth.currentUser;
-      if (!user) throw new Error('No user');
+      if (!user) throw new Error('No authenticated user found');
 
-      // Update Auth profile
+      // Update Firebase profile
       await updateProfile(user, {
         displayName: name.trim(),
-        photoURL: photo ? photo : undefined,
       });
 
-      // Save to MongoDB
-      await saveToMongoDB(user.uid, name.trim(), photo || null);
+      // Save to backend
+      await saveToMongoDB(user.uid, name.trim());
 
-      login(); // local auth store
-      router.replace('/tabs/chats'); // Navigate to main app
-    } catch (e) {
-      console.error(e);
-      Alert.alert('Error', 'Failed to save profile. Please try again.');
+      login(); // update local auth store
+      router.replace('/tabs/chats'); // navigate to main app
+    } catch (error: any) {
+      console.error('Finish setup error:', error);
+      Alert.alert('Error', error.message || 'Could not sync. Try again later.');
+    } finally {
       setLoading(false);
     }
   };
 
   return (
     <Screen>
-      <View style={{ flex: 1, justifyContent: 'center', paddingTop: 60 }}>
-        <Text style={{ color: colors.text, fontSize: 22, textAlign: 'center' }}>
-          Profile info
-        </Text>
-
-        <TouchableOpacity
-          onPress={pickImage}
-          style={{ alignSelf: 'center', marginVertical: 20 }}
-        >
-          {photo ? (
-            <Image
-              source={{ uri: photo }}
-              style={{ width: 120, height: 120, borderRadius: 60 }}
-            />
-          ) : (
-            <View
-              style={{
-                width: 120,
-                height: 120,
-                borderRadius: 60,
-                backgroundColor: '#2a2a2a',
-                justifyContent: 'center',
-                alignItems: 'center',
-              }}
-            >
-              <Text style={{ color: colors.muted }}>Add photo</Text>
-            </View>
-          )}
-        </TouchableOpacity>
+      <View style={{ flex: 1, justifyContent: 'center', paddingTop: 60, paddingHorizontal: 20 }}>
+        <Text style={{ color: colors.text, fontSize: 22, textAlign: 'center' }}>Enter your name</Text>
 
         <TextInput
           placeholder="Type your name"
@@ -172,7 +101,7 @@ export default function Device() {
           }}
         >
           {loading ? (
-            <Text style={{ color: '#000', fontWeight: 'bold' }}>Saving...</Text>
+            <ActivityIndicator color="#000" size="small" />
           ) : (
             <Text style={{ color: '#000', fontWeight: 'bold' }}>Next</Text>
           )}

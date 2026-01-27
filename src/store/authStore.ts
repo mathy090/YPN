@@ -9,6 +9,7 @@ type AuthState = {
   setUser: (user: User | null) => void;
   startListener: () => void;
   logout: () => Promise<void>;
+  login: () => void; // Add this line
 };
 
 export const useAuth = create<AuthState>((set, get) => ({
@@ -25,6 +26,8 @@ export const useAuth = create<AuthState>((set, get) => ({
       set({ user, initialized: true });
     });
   },
+
+  login: () => set({ user: get().user }), // Add this line
 
   logout: async () => {
     await logout();
