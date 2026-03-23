@@ -1,69 +1,52 @@
-import { useRouter } from 'expo-router';
-import { getAuth, updateProfile } from 'firebase/auth';
-import { useState } from 'react';
-import { ActivityIndicator, Alert, Text, TextInput, TouchableOpacity, View } from 'react-native';
+// app/auth/device.tsx
+import { useRouter } from "expo-router";
+import { getAuth, updateProfile } from "firebase/auth";
+import { useState } from "react";
+import {
+  ActivityIndicator,
+  Alert,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+} from "react-native";
+import { colors } from "../../src/theme/colors";
+import Screen from "../../src/ui/Screen";
+import { authHeaders } from "../../src/utils/tokenManager";
 
-import { useAuth } from '../../src/store/authStore';
-import { colors } from '../../src/theme/colors';
-import Screen from '../../src/ui/Screen';
+const API_URL = process.env.EXPO_PUBLIC_API_URL;
 
 export default function Device() {
   const router = useRouter();
-  const { login } = useAuth();
-
-  const [name, setName] = useState('');
+  const [name, setName] = useState("");
   const [loading, setLoading] = useState(false);
 
-  /* Save username to backend */
-  const saveToMongoDB = async (uid: string, name: string) => {
-    try {
-      const response = await fetch('https://ypn.onrender.com/api/users', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          uid,
-          name,
-          email: getAuth().currentUser?.email || '',
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error('Could not sync. Try again later.');
-      }
-
-      return await response.json();
-    } catch (error) {
-      console.error('MongoDB save error:', error);
-      throw new Error('Could not sync. Try again later.');
+  const saveProfile = async (trimmedName: string) => {
+    const headers = await authHeaders();
+    const res = await fetch(`${API_URL}/api/users/profile`, {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: trimmedName }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.message ?? "Could not save profile. Try again.");
     }
   };
 
-  /* Finish profile setup */
   const finishSetup = async () => {
-    if (!name.trim() || loading) return;
-
+    const trimmedName = name.trim();
+    if (!trimmedName || loading) return;
     setLoading(true);
-
     try {
-      const auth = getAuth();
-      const user = auth.currentUser;
-      if (!user) throw new Error('No authenticated user found');
-
-      // Update Firebase profile
-      await updateProfile(user, {
-        displayName: name.trim(),
-      });
-
-      // Save to backend
-      await saveToMongoDB(user.uid, name.trim());
-
-      login(); // update local auth store
-      router.replace('/tabs/chats'); // navigate to main app
+      const user = getAuth().currentUser;
+      if (!user) throw new Error("No authenticated user found.");
+      await updateProfile(user, { displayName: trimmedName });
+      await saveProfile(trimmedName);
+      router.replace("/tabs/chats");
     } catch (error: any) {
-      console.error('Finish setup error:', error);
-      Alert.alert('Error', error.message || 'Could not sync. Try again later.');
+      console.error("Finish setup error:", error);
+      Alert.alert("Error", error.message || "Could not sync. Try again later.");
     } finally {
       setLoading(false);
     }
@@ -71,8 +54,17 @@ export default function Device() {
 
   return (
     <Screen>
-      <View style={{ flex: 1, justifyContent: 'center', paddingTop: 60, paddingHorizontal: 20 }}>
-        <Text style={{ color: colors.text, fontSize: 22, textAlign: 'center' }}>Enter your name</Text>
+      <View
+        style={{
+          flex: 1,
+          justifyContent: "center",
+          paddingTop: 60,
+          paddingHorizontal: 20,
+        }}
+      >
+        <Text style={{ color: colors.text, fontSize: 22, textAlign: "center" }}>
+          Enter your name
+        </Text>
 
         <TextInput
           placeholder="Type your name"
@@ -86,7 +78,7 @@ export default function Device() {
             fontSize: 16,
             paddingVertical: 10,
             marginBottom: 40,
-            textAlign: 'center',
+            textAlign: "center",
           }}
         />
 
@@ -97,13 +89,14 @@ export default function Device() {
             backgroundColor: colors.primary,
             padding: 16,
             borderRadius: 30,
-            alignItems: 'center',
+            alignItems: "center",
+            opacity: !name.trim() || loading ? 0.5 : 1,
           }}
         >
           {loading ? (
             <ActivityIndicator color="#000" size="small" />
           ) : (
-            <Text style={{ color: '#000', fontWeight: 'bold' }}>Next</Text>
+            <Text style={{ color: "#000", fontWeight: "bold" }}>Next</Text>
           )}
         </TouchableOpacity>
       </View>

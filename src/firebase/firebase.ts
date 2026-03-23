@@ -1,15 +1,27 @@
-import { getApp, getApps, initializeApp } from 'firebase/app';
+// src/firebase/firebase.ts
+import { getApp, getApps, initializeApp } from "firebase/app";
 
-export const firebaseConfig = {
-  apiKey: "AIzaSyDJtU9grhwUsPruPUDEBfDvrM9GUvqdaZM",
-  authDomain: "ypnn-4ab56.firebaseapp.com",
-  projectId: "ypnn-4ab56",
-  storageBucket: "ypnn-4ab56.firebasestorage.app",
-  messagingSenderId: "361158718918",
-  appId: "1:361158718918:android:b1f232a5ca9af061c6aec7",
+const firebaseConfig = {
+  apiKey: process.env.EXPO_PUBLIC_FIREBASE_API_KEY!,
+  authDomain: process.env.EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN!,
+  projectId: process.env.EXPO_PUBLIC_FIREBASE_PROJECT_ID!,
+  storageBucket: process.env.EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET!,
+  messagingSenderId: process.env.EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID!,
+  appId: process.env.EXPO_PUBLIC_FIREBASE_APP_ID!,
 };
 
-// Prevent re-initialization (VERY IMPORTANT for Expo)
-export const app = getApps().length === 0
-  ? initializeApp(firebaseConfig)
-  : getApp();
+if (__DEV__) {
+  const missing = Object.entries(firebaseConfig)
+    .filter(([, v]) => !v)
+    .map(([k]) => `EXPO_PUBLIC_${k.replace(/([A-Z])/g, "_$1").toUpperCase()}`);
+  if (missing.length) {
+    console.error(
+      `[firebase.ts] Missing env vars: ${missing.join(", ")}\n` +
+        "Copy .env.example → .env.local and fill in your Firebase config.",
+    );
+  }
+}
+
+// Prevent re-initialization on Expo hot reload
+export const app =
+  getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();

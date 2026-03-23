@@ -3,7 +3,14 @@ import * as SecureStore from "expo-secure-store";
 import { auth } from "../firebase/auth";
 
 const TOKEN_KEY = "YPN_FIREBASE_TOKEN";
-const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "https://ypn.onrender.com";
+const API_URL = process.env.EXPO_PUBLIC_API_URL;
+
+if (__DEV__ && !API_URL) {
+  console.error(
+    "[tokenManager] EXPO_PUBLIC_API_URL is not set.\n" +
+      "Copy .env.example → .env.local and set it.",
+  );
+}
 
 export async function saveToken(token: string): Promise<void> {
   await SecureStore.setItemAsync(TOKEN_KEY, token, {
@@ -38,11 +45,8 @@ export async function authHeaders(): Promise<{ Authorization: string }> {
   }
 }
 
-/**
- * POST /api/auth/verify
- * Sends the Firebase ID token to backend for Admin SDK verification.
- * Returns { uid, email, hasProfile }
- */
+// Token sent as Authorization header — matches verifyFirebaseToken middleware
+// (original sent it in body as { token } which the middleware never read → always 401)
 export async function verifyWithBackend(
   idToken: string,
 ): Promise<{ uid: string; email: string; hasProfile: boolean }> {

@@ -1,6 +1,5 @@
 // app/auth/otp.tsx — Login
 import { Ionicons } from "@expo/vector-icons";
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
@@ -23,6 +22,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { auth } from "../../src/firebase/auth";
 import { useAuth } from "../../src/store/authStore";
+import { saveToken, verifyWithBackend } from "../../src/utils/tokenManager";
 
 export default function OTP() {
   const router = useRouter();
@@ -49,20 +49,48 @@ export default function OTP() {
     Keyboard.dismiss();
     setError("");
     setLoading(true);
+
     try {
-      await signInWithEmailAndPassword(auth, email, password);
-      const user = auth.currentUser;
-      if (user) {
-        const profile = await AsyncStorage.getItem(`YPN_PROFILE_${user.uid}`);
-        login();
-        router.replace(profile ? "/tabs/chats" : "/auth/device");
+      // 1. Firebase sign-in
+      const cred = await signInWithEmailAndPassword(auth, email, password);
+      const firebaseUser = cred.user;
+
+      // 2. Block unverified emails before touching the backend
+      if (!firebaseUser.emailVerified) {
+        setError("Please verify your email before signing in.");
+        await auth.signOut();
+        return;
       }
+
+      // 3. Get fresh token and verify with backend (the authoritative check)
+      const idToken = await firebaseUser.getIdToken(true);
+      await saveToken(idToken);
+      const { hasProfile } = await verifyWithBackend(idToken);
+
+      // 4. Backend accepted — commit auth state and navigate
+      await login();
+      router.replace(hasProfile ? "/tabs/chats" : "/auth/device");
     } catch (e: any) {
-      setError(
-        e.code === "auth/network-request-failed"
-          ? "No internet connection."
-          : "Invalid email or password.",
-      );
+      if (
+        e.code === "auth/network-request-failed" ||
+        e.code === "auth/too-many-requests"
+      ) {
+        setError("No internet connection. Please try again.");
+      } else if (
+        e.code === "auth/user-not-found" ||
+        e.code === "auth/wrong-password" ||
+        e.code === "auth/invalid-credential"
+      ) {
+        setError("Invalid email or password.");
+      } else if (e.code === "auth/user-disabled") {
+        setError("This account has been disabled.");
+      } else if (e.code === "EMAIL_NOT_VERIFIED") {
+        setError("Please verify your email before signing in.");
+      } else if (e.code === "TOKEN_EXPIRED" || e.code === "INVALID_TOKEN") {
+        setError("Session expired. Please sign in again.");
+      } else {
+        setError("Something went wrong. Please try again.");
+      }
     } finally {
       setLoading(false);
     }
