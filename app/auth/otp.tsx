@@ -1,14 +1,15 @@
-// app/auth/otp.tsx
+// app/auth/otp.tsx — Login
+import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { BlurView } from "expo-blur";
-import * as Haptics from "expo-haptics";
+import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
-import { useEffect, useRef, useState } from "react";
+import { StatusBar } from "expo-status-bar";
+import { signInWithEmailAndPassword } from "firebase/auth";
+import { useEffect, useState } from "react";
 import {
   ActivityIndicator,
-  Animated,
   BackHandler,
-  Easing,
+  Image,
   Keyboard,
   KeyboardAvoidingView,
   Platform,
@@ -20,28 +21,21 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { auth, signInWithEmailAndPassword } from "../../src/firebase/auth";
+import { auth } from "../../src/firebase/auth";
 import { useAuth } from "../../src/store/authStore";
-import { colors } from "../../src/theme/colors";
-import { saveToken, verifyWithBackend } from "../../src/utils/tokenManager";
 
 export default function OTP() {
   const router = useRouter();
   const { login } = useAuth();
-  const inputRef = useRef<TextInput>(null);
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [showDone, setShowDone] = useState(false);
-
-  const fadeAnim = useRef(new Animated.Value(0)).current;
-  const spinAnim = useRef(new Animated.Value(0)).current;
+  const [loading, setLoading] = useState(false);
+  const [showPass, setShowPass] = useState(false);
 
   const isValid = email.includes("@") && password.length >= 8;
 
-  // Android back → /welcome  (same as phone.tsx)
   useEffect(() => {
     const sub = BackHandler.addEventListener("hardwareBackPress", () => {
       router.replace("/welcome");
@@ -50,231 +44,246 @@ export default function OTP() {
     return () => sub.remove();
   }, []);
 
-  const handleLogin = async () => {
-    if (!isValid) return;
-
+  const submit = async () => {
+    if (!isValid || loading) return;
     Keyboard.dismiss();
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-
-    setLoading(true);
     setError("");
-    fadeAnim.setValue(0);
-    spinAnim.setValue(0);
-
-    // Animated overlay — identical to phone.tsx
-    Animated.timing(fadeAnim, {
-      toValue: 1,
-      duration: 250,
-      useNativeDriver: true,
-    }).start();
-
-    Animated.loop(
-      Animated.timing(spinAnim, {
-        toValue: 1,
-        duration: 900,
-        easing: Easing.inOut(Easing.ease),
-        useNativeDriver: true,
-      }),
-    ).start();
-
+    setLoading(true);
     try {
-      // Step 1 — Firebase client auth
-      const cred = await signInWithEmailAndPassword(
-        auth,
-        email.trim(),
-        password,
-      );
-
-      // Step 2 — Get Firebase ID token
-      const idToken = await cred.user.getIdToken();
-
-      // Step 3 — Backend verifies with Admin SDK + enforces email_verified
-      const { uid, hasProfile } = await verifyWithBackend(idToken);
-
-      // Step 4 — Persist token for future API calls
-      await saveToken(idToken);
-
-      // Step 5 — Cache session metadata (uid/email only, no passwords)
-      await AsyncStorage.setItem(
-        "YPN_SESSION",
-        JSON.stringify({
-          uid,
-          email: cred.user.email,
-          ts: Date.now(),
-        }),
-      );
-
-      setLoading(false);
-      setShowDone(true);
-      login();
-
-      // Short pause so the success modal is visible, then navigate
-      setTimeout(() => {
-        router.replace(hasProfile ? "/tabs/chats" : "/auth/device");
-      }, 800);
-    } catch (err: any) {
-      setLoading(false);
-      spinAnim.stopAnimation();
-
-      if (err.code === "auth/network-request-failed") {
-        setError("No internet connection.");
-      } else if (
-        err.code === "auth/user-not-found" ||
-        err.code === "auth/wrong-password" ||
-        err.code === "auth/invalid-credential"
-      ) {
-        setError("Invalid email or password.");
-      } else if (err.code === "auth/too-many-requests") {
-        setError("Too many attempts. Try again later.");
-      } else if (err.code === "EMAIL_NOT_VERIFIED" || err.status === 403) {
-        setError("Please verify your email before signing in.");
-      } else {
-        setError("Something went wrong. Please try again.");
-        console.error("Login error:", err);
+      await signInWithEmailAndPassword(auth, email, password);
+      const user = auth.currentUser;
+      if (user) {
+        const profile = await AsyncStorage.getItem(`YPN_PROFILE_${user.uid}`);
+        login();
+        router.replace(profile ? "/tabs/chats" : "/auth/device");
       }
+    } catch (e: any) {
+      setError(
+        e.code === "auth/network-request-failed"
+          ? "No internet connection."
+          : "Invalid email or password.",
+      );
+    } finally {
+      setLoading(false);
     }
   };
 
   return (
-    <SafeAreaView style={styles.container}>
-      {/* Back button — same position as phone.tsx */}
-      <TouchableOpacity
-        style={styles.back}
-        onPress={() => router.replace("/welcome")}
-      >
-        <Text style={styles.backText}>Back</Text>
-      </TouchableOpacity>
+    <View style={s.root}>
+      <StatusBar style="light" />
+      <LinearGradient
+        colors={["#0a0a14", "#000000", "#0a0a14"]}
+        style={StyleSheet.absoluteFill}
+      />
+      <View style={[s.orb, s.orb1]} />
+      <View style={[s.orb, s.orb2]} />
 
-      <KeyboardAvoidingView
-        style={{ flex: 1 }}
-        behavior={Platform.OS === "ios" ? "padding" : undefined}
-      >
-        <ScrollView contentContainerStyle={styles.content}>
-          <Text style={styles.info}>Sign in to your account</Text>
+      <SafeAreaView style={s.safe}>
+        <TouchableOpacity
+          style={s.back}
+          onPress={() => router.replace("/welcome")}
+        >
+          <Ionicons name="arrow-back" size={24} color="#fff" />
+        </TouchableOpacity>
 
-          <TextInput
-            placeholder="Email"
-            placeholderTextColor={colors.muted}
-            value={email}
-            onChangeText={(t) => {
-              setEmail(t);
-              setError("");
-            }}
-            style={styles.input}
-            keyboardType="email-address"
-            autoCapitalize="none"
-            returnKeyType="next"
-            onSubmitEditing={() => inputRef.current?.focus()}
-          />
-
-          <TextInput
-            ref={inputRef}
-            placeholder="Password"
-            placeholderTextColor={colors.muted}
-            secureTextEntry
-            value={password}
-            onChangeText={(t) => {
-              setPassword(t);
-              setError("");
-            }}
-            style={styles.input}
-            returnKeyType="done"
-            onSubmitEditing={handleLogin}
-          />
-
-          {error ? <Text style={styles.errorText}>{error}</Text> : null}
-        </ScrollView>
-
-        <View style={styles.bottom}>
-          <TouchableOpacity
-            disabled={!isValid}
-            onPress={handleLogin}
-            style={[
-              styles.next,
-              { backgroundColor: !isValid ? "#555" : colors.primary },
-            ]}
+        <KeyboardAvoidingView
+          style={{ flex: 1 }}
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
+        >
+          <ScrollView
+            contentContainerStyle={s.scroll}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
           >
-            <Text style={styles.nextText}>Login</Text>
-          </TouchableOpacity>
-        </View>
-      </KeyboardAvoidingView>
+            <View style={s.logoWrap}>
+              <Image
+                source={require("../../assets/images/YPN.png")}
+                style={s.logo}
+              />
+            </View>
 
-      {/* Loading overlay — same pattern as phone.tsx */}
-      {loading && (
-        <Animated.View style={[styles.overlay, { opacity: fadeAnim }]}>
-          <Animated.View
-            style={{
-              transform: [
-                {
-                  rotate: spinAnim.interpolate({
-                    inputRange: [0, 1],
-                    outputRange: ["0deg", "360deg"],
-                  }),
-                },
-              ],
-            }}
-          >
-            <ActivityIndicator size="large" color={colors.primary} />
-          </Animated.View>
-          <Text style={styles.loadingText}>Signing in…</Text>
-        </Animated.View>
-      )}
+            <Text style={s.title}>Welcome back</Text>
+            <Text style={s.sub}>Sign in to your YPN account</Text>
 
-      {/* Success blur modal — same pattern as phone.tsx */}
-      {showDone && (
-        <BlurView intensity={40} tint="dark" style={styles.modalOverlay}>
-          <View style={styles.modal}>
-            <Text style={styles.modalText}>Welcome back!</Text>
-            <Text style={styles.emailDisplay}>{email}</Text>
-          </View>
-        </BlurView>
-      )}
-    </SafeAreaView>
+            <View style={s.card}>
+              <View style={s.cardEdge} />
+
+              <Text style={s.label}>EMAIL</Text>
+              <View style={[s.row, email.includes("@") && s.rowActive]}>
+                <Ionicons
+                  name="mail-outline"
+                  size={18}
+                  color={email.includes("@") ? "#1DB954" : "#555"}
+                  style={s.icon}
+                />
+                <TextInput
+                  value={email}
+                  onChangeText={(t) => {
+                    setEmail(t);
+                    setError("");
+                  }}
+                  placeholder="you@email.com"
+                  placeholderTextColor="#444"
+                  style={s.input}
+                  keyboardType="email-address"
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                />
+              </View>
+
+              <Text style={[s.label, { marginTop: 16 }]}>PASSWORD</Text>
+              <View style={[s.row, password.length >= 8 && s.rowActive]}>
+                <Ionicons
+                  name="lock-closed-outline"
+                  size={18}
+                  color={password.length >= 8 ? "#1DB954" : "#555"}
+                  style={s.icon}
+                />
+                <TextInput
+                  value={password}
+                  onChangeText={(t) => {
+                    setPassword(t);
+                    setError("");
+                  }}
+                  placeholder="Your password"
+                  placeholderTextColor="#444"
+                  style={s.input}
+                  secureTextEntry={!showPass}
+                  onSubmitEditing={submit}
+                  returnKeyType="done"
+                />
+                <TouchableOpacity onPress={() => setShowPass((p) => !p)}>
+                  <Ionicons
+                    name={showPass ? "eye-off-outline" : "eye-outline"}
+                    size={18}
+                    color="#555"
+                  />
+                </TouchableOpacity>
+              </View>
+
+              {error ? <Text style={s.err}>{error}</Text> : null}
+            </View>
+
+            <TouchableOpacity
+              onPress={submit}
+              disabled={!isValid || loading}
+              activeOpacity={0.8}
+              style={[s.btn, (!isValid || loading) && s.btnOff]}
+            >
+              {loading ? (
+                <ActivityIndicator color="#000" />
+              ) : (
+                <Text style={s.btnText}>Sign In</Text>
+              )}
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={s.link}
+              onPress={() => router.replace("/auth/phone")}
+            >
+              <Text style={s.linkText}>
+                No account?{" "}
+                <Text style={{ color: "#1DB954", fontWeight: "600" }}>
+                  Create one
+                </Text>
+              </Text>
+            </TouchableOpacity>
+          </ScrollView>
+        </KeyboardAvoidingView>
+      </SafeAreaView>
+    </View>
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: colors.bg },
-  back: { position: "absolute", top: 12, left: 16, zIndex: 10 },
-  backText: { color: colors.primary, fontSize: 16, fontWeight: "600" },
-  content: { paddingTop: 80, paddingHorizontal: 20, paddingBottom: 140 },
-  info: { color: colors.text, fontSize: 18, marginBottom: 30 },
-  input: {
-    borderBottomWidth: 1,
-    borderBottomColor: colors.muted,
-    color: colors.text,
-    fontSize: 16,
-    paddingVertical: 12,
-    marginBottom: 24,
+const s = StyleSheet.create({
+  root: { flex: 1, backgroundColor: "#000" },
+  safe: { flex: 1 },
+  scroll: { paddingHorizontal: 24, paddingTop: 72, paddingBottom: 40 },
+  orb: { position: "absolute", borderRadius: 999 },
+  orb1: {
+    width: 300,
+    height: 300,
+    top: -60,
+    left: -80,
+    backgroundColor: "rgba(29,185,84,0.07)",
   },
-  errorText: {
-    color: "#FF6B6B",
+  orb2: {
+    width: 220,
+    height: 220,
+    bottom: 100,
+    right: -60,
+    backgroundColor: "rgba(29,185,84,0.05)",
+  },
+  back: {
+    position: "absolute",
+    top: 52,
+    left: 20,
+    zIndex: 10,
+    padding: 8,
+    borderRadius: 20,
+    backgroundColor: "rgba(255,255,255,0.08)",
+  },
+  logoWrap: { alignItems: "center", marginBottom: 24 },
+  logo: { width: 72, height: 72, borderRadius: 36 },
+  title: {
+    color: "#fff",
+    fontSize: 28,
+    fontWeight: "700",
+    textAlign: "center",
+    marginBottom: 6,
+  },
+  sub: {
+    color: "#B3B3B3",
     fontSize: 14,
-    marginBottom: 12,
-    marginLeft: 2,
+    textAlign: "center",
+    marginBottom: 28,
   },
-  bottom: { position: "absolute", bottom: 20, left: 20, right: 20 },
-  next: { padding: 14, borderRadius: 30, alignItems: "center" },
-  nextText: { color: "#000", fontSize: 16, fontWeight: "bold" },
-  overlay: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: "#000",
-    justifyContent: "center",
+  card: {
+    backgroundColor: "rgba(255,255,255,0.04)",
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.08)",
+    padding: 20,
+    marginBottom: 20,
+    overflow: "hidden",
+  },
+  cardEdge: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    height: 1,
+    backgroundColor: "rgba(255,255,255,0.12)",
+  },
+  label: {
+    color: "rgba(255,255,255,0.35)",
+    fontSize: 11,
+    letterSpacing: 1.2,
+    marginBottom: 6,
+    fontWeight: "600",
+  },
+  row: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "rgba(255,255,255,0.05)",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.08)",
+    paddingHorizontal: 12,
+    height: 50,
+  },
+  rowActive: { borderColor: "#1DB954" },
+  icon: { marginRight: 10 },
+  input: { flex: 1, color: "#fff", fontSize: 15 },
+  err: { color: "#E91429", fontSize: 12, marginTop: 10 },
+  btn: {
+    backgroundColor: "#1DB954",
+    borderRadius: 30,
+    paddingVertical: 16,
     alignItems: "center",
   },
-  loadingText: { color: colors.text, fontSize: 18, marginTop: 16 },
-  modalOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  modal: {
-    backgroundColor: "rgba(20,20,20,0.95)",
-    padding: 24,
-    borderRadius: 14,
-    width: "80%",
-    alignItems: "center",
-  },
-  modalText: { color: colors.text, fontSize: 16, marginBottom: 8 },
-  emailDisplay: { color: colors.primary, fontSize: 15, fontWeight: "bold" },
+  btnOff: { backgroundColor: "#1a3d26", opacity: 0.6 },
+  btnText: { color: "#000", fontWeight: "700", fontSize: 16 },
+  link: { alignItems: "center", marginTop: 20 },
+  linkText: { color: "#B3B3B3", fontSize: 14 },
 });

@@ -1,19 +1,24 @@
 // src/store/authStore.ts
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { User } from "firebase/auth";
 import { create } from "zustand";
-import { logout, subscribeToAuth } from "../firebase/auth";
-import { clearToken } from "../utils/tokenManager";
+import { auth, logout as fbLogout, subscribeToAuth } from "../firebase/auth";
+import {
+  clearSession,
+  loadAgreed,
+  loadSession,
+  saveAgreed,
+  saveSession,
+} from "../utils/session";
 
-const AGREED_KEY = "YPN_HAS_AGREED";
+const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
 
 type AuthState = {
   user: User | null;
   initialized: boolean;
   isLoggedIn: boolean;
   hasAgreed: boolean;
-  setUser: (user: User | null) => void;
-  startListener: () => void;
+  isOffline: boolean;
+  hydrate: () => Promise<void>;
   login: () => void;
   agreeToTerms: () => Promise<void>;
   logout: () => Promise<void>;
@@ -24,35 +29,114 @@ export const useAuth = create<AuthState>((set, get) => ({
   initialized: false,
   isLoggedIn: false,
   hasAgreed: false,
+  isOffline: false,
 
-  setUser: (user) => set({ user }),
+  hydrate: async () => {
+    const agreed = await loadAgreed();
+    set({ hasAgreed: agreed });
 
-  startListener: () => {
-    if (get().initialized) return;
-    subscribeToAuth((user) => {
-      set({ user, initialized: true, isLoggedIn: !!user });
+    let online = false;
+    try {
+      const res = await Promise.race([
+        fetch(`${API_URL}/`),
+        new Promise<never>((_, rej) =>
+          setTimeout(() => rej(new Error("timeout")), 4000),
+        ),
+      ]);
+      online = (res as Response).ok;
+    } catch {
+      online = false;
+    }
+
+    if (!online) {
+      const cached = await loadSession();
+      set({ initialized: true, isOffline: true, isLoggedIn: !!cached });
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      const unsub = subscribeToAuth(async (firebaseUser) => {
+        unsub();
+
+        if (!firebaseUser) {
+          await clearSession();
+          set({
+            user: null,
+            initialized: true,
+            isLoggedIn: false,
+            isOffline: false,
+          });
+          resolve();
+          return;
+        }
+
+        try {
+          const token = await firebaseUser.getIdToken(true);
+          const res = await fetch(`${API_URL}/api/auth/verify`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ token }),
+          });
+
+          if (res.ok) {
+            await saveSession({
+              uid: firebaseUser.uid,
+              email: firebaseUser.email,
+              displayName: firebaseUser.displayName,
+              savedAt: Date.now(),
+            });
+            set({
+              user: firebaseUser,
+              initialized: true,
+              isLoggedIn: true,
+              isOffline: false,
+            });
+          } else {
+            await fbLogout();
+            await clearSession();
+            set({
+              user: null,
+              initialized: true,
+              isLoggedIn: false,
+              isOffline: false,
+            });
+          }
+        } catch {
+          const cached = await loadSession();
+          set({
+            user: firebaseUser,
+            initialized: true,
+            isLoggedIn: !!cached,
+            isOffline: true,
+          });
+        }
+
+        resolve();
+      });
     });
   },
 
-  login: () => set({ isLoggedIn: true }),
+  login: () => {
+    const user = auth.currentUser;
+    if (user) {
+      saveSession({
+        uid: user.uid,
+        email: user.email,
+        displayName: user.displayName,
+        savedAt: Date.now(),
+      });
+    }
+    set({ isLoggedIn: true, user: auth.currentUser });
+  },
 
   agreeToTerms: async () => {
-    await AsyncStorage.setItem(AGREED_KEY, "1");
+    await saveAgreed();
     set({ hasAgreed: true });
   },
 
   logout: async () => {
-    await logout();
-    await clearToken();
-    set({ user: null, isLoggedIn: false });
+    await fbLogout();
+    await clearSession();
+    set({ user: null, isLoggedIn: false, isOffline: false });
   },
 }));
-
-/**
- * Call once at startup to read hasAgreed from AsyncStorage.
- * Keeps the value across app restarts so users don't see /welcome every time.
- */
-export async function hydrateAgreed(): Promise<void> {
-  const val = await AsyncStorage.getItem(AGREED_KEY);
-  useAuth.setState({ hasAgreed: val === "1" });
-}
