@@ -1,11 +1,9 @@
-# ypn-ai-service/main.py
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
 import cohere
-
 import memory
 from prompts import SYSTEM_PROMPT
 
@@ -13,11 +11,11 @@ load_dotenv()
 
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 if not COHERE_API_KEY:
-    raise RuntimeError("COHERE_API_KEY is not set — add it to your Render env vars")
+    raise RuntimeError("COHERE_API_KEY is not set")
 
 co = cohere.ClientV2(api_key=COHERE_API_KEY)
 
-app = FastAPI(title="YPN AI Service")
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,12 +39,12 @@ async def root_head():
 @app.post("/chat")
 async def chat(req: ChatRequest):
     user_message = req.message.strip()
-    session_id   = req.session_id.strip() or "default"
+    session_id = req.session_id.strip() or "default"
 
     if not user_message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
-    raw_history  = memory.get_history(session_id)
+    raw_history = memory.get_history(session_id)
     chat_history = [
         {"role": h["role"], "message": h["message"]}
         for h in raw_history
@@ -55,17 +53,17 @@ async def chat(req: ChatRequest):
 
     try:
         response = co.chat(
-            model="command-r-plus",
+            model="command-r",
             preamble=SYSTEM_PROMPT,
             chat_history=chat_history,
             message=user_message,
             temperature=0.7,
-            max_tokens=400,
+            max_tokens=200,
         )
 
         reply = response.message.content[0].text.strip()
 
-        memory.append(session_id, "USER",    user_message)
+        memory.append(session_id, "USER", user_message)
         memory.append(session_id, "CHATBOT", reply)
 
         return {"reply": reply}
@@ -73,7 +71,7 @@ async def chat(req: ChatRequest):
     except cohere.errors.UnauthorizedError:
         raise HTTPException(status_code=500, detail="Invalid Cohere API key")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/chat/{session_id}")
 async def clear_session(session_id: str):
@@ -84,22 +82,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 10000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
-```
-
----
-
-## `ypn-ai-service/requirements.txt`
-```
-fastapi
-uvicorn[standard]
-python-dotenv
-cohere
-```
-
----
-
-## `ypn-ai-service/.env.example`
-```
-# On Render: set these in the Environment tab of your service dashboard
-COHERE_API_KEY=
-PORT=10000

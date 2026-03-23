@@ -3,86 +3,19 @@ import { useRouter } from "expo-router";
 import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
-  Animated,
-  Easing,
   FlatList,
   Image,
-  Keyboard,
-  LayoutAnimation,
-  Platform,
-  Pressable,
-  StatusBar,
+  SafeAreaView,
   StyleSheet,
   Text,
   TextInput,
+  TouchableOpacity,
   View,
 } from "react-native";
-
 import { Message } from "../src/types/chat";
 import { getSecureCache, setSecureCache } from "../src/utils/cache";
-import { useNetworkStatus } from "../src/utils/network";
 
-const AI_API_URL = `${process.env.EXPO_PUBLIC_AI_URL}/chat`;
-
-// ─── Typing indicator — three dots that bounce sequentially ──────────────────
-function TypingIndicator() {
-  const dots = [
-    useRef(new Animated.Value(0)).current,
-    useRef(new Animated.Value(0)).current,
-    useRef(new Animated.Value(0)).current,
-  ];
-
-  useEffect(() => {
-    const bounce = (dot: Animated.Value, delay: number) =>
-      Animated.loop(
-        Animated.sequence([
-          Animated.delay(delay),
-          Animated.timing(dot, {
-            toValue: -6,
-            duration: 300,
-            easing: Easing.inOut(Easing.ease),
-            useNativeDriver: true,
-          }),
-          Animated.timing(dot, {
-            toValue: 0,
-            duration: 300,
-            easing: Easing.inOut(Easing.ease),
-            useNativeDriver: true,
-          }),
-          Animated.delay(600),
-        ]),
-      );
-
-    const anims = dots.map((d, i) => bounce(d, i * 150));
-    anims.forEach((a) => a.start());
-    return () => anims.forEach((a) => a.stop());
-  }, []);
-
-  return (
-    <View style={styles.row}>
-      <View style={[styles.bubble, styles.aiBubble, styles.typingBubble]}>
-        <View style={styles.typingRow}>
-          {dots.map((d, i) => (
-            <Animated.View
-              key={i}
-              style={[styles.typingDot, { transform: [{ translateY: d }] }]}
-            />
-          ))}
-        </View>
-      </View>
-    </View>
-  );
-}
-
-// ─── Blue tick component ──────────────────────────────────────────────────────
-function Ticks({ status }: { status: Message["status"] }) {
-  if (status === "failed") return null;
-  const color = status === "read" ? "#34B7F1" : "#8a8a8a";
-  const icon = status === "sent" ? "checkmark" : "checkmark-done";
-  return (
-    <Ionicons name={icon} size={15} color={color} style={{ marginLeft: 2 }} />
-  );
-}
+const AI_URL = process.env.EXPO_PUBLIC_AI_URL + "/chat";
 
 export default function TeamYPNScreen() {
   const router = useRouter();
@@ -90,196 +23,109 @@ export default function TeamYPNScreen() {
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
-  const [aiTyping, setAiTyping] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [typing, setTyping] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [inputHeight, setInputHeight] = useState(48);
-  const [keyboardHeight, setKeyboardHeight] = useState(0);
 
-  const { isConnected } = useNetworkStatus();
+  const scrollToBottom = () =>
+    setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 80);
 
-  const scrollToBottom = (animated = true) =>
-    setTimeout(() => listRef.current?.scrollToEnd({ animated }), 60);
-
-  /* ── load cache ─────────────────────────────────────────────────────────── */
   useEffect(() => {
     (async () => {
-      const cached = await getSecureCache("chat_team-ypn");
-      if (Array.isArray(cached)) setMessages(cached);
-      setLoading(false);
-      scrollToBottom(false); // open at bottom of last message
+      try {
+        const cached = await getSecureCache("chat_team-ypn");
+        if (Array.isArray(cached)) setMessages(cached);
+      } catch {
+      } finally {
+        setLoading(false);
+      }
     })();
   }, []);
 
-  /* ── persist cache ──────────────────────────────────────────────────────── */
   useEffect(() => {
-    if (!loading) setSecureCache("chat_team-ypn", messages);
+    if (!loading && messages.length > 0)
+      setSecureCache("chat_team-ypn", messages).catch(() => {});
   }, [messages]);
 
-  /* ── keyboard ───────────────────────────────────────────────────────────── */
   useEffect(() => {
-    const show = Keyboard.addListener("keyboardDidShow", (e) => {
-      LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-      setKeyboardHeight(e.endCoordinates.height);
-      scrollToBottom();
-    });
-    const hide = Keyboard.addListener("keyboardDidHide", () => {
-      LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-      setKeyboardHeight(0);
-      setInputHeight(48);
-    });
-    return () => {
-      show.remove();
-      hide.remove();
-    };
-  }, []);
+    if (messages.length > 0) scrollToBottom();
+  }, [messages, typing]);
 
-  /* ── send ───────────────────────────────────────────────────────────────── */
-  const sendMessage = async (text: string, retryId?: string) => {
-    if (!text.trim() || !isConnected) return;
+  const send = async () => {
+    const text = input.trim();
+    if (!text || sending) return;
 
-    const messageId = retryId || Date.now().toString();
+    setSending(true);
+    setInput("");
 
+    const msgId = Date.now().toString();
     const userMsg: Message = {
-      id: messageId,
+      id: msgId,
       text,
       sender: "user",
       timestamp: new Date().toISOString(),
-      status: "sent", // single grey tick
+      status: "sent",
     };
 
-    setMessages((prev) =>
-      retryId
-        ? prev.filter((m) => m.id !== retryId).concat(userMsg)
-        : [...prev, userMsg],
-    );
-    scrollToBottom();
-
-    // 400ms later → double grey tick (delivered)
-    setTimeout(() => {
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === messageId ? { ...m, status: "delivered" } : m,
-        ),
-      );
-    }, 400);
-
-    setAiTyping(true);
-    scrollToBottom();
+    setMessages((prev) => [...prev, userMsg]);
+    setTyping(true);
 
     try {
-      const res = await fetch(AI_API_URL, {
+      const res = await fetch(AI_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text }),
+        body: JSON.stringify({ message: text, session_id: "ypn-general" }),
       });
 
-      if (!res.ok) throw new Error(await res.text());
-      const { reply } = await res.json();
+      const data = await res.json();
+      const reply = data.reply || data.message || data.text || "No response";
 
-      // double blue tick (read) + AI reply appears
-      setAiTyping(false);
+      setTyping(false);
       setMessages((prev) => [
-        ...prev.map((m) => (m.id === messageId ? { ...m, status: "read" } : m)),
+        ...prev,
         {
-          id: Date.now().toString(),
+          id: (Date.now() + 1).toString(),
           text: reply,
           sender: "ai",
           timestamp: new Date().toISOString(),
           status: "read",
         },
       ]);
-      scrollToBottom();
-    } catch {
-      setAiTyping(false);
+    } catch (e) {
+      setTyping(false);
       setMessages((prev) =>
-        prev.map((m) => (m.id === messageId ? { ...m, status: "failed" } : m)),
+        prev.map((m) => (m.id === msgId ? { ...m, status: "failed" } : m)),
       );
+    } finally {
+      setSending(false);
     }
   };
 
-  const handleSend = () => {
-    const text = input.trim();
-    if (!text) return;
-    setInput("");
-    setInputHeight(48);
-    sendMessage(text);
-  };
-
-  /* ── date headers ───────────────────────────────────────────────────────── */
-  const formatDateHeader = (iso: string) => {
-    const d = new Date(iso);
-    const now = new Date();
-    const yest = new Date();
-    yest.setDate(now.getDate() - 1);
-    const same = (a: Date, b: Date) =>
-      a.getFullYear() === b.getFullYear() &&
-      a.getMonth() === b.getMonth() &&
-      a.getDate() === b.getDate();
-    if (same(d, now)) return "Today";
-    if (same(d, yest)) return "Yesterday";
-    return d.toLocaleDateString(undefined, {
-      weekday: "long",
-      day: "numeric",
-      month: "short",
-      year: "numeric",
-    });
-  };
-
-  type GroupItem =
-    | { type: "header"; text: string }
-    | { type: "message"; text: string; item: Message };
-
-  const grouped = (): GroupItem[] => {
-    const out: GroupItem[] = [];
-    let lastDate = "";
-    messages.forEach((msg) => {
-      const dh = formatDateHeader(msg.timestamp);
-      if (dh !== lastDate) {
-        out.push({ type: "header", text: dh });
-        lastDate = dh;
-      }
-      out.push({ type: "message", text: msg.text, item: msg });
-    });
-    return out;
-  };
-
-  /* ── render item ────────────────────────────────────────────────────────── */
-  const renderItem = ({ item }: { item: GroupItem }) => {
-    if (item.type === "header") {
-      return (
-        <View style={styles.dateHeader}>
-          <Text style={styles.dateHeaderText}>{item.text}</Text>
-        </View>
-      );
-    }
-
-    const msg = item.item;
-    const isUser = msg.sender === "user";
-    const time = new Date(msg.timestamp).toLocaleTimeString([], {
+  const renderMessage = ({ item }: { item: Message }) => {
+    const isUser = item.sender === "user";
+    const time = new Date(item.timestamp).toLocaleTimeString([], {
       hour: "2-digit",
       minute: "2-digit",
     });
 
     return (
-      <View style={[styles.row, isUser && styles.userRow]}>
+      <View style={[styles.row, isUser && styles.rowUser]}>
         <View
-          style={[styles.bubble, isUser ? styles.userBubble : styles.aiBubble]}
+          style={[styles.bubble, isUser ? styles.bubbleUser : styles.bubbleAI]}
         >
-          <Text style={styles.text}>{msg.text}</Text>
+          <Text style={styles.msgText}>{item.text}</Text>
           <View style={styles.meta}>
             <Text style={styles.time}>{time}</Text>
-            {isUser && msg.status === "failed" ? (
-              <Pressable onPress={() => sendMessage(msg.text, msg.id)}>
-                <Ionicons
-                  name="alert-circle"
-                  size={15}
-                  color="#FF453A"
-                  style={{ marginLeft: 2 }}
-                />
-              </Pressable>
-            ) : isUser ? (
-              <Ticks status={msg.status} />
-            ) : null}
+            {isUser && item.status === "failed" && (
+              <TouchableOpacity
+                onPress={() => {
+                  setMessages((prev) => prev.filter((m) => m.id !== item.id));
+                  setInput(item.text);
+                }}
+              >
+                <Ionicons name="alert-circle" size={14} color="#FF3B30" />
+              </TouchableOpacity>
+            )}
           </View>
         </View>
       </View>
@@ -288,86 +134,90 @@ export default function TeamYPNScreen() {
 
   if (loading) {
     return (
-      <View style={styles.loading}>
-        <ActivityIndicator size="large" color="#25D366" />
+      <View style={styles.center}>
+        <ActivityIndicator size="large" color="#3396FD" />
       </View>
     );
   }
 
-  /* ── main render ────────────────────────────────────────────────────────── */
   return (
-    <View style={styles.container}>
-      {/* HEADER */}
+    <SafeAreaView style={styles.container}>
       <View style={styles.header}>
-        <Pressable onPress={() => router.back()}>
+        <TouchableOpacity onPress={() => router.back()} style={styles.back}>
           <Ionicons name="arrow-back" size={24} color="#fff" />
-        </Pressable>
-        <Image
-          source={require("../assets/images/YPN.png")}
-          style={styles.avatar}
-        />
-        <View style={{ flex: 1 }}>
-          <Text style={styles.title}>Team YPN</Text>
-          <Text style={styles.subtitle}>{aiTyping ? "typing…" : "Online"}</Text>
+        </TouchableOpacity>
+        <View style={styles.headerInfo}>
+          <Image
+            source={require("../assets/images/YPN.png")}
+            style={styles.avatar}
+          />
+          <View>
+            <Text style={styles.name}>Team YPN</Text>
+            <Text style={styles.status}>{typing ? "typing..." : "Online"}</Text>
+          </View>
         </View>
+        <View style={styles.dot} />
       </View>
 
-      {/* CHAT LIST */}
       <FlatList
         ref={listRef}
-        data={grouped()}
-        renderItem={renderItem}
-        keyExtractor={(item, index) =>
-          item.type === "header" ? `header-${index}` : item.item.id
-        }
+        data={messages}
+        renderItem={renderMessage}
+        keyExtractor={(item) => item.id}
+        contentContainerStyle={styles.list}
         showsVerticalScrollIndicator={false}
-        onLayout={() => scrollToBottom(false)}
-        onContentSizeChange={() => scrollToBottom()}
-        contentContainerStyle={{
-          padding: 12,
-          paddingBottom: inputHeight + keyboardHeight + 20,
-        }}
-        ListFooterComponent={aiTyping ? <TypingIndicator /> : null}
+        onContentSizeChange={scrollToBottom}
+        ListEmptyComponent={
+          <View style={styles.emptyWrap}>
+            <Text style={styles.emptyText}>Say hello to Team YPN</Text>
+          </View>
+        }
+        ListFooterComponent={
+          typing ? (
+            <View style={styles.row}>
+              <View style={styles.bubbleAI}>
+                <Text style={styles.typingText}>typing...</Text>
+              </View>
+            </View>
+          ) : null
+        }
       />
 
-      {/* INPUT BAR */}
-      <View style={[styles.inputContainer, { bottom: keyboardHeight }]}>
+      <View style={styles.bar}>
         <TextInput
           value={input}
           onChangeText={setInput}
           placeholder="Message"
-          placeholderTextColor="#aaa"
+          placeholderTextColor="#8E8E93"
+          style={styles.input}
           multiline
-          style={[styles.input, { height: inputHeight }]}
-          onContentSizeChange={(e) => {
-            const h = Math.min(
-              120,
-              Math.max(48, e.nativeEvent.contentSize.height),
-            );
-            setInputHeight(h);
-          }}
-          onSubmitEditing={handleSend}
+          maxLength={500}
+          editable={!sending}
+          onSubmitEditing={send}
           blurOnSubmit={false}
         />
-        <Pressable
-          onPress={handleSend}
-          disabled={!input.trim() || aiTyping}
+        <TouchableOpacity
+          onPress={send}
+          disabled={!input.trim() || sending}
           style={[
-            styles.send,
-            (!input.trim() || aiTyping) && styles.sendDisabled,
+            styles.sendBtn,
+            (!input.trim() || sending) && styles.sendBtnOff,
           ]}
         >
-          <Ionicons name="send" size={20} color="#fff" />
-        </Pressable>
+          {sending ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <Ionicons name="send" size={20} color="#fff" />
+          )}
+        </TouchableOpacity>
       </View>
-    </View>
+    </SafeAreaView>
   );
 }
 
-/* ── styles ─────────────────────────────────────────────────────────────────── */
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#000" },
-  loading: {
+  center: {
     flex: 1,
     justifyContent: "center",
     alignItems: "center",
@@ -377,81 +227,85 @@ const styles = StyleSheet.create({
   header: {
     flexDirection: "row",
     alignItems: "center",
-    padding: 12,
-    paddingTop:
-      Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) + 4 : 12,
+    justifyContent: "space-between",
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    backgroundColor: "#000",
     borderBottomWidth: 1,
-    borderBottomColor: "#222",
+    borderBottomColor: "#282828",
   },
-  avatar: { width: 40, height: 40, borderRadius: 20, marginHorizontal: 12 },
-  title: { color: "#fff", fontSize: 17, fontWeight: "600" },
-  subtitle: { color: "#25D366", fontSize: 12 },
-
-  row: { marginVertical: 4 },
-  userRow: { alignItems: "flex-end" },
-
-  bubble: {
-    maxWidth: "80%",
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    borderRadius: 18,
+  back: { padding: 4 },
+  headerInfo: {
+    flexDirection: "row",
+    alignItems: "center",
+    flex: 1,
+    marginLeft: 8,
+    gap: 10,
   },
-  userBubble: { backgroundColor: "#25D366" },
-  aiBubble: { backgroundColor: "#1f1f1f" },
+  avatar: { width: 40, height: 40, borderRadius: 20 },
+  name: { fontSize: 18, fontWeight: "600", color: "#fff" },
+  status: { fontSize: 12, color: "#3396FD", marginTop: 2 },
+  dot: { width: 10, height: 10, borderRadius: 5, backgroundColor: "#34C759" },
 
-  typingBubble: { paddingVertical: 14 },
-  typingRow: { flexDirection: "row", alignItems: "center", gap: 5 },
-  typingDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: "#aaa" },
+  list: { padding: 12, paddingBottom: 100 },
+  emptyWrap: { flex: 1, alignItems: "center", paddingTop: 60 },
+  emptyText: { color: "#555", fontSize: 16 },
 
-  text: { color: "#fff", fontSize: 16 },
+  row: { marginVertical: 6, maxWidth: "85%" },
+  rowUser: { alignSelf: "flex-end" },
+
+  bubble: { paddingVertical: 10, paddingHorizontal: 14, borderRadius: 18 },
+  bubbleUser: { backgroundColor: "#00A884", borderBottomRightRadius: 4 },
+  bubbleAI: { backgroundColor: "#333", borderBottomLeftRadius: 4 },
+
+  msgText: { color: "#fff", fontSize: 16, lineHeight: 22 },
+  typingText: {
+    color: "#8E8E93",
+    fontSize: 14,
+    fontStyle: "italic",
+    padding: 4,
+  },
 
   meta: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "flex-end",
-    marginTop: 3,
-    gap: 2,
+    marginTop: 4,
+    gap: 4,
   },
-  time: { fontSize: 10, color: "#ddd" },
+  time: { fontSize: 10, color: "#8E8E93" },
 
-  dateHeader: {
-    alignSelf: "center",
-    backgroundColor: "#333",
-    paddingHorizontal: 12,
-    paddingVertical: 4,
-    borderRadius: 12,
-    marginVertical: 8,
-  },
-  dateHeaderText: { color: "#ccc", fontSize: 12, fontWeight: "600" },
-
-  inputContainer: {
+  bar: {
     position: "absolute",
+    bottom: 0,
     left: 0,
     right: 0,
     flexDirection: "row",
     alignItems: "flex-end",
-    padding: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: "#121212",
     borderTopWidth: 1,
-    borderTopColor: "#222",
-    backgroundColor: "#111",
+    borderTopColor: "#282828",
   },
   input: {
     flex: 1,
-    backgroundColor: "#222",
-    borderRadius: 24,
+    backgroundColor: "#282828",
+    borderRadius: 20,
     paddingHorizontal: 16,
-    paddingVertical: 12,
-    color: "#fff",
+    paddingVertical: 10,
     fontSize: 16,
+    maxHeight: 100,
+    marginRight: 10,
+    color: "#fff",
   },
-  send: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    backgroundColor: "#25D366",
+  sendBtn: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: "#00A884",
     justifyContent: "center",
     alignItems: "center",
-    marginLeft: 8,
   },
-  sendDisabled: { backgroundColor: "#1a4d2e" },
+  sendBtnOff: { backgroundColor: "#333" },
 });
