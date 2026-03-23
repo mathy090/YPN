@@ -9,58 +9,88 @@ const multer = require("multer");
 const { GridFsStorage } = require("multer-gridfs-storage");
 const admin = require("firebase-admin");
 
-/* ── Firebase Admin SDK ─────────────────────────────────────
-   Verifies Firebase ID tokens issued by the client SDK.
-   No second JWT needed — Firebase tokens are already signed JWTs
-   verified against Google's public keys.
-─────────────────────────────────────────────────────────── */
-const serviceAccount = require("./config/firebase-admin.json");
-admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+/* =====================
+   Firebase Admin SDK
+   Credentials live in FIREBASE_ADMIN_KEY env var (JSON string).
+   Never commit the key file — use .env locally, Render dashboard in prod.
+===================== */
+if (!process.env.FIREBASE_ADMIN_KEY) {
+  console.error("❌  FIREBASE_ADMIN_KEY env var is not set. Exiting.");
+  process.exit(1);
+}
 
-/* ── Express ────────────────────────────────────────────── */
+let serviceAccount;
+try {
+  serviceAccount = JSON.parse(process.env.FIREBASE_ADMIN_KEY);
+} catch {
+  console.error("❌  FIREBASE_ADMIN_KEY is not valid JSON. Exiting.");
+  process.exit(1);
+}
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+
+/* =====================
+   Express
+===================== */
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* ── Auth Middleware ────────────────────────────────────────
+/* =====================
+   Auth Middleware
    Usage: router.get('/protected', verifyFirebaseToken, handler)
    Sets req.user = decoded Firebase token payload
    { uid, email, email_verified, name, picture, ... }
-─────────────────────────────────────────────────────────── */
+===================== */
 async function verifyFirebaseToken(req, res, next) {
-  const header = req.headers.authorization;
-  if (!header || !header.startsWith("Bearer ")) {
-    return res.status(401).json({ message: "Unauthorized: no token" });
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ message: "Unauthorized: No token provided" });
   }
 
+  const idToken = authHeader.split("Bearer ")[1];
+
   try {
-    req.user = await admin.auth().verifyIdToken(header.split("Bearer ")[1]);
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    req.user = decoded;
     next();
   } catch (err) {
-    console.error("Token verification failed:", err.code);
+    console.error("Token verification failed:", err.code, err.message);
+
     if (err.code === "auth/id-token-expired") {
-      return res
-        .status(401)
-        .json({ message: "Token expired", code: "TOKEN_EXPIRED" });
+      return res.status(401).json({
+        message: "Token expired. Please sign in again.",
+        code: "TOKEN_EXPIRED",
+      });
     }
-    return res
-      .status(401)
-      .json({ message: "Invalid token", code: "INVALID_TOKEN" });
+    return res.status(401).json({
+      message: "Unauthorized: Invalid token",
+      code: "INVALID_TOKEN",
+    });
   }
 }
 
-/* ── Health check ───────────────────────────────────────── */
-app.get("/", (_req, res) =>
-  res.json({
+/* =====================
+   Health Check
+===================== */
+app.get("/", (_req, res) => {
+  res.status(200).json({
     status: "ok",
     service: "YPN Backend",
     time: new Date().toISOString(),
-  }),
-);
+  });
+});
 
-/* ── MongoDB ────────────────────────────────────────────── */
+/* =====================
+   MongoDB Setup
+===================== */
 const client = new MongoClient(process.env.MONGO_URI);
-let db, bucket, upload;
+let db;
+let bucket;
+let upload; // Multer upload initialized after DB connects
 
 async function connectDB() {
   await client.connect();
@@ -79,23 +109,29 @@ async function connectDB() {
 }
 
 connectDB().catch((err) => {
-  console.error("❌ MongoDB failed:", err.message);
+  console.error("❌ MongoDB connection failed:", err.message);
   process.exit(1);
 });
 
-/* ── POST /api/auth/verify ──────────────────────────────────
+/* =====================
+   POST /api/auth/verify
+   ─────────────────────
    Flow:
      1. Client signs in via Firebase SDK → gets ID token
-     2. Client sends  Authorization: Bearer <idToken>
-     3. verifyFirebaseToken middleware validates with Admin SDK
+     2. Client POSTs here with  Authorization: Bearer <idToken>
+     3. We verify with Admin SDK  (not a JWT library — Admin SDK handles rotation, revocation)
      4. We enforce email_verified
-     5. We upsert user in MongoDB
+     5. We upsert the user in MongoDB
      6. We return { uid, email, hasProfile }
-─────────────────────────────────────────────────────────── */
+   
+   The client stores the raw Firebase ID token in SecureStore and
+   sends it on every subsequent request. No second JWT is needed.
+===================== */
 app.post("/api/auth/verify", verifyFirebaseToken, async (req, res) => {
   try {
     const { uid, email, email_verified, name } = req.user;
 
+    // Enforce email verification
     if (!email_verified) {
       return res.status(403).json({
         message: "Please verify your email before signing in.",
@@ -103,6 +139,7 @@ app.post("/api/auth/verify", verifyFirebaseToken, async (req, res) => {
       });
     }
 
+    // Upsert user document
     const result = await db.collection("users").findOneAndUpdate(
       { uid },
       {
@@ -116,7 +153,9 @@ app.post("/api/auth/verify", verifyFirebaseToken, async (req, res) => {
       { upsert: true, returnDocument: "after" },
     );
 
-    const hasProfile = !!result?.name?.trim();
+    const user = result; // findOneAndUpdate with returnDocument:'after' returns the doc
+    const hasProfile = !!user?.name?.trim();
+
     res.json({ uid, email, hasProfile });
   } catch (err) {
     console.error("/api/auth/verify error:", err);
@@ -124,13 +163,22 @@ app.post("/api/auth/verify", verifyFirebaseToken, async (req, res) => {
   }
 });
 
-/* ── POST /api/users/profile ────────────────────────────────
-   Create / update display name + optional photo.
-   Body: multipart/form-data  { name: string, photo?: file }
-─────────────────────────────────────────────────────────── */
+/* =====================
+   POST /api/users/profile
+   ─────────────────────
+   Create / update the user's display name and optional photo.
+   Protected: must send Authorization: Bearer <firebase_id_token>
+   
+   Body (multipart/form-data):
+     name   — string (required)
+     photo  — file   (optional)
+===================== */
 app.post("/api/users/profile", verifyFirebaseToken, (req, res) => {
-  if (!upload)
-    return res.status(503).json({ message: "Server starting, try again" });
+  if (!upload) {
+    return res
+      .status(503)
+      .json({ message: "Server still starting, try again shortly." });
+  }
 
   upload.single("photo")(req, res, async (err) => {
     if (err) return res.status(500).json({ message: err.message });
@@ -158,13 +206,16 @@ app.post("/api/users/profile", verifyFirebaseToken, (req, res) => {
 
       res.json({ success: true });
     } catch (e) {
-      console.error("POST /api/users/profile error:", e);
+      console.error("/api/users/profile POST error:", e);
       res.status(500).json({ message: e.message });
     }
   });
 });
 
-/* ── GET /api/users/profile ─────────────────────────────── */
+/* =====================
+   GET /api/users/profile
+   Protected — returns the logged-in user's profile.
+===================== */
 app.get("/api/users/profile", verifyFirebaseToken, async (req, res) => {
   try {
     const user = await db
@@ -182,6 +233,7 @@ app.get("/api/users/profile", verifyFirebaseToken, async (req, res) => {
           },
         },
       );
+
     if (!user) return res.status(404).json({ message: "Profile not found" });
     res.json(user);
   } catch (e) {
@@ -189,20 +241,27 @@ app.get("/api/users/profile", verifyFirebaseToken, async (req, res) => {
   }
 });
 
-/* ── GET /photos/:filename ──────────────────────────────── */
+/* =====================
+   GET /photos/:filename
+   Stream a GridFS photo.
+===================== */
 app.get("/photos/:filename", async (req, res) => {
   try {
     const files = await db
       .collection("photos.files")
       .find({ filename: req.params.filename })
       .toArray();
+
     if (!files.length) return res.status(404).send("File not found");
+
     bucket.openDownloadStreamByName(req.params.filename).pipe(res);
   } catch (e) {
     res.status(500).json({ message: e.message });
   }
 });
 
-/* ── Start ──────────────────────────────────────────────── */
+/* =====================
+   Start Server
+===================== */
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
-app.listen(PORT, () => console.log(`🚀 YPN backend on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 YPN backend running on port ${PORT}`));
