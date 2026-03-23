@@ -42,3 +42,12 @@ app-example
 /ios
 /android
 .env
+backend/config/
+.env
+backend/.env
+backend/config/
+.env
+backend/.env
+.env
+backend/.env
+backend/config/
