@@ -1,527 +1,465 @@
 // src/screens/foryou.tsx
 import { Ionicons } from "@expo/vector-icons";
-import AsyncStorage from "@react-native-async-storage/async-storage";
-import { LinearGradient } from "expo-linear-gradient";
-import { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Dimensions,
   FlatList,
+  Image,
+  Platform,
+  StatusBar as RNStatusBar,
   Share,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
-  ViewToken,
 } from "react-native";
-import { WebView } from "react-native-webview";
+// VideoPlayer is in its own file to prevent Metro from registering
+// RNCWebView twice during hot-reload (Invariant Violation fix).
+import VideoPlayer from "../components/VideoPlayer";
 import { auth } from "../firebase/auth";
 
-const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get("window");
+const { width: W, height: H } = Dimensions.get("window");
+const BOTTOM_TAB_HEIGHT = 86;
+const STATUS_BAR_H =
+  Platform.OS === "android" ? (RNStatusBar.currentHeight ?? 24) : 0;
+
 const API_URL = process.env.EXPO_PUBLIC_API_URL;
 
-// ─── Cache config ─────────────────────────────────────────────────────────────
-const CACHE_KEY = "YPN_FORYOU_VIDEOS_V2";
-const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
-const BG_REFRESH_AFTER_MS = 3 * 60 * 60 * 1000; // background-refresh after 3h
+// ── Number formatter — 1200000 → "1.2M", 45000 → "45K" ──────────────────────
+function fmt(n: number | null | undefined): string {
+  if (n == null) return "—";
+  if (n >= 1_000_000)
+    return (n / 1_000_000).toFixed(1).replace(/\.0$/, "") + "M";
+  if (n >= 1_000) return (n / 1_000).toFixed(1).replace(/\.0$/, "") + "K";
+  return n.toString();
+}
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-interface VideoItem {
+// ── Types ─────────────────────────────────────────────────────────────────────
+type VideoItem = {
   videoId: string;
   title: string;
-  url: string;
-  thumbnail: string;
   channelTitle: string;
-  channelURL: string;
-}
+  thumbnail: string;
+  url: string;
+  viewCount: number | null;
+  likeCount: number | null;
+  commentCount: number | null;
+};
 
-interface CacheEntry {
-  videos: VideoItem[];
-  savedAt: number;
-}
+// ── Fallback videos (shown if backend is cold / offline) ──────────────────────
+const FALLBACK: VideoItem[] = [
+  {
+    videoId: "X6-jQFdQHUY",
+    title: "Youth Empowerment — Find Your Purpose",
+    channelTitle: "YPN Zimbabwe",
+    thumbnail: "https://img.youtube.com/vi/X6-jQFdQHUY/hqdefault.jpg",
+    url: "https://www.youtube.com/watch?v=X6-jQFdQHUY",
+    viewCount: null,
+    likeCount: null,
+    commentCount: null,
+  },
+  {
+    videoId: "ugcSDR_Z0sA",
+    title: "Mental Health Tips for Young People",
+    channelTitle: "Mental Health Africa",
+    thumbnail: "https://img.youtube.com/vi/ugcSDR_Z0sA/hqdefault.jpg",
+    url: "https://www.youtube.com/watch?v=ugcSDR_Z0sA",
+    viewCount: null,
+    likeCount: null,
+    commentCount: null,
+  },
+  {
+    videoId: "ZmWBrN7QV6Y",
+    title: "How to Build Skills for the Future",
+    channelTitle: "Education Hub",
+    thumbnail: "https://img.youtube.com/vi/ZmWBrN7QV6Y/hqdefault.jpg",
+    url: "https://www.youtube.com/watch?v=ZmWBrN7QV6Y",
+    viewCount: null,
+    likeCount: null,
+    commentCount: null,
+  },
+];
 
-// ─── Cache helpers ────────────────────────────────────────────────────────────
-async function loadCache(): Promise<CacheEntry | null> {
-  try {
-    const raw = await AsyncStorage.getItem(CACHE_KEY);
-    if (!raw) return null;
-    return JSON.parse(raw) as CacheEntry;
-  } catch {
-    return null;
-  }
-}
-
-async function saveCache(videos: VideoItem[]): Promise<void> {
-  try {
-    const entry: CacheEntry = { videos, savedAt: Date.now() };
-    await AsyncStorage.setItem(CACHE_KEY, JSON.stringify(entry));
-  } catch {
-    // Non-critical
-  }
-}
-
-// ─── Build YouTube embed HTML ─────────────────────────────────────────────────
-// Using youtube-nocookie.com + full HTML injection fixes Error 153
-// ("Video unavailable / not configured for embedded playback")
-// that appears with source={{ uri }} on many YouTube videos.
-function buildEmbedHtml(videoId: string, autoplay: boolean): string {
-  return `<!DOCTYPE html>
-<html>
-<head>
-  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-  <style>
-    *{margin:0;padding:0;box-sizing:border-box}
-    html,body{width:100%;height:100%;background:#000;overflow:hidden}
-    iframe{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:100%;height:100%;border:none}
-  </style>
-</head>
-<body>
-  <iframe
-    src="https://www.youtube-nocookie.com/embed/${videoId}?autoplay=${autoplay ? 1 : 0}&playsinline=1&rel=0&modestbranding=1&controls=1&enablejsapi=1"
-    allow="autoplay;encrypted-media;fullscreen"
-    allowfullscreen
-    frameborder="0"
-  ></iframe>
-</body>
-</html>`;
-}
-
-// ─── Skeleton card ────────────────────────────────────────────────────────────
-function SkeletonCard() {
-  return (
-    <View style={styles.card}>
-      <View
-        style={[StyleSheet.absoluteFillObject, { backgroundColor: "#111" }]}
-      />
-      <LinearGradient
-        colors={["transparent", "rgba(0,0,0,0.92)"]}
-        style={styles.gradientOverlay}
-        pointerEvents="none"
-      >
-        <View style={{ padding: 20, paddingBottom: 110 }}>
-          <View
-            style={[styles.skeletonLine, { width: "40%", marginBottom: 10 }]}
-          />
-          <View style={[styles.skeletonLine, { width: "78%" }]} />
-          <View style={[styles.skeletonLine, { width: "55%", marginTop: 7 }]} />
-        </View>
-      </LinearGradient>
-    </View>
-  );
-}
-
-// ─── Video card ───────────────────────────────────────────────────────────────
-function VideoCard({
-  item,
-  isActive,
-  liked,
-  likeCount,
-  onLike,
+// ── Single stat pill ──────────────────────────────────────────────────────────
+const Stat = ({
+  icon,
+  value,
+  color = "#fff",
 }: {
-  item: VideoItem;
-  isActive: boolean;
-  liked: boolean;
-  likeCount: number;
-  onLike: () => void;
-}) {
-  const embedHtml = buildEmbedHtml(item.videoId, isActive);
+  icon: string;
+  value: string;
+  color?: string;
+}) => (
+  <View style={s.statPill}>
+    <Ionicons name={icon as any} size={15} color={color} />
+    <Text style={[s.statText, { color }]}>{value}</Text>
+  </View>
+);
 
-  const handleShare = async () => {
-    try {
-      await Share.share({
-        message: `${item.title}\n\nWatch on YouTube: ${item.url}`,
-        url: item.url,
-        title: item.title,
-      });
-    } catch {
-      // user dismissed
-    }
-  };
+// ── Single video card ─────────────────────────────────────────────────────────
+const VideoCard = React.memo(
+  ({
+    item,
+    onWatched,
+  }: {
+    item: VideoItem;
+    onWatched: (id: string) => void;
+  }) => {
+    const [liked, setLiked] = useState(false);
+    const [playing, setPlaying] = useState(false);
 
-  const formatCount = (n: number) =>
-    n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n);
+    const handlePlay = useCallback(() => {
+      onWatched(item.videoId);
+      setPlaying(true);
+    }, [item.videoId, onWatched]);
 
-  return (
-    <View style={styles.card}>
-      {/* ── Player ─────────────────────────────────────────────────────── */}
-      <WebView
-        source={{
-          html: embedHtml,
-          baseUrl: "https://www.youtube-nocookie.com",
-        }}
-        style={styles.webview}
-        allowsInlineMediaPlayback
-        mediaPlaybackRequiresUserAction={false}
-        allowsFullscreenVideo
-        javaScriptEnabled
-        domStorageEnabled
-        originWhitelist={["*"]}
-        mixedContentMode="always"
-        backgroundColor="#000000"
-        onShouldStartLoadWithRequest={(req) =>
-          req.url.includes("youtube-nocookie.com") ||
-          req.url.includes("youtube.com") ||
-          req.url === "about:blank"
-        }
-      />
+    const handleShare = useCallback(async () => {
+      try {
+        await Share.share({ message: `${item.title}\n${item.url}` });
+      } catch {}
+    }, [item]);
 
-      {/* ── Gradient overlay ────────────────────────────────────────────── */}
-      <LinearGradient
-        colors={["transparent", "rgba(0,0,0,0.5)", "rgba(0,0,0,0.93)"]}
-        locations={[0, 0.35, 1]}
-        style={styles.gradientOverlay}
-        pointerEvents="none"
-      />
-
-      {/* ── Right actions ───────────────────────────────────────────────── */}
-      <View style={styles.actions}>
-        <TouchableOpacity
-          style={styles.actionBtn}
-          onPress={onLike}
-          activeOpacity={0.7}
-        >
-          <Ionicons
-            name={liked ? "heart" : "heart-outline"}
-            size={34}
-            color={liked ? "#FF2D55" : "#FFFFFF"}
+    return (
+      <View style={s.card}>
+        {playing ? (
+          <VideoPlayer
+            videoId={item.videoId}
+            onClose={() => setPlaying(false)}
           />
-          <Text style={styles.actionLabel}>{formatCount(likeCount)}</Text>
-        </TouchableOpacity>
+        ) : (
+          <>
+            {/* ── Thumbnail ── */}
+            <TouchableOpacity
+              activeOpacity={0.92}
+              onPress={handlePlay}
+              style={StyleSheet.absoluteFill}
+            >
+              <Image
+                source={{ uri: item.thumbnail }}
+                style={StyleSheet.absoluteFill}
+                resizeMode="cover"
+              />
+              {/* Scrim: two overlapping semi-transparent views to fake gradient */}
+              <View style={s.scrimTop} />
+              <View style={s.scrimBottom} />
 
-        <TouchableOpacity
-          style={styles.actionBtn}
-          onPress={handleShare}
-          activeOpacity={0.7}
-        >
-          <Ionicons name="share-social-outline" size={32} color="#FFFFFF" />
-          <Text style={styles.actionLabel}>Share</Text>
-        </TouchableOpacity>
-      </View>
+              {/* Play button */}
+              <View style={s.playWrap} pointerEvents="none">
+                <View style={s.playCircle}>
+                  <Ionicons name="play" size={30} color="#fff" />
+                </View>
+              </View>
+            </TouchableOpacity>
 
-      {/* ── Bottom metadata ─────────────────────────────────────────────── */}
-      <View style={styles.meta} pointerEvents="none">
-        <Text style={styles.channelName} numberOfLines={1}>
-          {item.channelTitle}
-        </Text>
-        <Text style={styles.videoTitle} numberOfLines={2}>
-          {item.title}
-        </Text>
+            {/* ── LEFT side: Like / Share / Play ── */}
+            <View style={s.actions}>
+              <TouchableOpacity
+                onPress={() => setLiked((p) => !p)}
+                style={s.actionBtn}
+              >
+                <Ionicons
+                  name={liked ? "heart" : "heart-outline"}
+                  size={30}
+                  color={liked ? "#FF3B57" : "#fff"}
+                />
+                <Text style={s.actionLabel}>
+                  {liked ? fmt((item.likeCount ?? 0) + 1) : fmt(item.likeCount)}
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity onPress={handleShare} style={s.actionBtn}>
+                <Ionicons name="share-social-outline" size={28} color="#fff" />
+                <Text style={s.actionLabel}>Share</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity onPress={handlePlay} style={s.actionBtn}>
+                <Ionicons name="play-circle-outline" size={30} color="#fff" />
+                <Text style={s.actionLabel}>Play</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* ── Info + stats just above bottom tab bar ── */}
+            <View style={s.info}>
+              {/* Channel name */}
+              <View style={s.channelRow}>
+                <View style={s.channelDot} />
+                <Text style={s.channelText} numberOfLines={1}>
+                  {item.channelTitle}
+                </Text>
+              </View>
+
+              {/* Title */}
+              <Text style={s.titleText} numberOfLines={2}>
+                {item.title}
+              </Text>
+
+              {/* Real YouTube stats row */}
+              <View style={s.statsRow}>
+                <Stat icon="eye-outline" value={fmt(item.viewCount)} />
+                <Stat
+                  icon="heart-outline"
+                  value={fmt(item.likeCount)}
+                  color="#FF3B57"
+                />
+                <Stat
+                  icon="chatbubble-outline"
+                  value={fmt(item.commentCount)}
+                />
+              </View>
+            </View>
+          </>
+        )}
       </View>
-    </View>
-  );
+    );
+  },
+);
+
+// ── Retry on 503 (Render free-tier cold starts) ───────────────────────────────
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit,
+  retries = 3,
+  delayMs = 3000,
+): Promise<Response> {
+  let lastErr: unknown;
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await fetch(url, options);
+      if (res.status === 503 && i < retries - 1) {
+        await new Promise((r) => setTimeout(r, delayMs));
+        continue;
+      }
+      return res;
+    } catch (e) {
+      lastErr = e;
+      if (i < retries - 1) await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  throw lastErr;
 }
 
-// ─── Main screen ──────────────────────────────────────────────────────────────
+// ── Main screen ───────────────────────────────────────────────────────────────
 export default function ForYouScreen() {
   const [videos, setVideos] = useState<VideoItem[]>([]);
   const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [activeIndex, setActiveIndex] = useState(0);
-  const [likes, setLikes] = useState<
-    Record<string, { liked: boolean; count: number }>
-  >({});
-
-  const flatListRef = useRef<FlatList>(null);
-  const watchedRef = useRef<Set<string>>(new Set());
-
-  // ── Seed like counters ────────────────────────────────────────────────────
-  const initLikes = (vids: VideoItem[]) => {
-    setLikes((prev) => {
-      const next = { ...prev };
-      vids.forEach((v) => {
-        if (!next[v.videoId]) {
-          next[v.videoId] = {
-            liked: false,
-            count: Math.floor(Math.random() * 4800) + 200,
-          };
-        }
-      });
-      return next;
-    });
-  };
-
-  // ── Fetch from backend ────────────────────────────────────────────────────
-  const fetchFromNetwork = useCallback(async (silent = false) => {
-    try {
-      const uid = auth.currentUser?.uid ?? "anonymous";
-      const res = await fetch(`${API_URL}/api/videos/foryou`, {
-        headers: { "x-user-uid": uid },
-      });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.message ?? `Server error ${res.status}`);
-      }
-      const data: VideoItem[] = await res.json();
-      if (!Array.isArray(data) || data.length === 0) {
-        throw new Error("No videos available right now.");
-      }
-      if (!silent) setVideos(data);
-      else setVideos((prev) => (prev.length === 0 ? data : prev)); // bg refresh: only replace if empty
-      initLikes(data);
-      await saveCache(data);
-      return data;
-    } catch (err: any) {
-      if (!silent) throw err;
-      return null;
-    }
-  }, []);
-
-  // ── Main load ─────────────────────────────────────────────────────────────
-  const fetchFeed = useCallback(
-    async (isRefresh = false) => {
-      if (isRefresh) setRefreshing(true);
-      else setLoading(true);
-      setError(null);
-
-      try {
-        // Skip cache on manual pull-to-refresh
-        if (!isRefresh) {
-          const cached = await loadCache();
-          if (
-            cached &&
-            cached.videos.length >= 10 &&
-            Date.now() - cached.savedAt < CACHE_TTL_MS
-          ) {
-            setVideos(cached.videos);
-            initLikes(cached.videos);
-            setLoading(false);
-
-            // Background refresh if cache is getting stale
-            if (Date.now() - cached.savedAt > BG_REFRESH_AFTER_MS) {
-              fetchFromNetwork(true); // fire and forget
-            }
-            return;
-          }
-        }
-
-        await fetchFromNetwork(false);
-      } catch (err: any) {
-        // Network failed — try stale cache as fallback
-        const cached = await loadCache();
-        if (cached && cached.videos.length > 0) {
-          setVideos(cached.videos);
-          initLikes(cached.videos);
-          // Don't show error — stale data is fine
-        } else {
-          setError(err.message ?? "Failed to load videos.");
-        }
-      } finally {
-        setLoading(false);
-        setRefreshing(false);
-      }
-    },
-    [fetchFromNetwork],
-  );
+  const [usedFallback, setUsedFallback] = useState(false);
+  const flatRef = useRef<FlatList>(null);
 
   useEffect(() => {
     fetchFeed();
-  }, [fetchFeed]);
+  }, []);
 
-  // ── Watched tracking ──────────────────────────────────────────────────────
-  const markWatched = useCallback(async (videoId: string) => {
-    if (watchedRef.current.has(videoId)) return;
-    watchedRef.current.add(videoId);
+  const fetchFeed = async () => {
+    setLoading(true);
+    setUsedFallback(false);
     try {
-      const uid = auth.currentUser?.uid ?? "anonymous";
+      const uid = auth?.currentUser?.uid ?? "anonymous";
+      const res = await fetchWithRetry(
+        `${API_URL}/api/videos/foryou`,
+        { headers: { "x-user-uid": uid } },
+        3,
+        3000,
+      );
+      if (!res.ok) throw new Error(`status ${res.status}`);
+      const data: VideoItem[] = await res.json();
+      setVideos(data.length > 0 ? data : FALLBACK);
+      if (data.length === 0) setUsedFallback(true);
+    } catch (e) {
+      console.warn("ForYou fetch failed:", e);
+      setVideos(FALLBACK);
+      setUsedFallback(true);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const markWatched = useCallback(async (videoId: string) => {
+    try {
+      const uid = auth?.currentUser?.uid;
+      if (!uid) return;
       await fetch(`${API_URL}/api/videos/watched`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-user-uid": uid },
         body: JSON.stringify({ videoId }),
       });
-    } catch {
-      /* non-critical */
-    }
+    } catch {}
   }, []);
 
-  // ── Viewability ───────────────────────────────────────────────────────────
-  const onViewableItemsChanged = useCallback(
-    ({ viewableItems }: { viewableItems: ViewToken[] }) => {
-      if (!viewableItems.length) return;
-      const idx = viewableItems[0].index ?? 0;
-      setActiveIndex((prev) => {
-        if (prev !== idx && videos[prev]) markWatched(videos[prev].videoId);
-        return idx;
-      });
-    },
-    [videos, markWatched],
-  );
-
-  const viewabilityConfig = useRef({ itemVisiblePercentThreshold: 75 }).current;
-
-  // ── Like toggle ───────────────────────────────────────────────────────────
-  const toggleLike = useCallback((videoId: string) => {
-    setLikes((prev) => {
-      const cur = prev[videoId] ?? { liked: false, count: 0 };
-      return {
-        ...prev,
-        [videoId]: {
-          liked: !cur.liked,
-          count: cur.liked ? cur.count - 1 : cur.count + 1,
-        },
-      };
-    });
-  }, []);
-
-  // ── Render ────────────────────────────────────────────────────────────────
   if (loading) {
     return (
-      <View style={styles.centered}>
-        <SkeletonCard />
-        <ActivityIndicator
-          size="large"
-          color="#fff"
-          style={StyleSheet.absoluteFillObject}
-        />
-      </View>
-    );
-  }
-
-  if (error && videos.length === 0) {
-    return (
-      <View style={styles.centered}>
-        <Ionicons name="wifi-outline" size={52} color="#444" />
-        <Text style={styles.errorText}>{error}</Text>
-        <TouchableOpacity
-          style={styles.retryBtn}
-          onPress={() => fetchFeed(true)}
-        >
-          <Text style={styles.retryLabel}>Try again</Text>
-        </TouchableOpacity>
+      <View style={s.centre}>
+        <ActivityIndicator size="large" color="#1DB954" />
+        <Text style={s.loadingText}>Loading your feed…</Text>
       </View>
     );
   }
 
   return (
-    <FlatList
-      ref={flatListRef}
-      data={videos}
-      keyExtractor={(item) => item.videoId}
-      renderItem={({ item, index }) => {
-        const ls = likes[item.videoId] ?? { liked: false, count: 0 };
-        return (
-          <VideoCard
-            item={item}
-            isActive={index === activeIndex}
-            liked={ls.liked}
-            likeCount={ls.count}
-            onLike={() => toggleLike(item.videoId)}
-          />
-        );
-      }}
-      pagingEnabled
-      snapToInterval={SCREEN_H}
-      snapToAlignment="start"
-      decelerationRate="fast"
-      showsVerticalScrollIndicator={false}
-      onViewableItemsChanged={onViewableItemsChanged}
-      viewabilityConfig={viewabilityConfig}
-      refreshing={refreshing}
-      onRefresh={() => fetchFeed(true)}
-      getItemLayout={(_d, index) => ({
-        length: SCREEN_H,
-        offset: SCREEN_H * index,
-        index,
-      })}
-      initialNumToRender={3}
-      maxToRenderPerBatch={4}
-      windowSize={7}
-      removeClippedSubviews={false} // keep WebViews alive — prevents reload on scroll-back
-    />
+    <View style={s.root}>
+      {usedFallback && (
+        <View style={s.banner}>
+          <Ionicons name="bookmark-outline" size={13} color="#FFD60A" />
+          <Text style={s.bannerText}>
+            Showing saved videos — pull down to refresh
+          </Text>
+        </View>
+      )}
+
+      <FlatList
+        ref={flatRef}
+        data={videos}
+        keyExtractor={(v) => v.videoId}
+        renderItem={({ item }) => (
+          <VideoCard item={item} onWatched={markWatched} />
+        )}
+        pagingEnabled
+        snapToInterval={H}
+        snapToAlignment="start"
+        decelerationRate="fast"
+        showsVerticalScrollIndicator={false}
+        onRefresh={fetchFeed}
+        refreshing={loading}
+      />
+    </View>
   );
 }
 
-// ─── Styles ───────────────────────────────────────────────────────────────────
-const styles = StyleSheet.create({
-  card: {
-    width: SCREEN_W,
-    height: SCREEN_H,
-    backgroundColor: "#000",
-  },
-  webview: {
+// ── Styles ────────────────────────────────────────────────────────────────────
+const s = StyleSheet.create({
+  root: { flex: 1, backgroundColor: "#000" },
+
+  centre: {
     flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
     backgroundColor: "#000",
+    gap: 12,
   },
-  gradientOverlay: {
+  loadingText: { color: "#8E8E93", fontSize: 14 },
+
+  card: { width: W, height: H, backgroundColor: "#111", overflow: "hidden" },
+
+  // Two-layer scrim to simulate a gradient without expo-linear-gradient
+  scrimTop: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    height: H * 0.25,
+    backgroundColor: "rgba(0,0,0,0.35)",
+  },
+  scrimBottom: {
     position: "absolute",
     bottom: 0,
     left: 0,
     right: 0,
-    height: SCREEN_H * 0.55,
-    justifyContent: "flex-end",
+    height: H * 0.55,
+    backgroundColor: "rgba(0,0,0,0.6)",
   },
+
+  playWrap: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  playCircle: {
+    width: 70,
+    height: 70,
+    borderRadius: 35,
+    backgroundColor: "rgba(0,0,0,0.48)",
+    borderWidth: 2,
+    borderColor: "rgba(255,255,255,0.65)",
+    justifyContent: "center",
+    alignItems: "center",
+    paddingLeft: 4,
+  },
+
+  // LEFT actions
   actions: {
     position: "absolute",
-    right: 14,
-    bottom: 110,
+    left: 14,
+    bottom: BOTTOM_TAB_HEIGHT + 110,
     alignItems: "center",
-    gap: 28,
+    gap: 20,
   },
-  actionBtn: {
-    alignItems: "center",
+  actionBtn: { alignItems: "center", gap: 3 },
+  actionLabel: {
+    color: "#fff",
+    fontSize: 11,
+    fontWeight: "600",
+    textShadowColor: "rgba(0,0,0,0.9)",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 3,
+  },
+
+  // Info block — offset right so it doesn't overlap action buttons
+  info: {
+    position: "absolute",
+    left: 62,
+    right: 14,
+    bottom: BOTTOM_TAB_HEIGHT + 14,
     gap: 5,
   },
-  actionLabel: {
-    color: "#FFF",
-    fontSize: 12,
+  channelRow: { flexDirection: "row", alignItems: "center", gap: 6 },
+  channelDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: "#1DB954",
+    flexShrink: 0,
+  },
+  channelText: {
+    color: "#1DB954",
+    fontSize: 13,
     fontWeight: "700",
+    flexShrink: 1,
     textShadowColor: "rgba(0,0,0,0.9)",
     textShadowOffset: { width: 0, height: 1 },
     textShadowRadius: 4,
   },
-  meta: {
-    position: "absolute",
-    bottom: 90,
-    left: 16,
-    right: 80,
-  },
-  channelName: {
-    color: "#1DB954",
-    fontSize: 13,
-    fontWeight: "800",
-    marginBottom: 5,
-    textShadowColor: "rgba(0,0,0,0.9)",
-    textShadowOffset: { width: 0, height: 1 },
-    textShadowRadius: 5,
-  },
-  videoTitle: {
-    color: "#FFF",
-    fontSize: 14,
-    fontWeight: "600",
-    lineHeight: 20,
-    textShadowColor: "rgba(0,0,0,0.9)",
-    textShadowOffset: { width: 0, height: 1 },
-    textShadowRadius: 5,
-  },
-  skeletonLine: {
-    height: 13,
-    backgroundColor: "#2a2a2a",
-    borderRadius: 6,
-  },
-  centered: {
-    flex: 1,
-    backgroundColor: "#000",
-    justifyContent: "center",
-    alignItems: "center",
-    padding: 32,
-    gap: 18,
-  },
-  errorText: {
-    color: "#777",
+  titleText: {
+    color: "#fff",
     fontSize: 15,
-    textAlign: "center",
-    lineHeight: 22,
-  },
-  retryBtn: {
-    paddingHorizontal: 32,
-    paddingVertical: 12,
-    borderRadius: 24,
-    borderWidth: 1.5,
-    borderColor: "#1DB954",
-  },
-  retryLabel: {
-    color: "#1DB954",
-    fontSize: 14,
     fontWeight: "700",
+    lineHeight: 21,
+    textShadowColor: "rgba(0,0,0,0.9)",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 6,
   },
+
+  // Stats row
+  statsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    marginTop: 2,
+  },
+  statPill: { flexDirection: "row", alignItems: "center", gap: 4 },
+  statText: {
+    color: "#fff",
+    fontSize: 12,
+    fontWeight: "600",
+    textShadowColor: "rgba(0,0,0,0.9)",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 3,
+  },
+
+  // Fallback banner
+  banner: {
+    position: "absolute",
+    top: STATUS_BAR_H,
+    left: 0,
+    right: 0,
+    zIndex: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: "rgba(255,214,10,0.12)",
+    borderBottomWidth: 1,
+    borderBottomColor: "rgba(255,214,10,0.25)",
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+  },
+  bannerText: { color: "#FFD60A", fontSize: 12 },
 });
