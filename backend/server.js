@@ -115,23 +115,11 @@ connectDB().catch((err) => {
 
 /* =====================
    POST /api/auth/verify
-   ─────────────────────
-   Flow:
-     1. Client signs in via Firebase SDK → gets ID token
-     2. Client POSTs here with  Authorization: Bearer <idToken>
-     3. We verify with Admin SDK  (not a JWT library — Admin SDK handles rotation, revocation)
-     4. We enforce email_verified
-     5. We upsert the user in MongoDB
-     6. We return { uid, email, hasProfile }
-   
-   The client stores the raw Firebase ID token in SecureStore and
-   sends it on every subsequent request. No second JWT is needed.
 ===================== */
 app.post("/api/auth/verify", verifyFirebaseToken, async (req, res) => {
   try {
     const { uid, email, email_verified, name } = req.user;
 
-    // Enforce email verification
     if (!email_verified) {
       return res.status(403).json({
         message: "Please verify your email before signing in.",
@@ -139,7 +127,6 @@ app.post("/api/auth/verify", verifyFirebaseToken, async (req, res) => {
       });
     }
 
-    // Upsert user document
     const result = await db.collection("users").findOneAndUpdate(
       { uid },
       {
@@ -153,7 +140,7 @@ app.post("/api/auth/verify", verifyFirebaseToken, async (req, res) => {
       { upsert: true, returnDocument: "after" },
     );
 
-    const user = result; // findOneAndUpdate with returnDocument:'after' returns the doc
+    const user = result;
     const hasProfile = !!user?.name?.trim();
 
     res.json({ uid, email, hasProfile });
@@ -165,13 +152,6 @@ app.post("/api/auth/verify", verifyFirebaseToken, async (req, res) => {
 
 /* =====================
    POST /api/users/profile
-   ─────────────────────
-   Create / update the user's display name and optional photo.
-   Protected: must send Authorization: Bearer <firebase_id_token>
-   
-   Body (multipart/form-data):
-     name   — string (required)
-     photo  — file   (optional)
 ===================== */
 app.post("/api/users/profile", verifyFirebaseToken, (req, res) => {
   if (!upload) {
@@ -214,7 +194,6 @@ app.post("/api/users/profile", verifyFirebaseToken, (req, res) => {
 
 /* =====================
    GET /api/users/profile
-   Protected — returns the logged-in user's profile.
 ===================== */
 app.get("/api/users/profile", verifyFirebaseToken, async (req, res) => {
   try {
@@ -243,7 +222,6 @@ app.get("/api/users/profile", verifyFirebaseToken, async (req, res) => {
 
 /* =====================
    GET /photos/:filename
-   Stream a GridFS photo.
 ===================== */
 app.get("/photos/:filename", async (req, res) => {
   try {
@@ -259,6 +237,12 @@ app.get("/photos/:filename", async (req, res) => {
     res.status(500).json({ message: e.message });
   }
 });
+
+/* =====================
+   Video Routes – TikTok-style feed
+===================== */
+const videoRoutes = require("./src/routes/videoRoutes");
+app.use("/api/videos", videoRoutes);
 
 /* =====================
    Start Server
