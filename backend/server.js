@@ -8,7 +8,7 @@ const cors = require("cors");
 const multer = require("multer");
 const { GridFsStorage } = require("multer-gridfs-storage");
 const admin = require("firebase-admin");
-
+const { init: initUserVideos } = require("./src/models/UserVideos");
 /* =====================
    Firebase Admin SDK
    Credentials live in FIREBASE_ADMIN_KEY env var (JSON string).
@@ -95,6 +95,7 @@ let upload; // Multer upload initialized after DB connects
 async function connectDB() {
   await client.connect();
   db = client.db("ypn_users");
+  initUserVideos(db);
   bucket = new GridFSBucket(db, { bucketName: "photos" });
   console.log("✅ Connected to MongoDB");
 
@@ -197,21 +198,19 @@ app.post("/api/users/profile", verifyFirebaseToken, (req, res) => {
 ===================== */
 app.get("/api/users/profile", verifyFirebaseToken, async (req, res) => {
   try {
-    const user = await db
-      .collection("users")
-      .findOne(
-        { uid: req.user.uid },
-        {
-          projection: {
-            _id: 0,
-            uid: 1,
-            email: 1,
-            name: 1,
-            photoPath: 1,
-            hasProfile: 1,
-          },
+    const user = await db.collection("users").findOne(
+      { uid: req.user.uid },
+      {
+        projection: {
+          _id: 0,
+          uid: 1,
+          email: 1,
+          name: 1,
+          photoPath: 1,
+          hasProfile: 1,
         },
-      );
+      },
+    );
 
     if (!user) return res.status(404).json({ message: "Profile not found" });
     res.json(user);

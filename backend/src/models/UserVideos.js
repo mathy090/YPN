@@ -1,19 +1,19 @@
+// backend/src/models/UserVideos.js
 "use strict";
-const { MongoClient } = require("mongodb");
-const client = new MongoClient(process.env.MONGO_URI);
 
-let db;
-async function getDB() {
-  if (!db) {
-    await client.connect();
-    db = client.db("ypn_users");
-  }
-  return db;
+let _db = null;
+
+function init(db) {
+  _db = db;
+}
+
+function getDB() {
+  if (!_db) throw new Error("UserVideos not initialised — call init(db) first");
+  return _db;
 }
 
 async function addWatchedVideo(uid, videoId) {
-  const database = await getDB();
-  await database
+  await getDB()
     .collection("users")
     .updateOne(
       { uid },
@@ -23,11 +23,10 @@ async function addWatchedVideo(uid, videoId) {
 }
 
 async function getWatchedVideos(uid) {
-  const database = await getDB();
-  const user = await database
+  const user = await getDB()
     .collection("users")
     .findOne({ uid }, { projection: { _id: 0, watchedVideos: 1 } });
-  return user?.watchedVideos || [];
+  return user?.watchedVideos ?? [];
 }
 
-module.exports = { addWatchedVideo, getWatchedVideos };
+module.exports = { init, addWatchedVideo, getWatchedVideos };
