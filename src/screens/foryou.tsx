@@ -1,42 +1,67 @@
 // src/screens/foryou.tsx
-import { Ionicons } from '@expo/vector-icons';
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+//
+// TikTok-style full-screen vertical feed.
+//
+// Key changes vs previous version:
+//  • Card height = full device height (edge-to-edge, no gaps)
+//  • Actions moved to RIGHT side (TikTok style), vertically stacked
+//  • Info text (channel + title + stats) sits at bottom-left, above the tab bar
+//  • Error 143 fix: autoplay is NOT in the initial embed URL on Android.
+//    Instead we use a JS injection after load to start playback, which bypasses
+//    the Android WebView media-config restriction that causes Error 143.
+//  • Two-layer cache: MMKV (L1, device) + backend (L2, network)
+
+import { Ionicons } from "@expo/vector-icons";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Dimensions,
   FlatList,
   Image,
   Platform,
-  Share,
   StatusBar as RNStatusBar,
+  Share,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
-} from 'react-native';
-import { MMKV } from 'react-native-mmkv';
-import VideoPlayer from '../components/VideoPlayer';
-import { auth } from '../firebase/auth';
+} from "react-native";
+import { MMKV } from "react-native-mmkv";
+import { WebView } from "react-native-webview";
+import { auth } from "../firebase/auth";
 
-// MMKV instance — stored on device, survives app kills
-const mmkv = new MMKV({ id: 'foryou-cache' });
-const MMKV_KEY = 'foryou_feed_v1';
-const MMKV_TS_KEY = 'foryou_feed_ts_v1';
-const MMKV_TTL = 60 * 60 * 1000; // 1 hour — matches backend TTL
+// ─── Constants ────────────────────────────────────────────────────────────────
+// Lazy singleton — MMKV requires the native bridge to be ready.
+// Instantiating at module-level crashes on cold start before the bridge mounts.
+let _mmkv: MMKV | null = null;
+function getMMKV(): MMKV {
+  if (!_mmkv) _mmkv = new MMKV({ id: "foryou-cache" });
+  return _mmkv;
+}
 
-const { width: W, height: H } = Dimensions.get('window');
-const BOTTOM_TAB_HEIGHT = 86;
-const STATUS_BAR_H = Platform.OS === 'android' ? (RNStatusBar.currentHeight ?? 24) : 0;
+const MMKV_KEY = "foryou_feed_v1";
+const MMKV_TS_KEY = "foryou_feed_ts_v1";
+const MMKV_TTL = 60 * 60 * 1000; // 1 hour
+
+const { width: W, height: H } = Dimensions.get("window");
+
+// Bottom tab bar height — keep in sync with tabs/_layout.tsx
+const BOTTOM_TAB_H = 86 + 16; // height + bottom offset
+
+// Height of the floating community tab bar
+const TOP_NAV_H =
+  48 + (Platform.OS === "android" ? (RNStatusBar.currentHeight ?? 24) : 44);
+
 const API_URL = process.env.EXPO_PUBLIC_API_URL;
 
-// ── MMKV helpers ──────────────────────────────────────────────────────────────
+// ─── MMKV helpers ─────────────────────────────────────────────────────────────
 function readCache(): VideoItem[] | null {
   try {
-    const ts = mmkv.getNumber(MMKV_TS_KEY);
+    const store = getMMKV();
+    const ts = store.getNumber(MMKV_TS_KEY);
     if (!ts || Date.now() - ts > MMKV_TTL) return null;
-    const raw = mmkv.getString(MMKV_KEY);
-    if (!raw) return null;
-    return JSON.parse(raw) as VideoItem[];
+    const raw = store.getString(MMKV_KEY);
+    return raw ? (JSON.parse(raw) as VideoItem[]) : null;
   } catch {
     return null;
   }
@@ -44,17 +69,13 @@ function readCache(): VideoItem[] | null {
 
 function writeCache(videos: VideoItem[]) {
   try {
-    mmkv.set(MMKV_KEY, JSON.stringify(videos));
-    mmkv.set(MMKV_TS_KEY, Date.now());
-  } catch { }
+    const store = getMMKV();
+    store.set(MMKV_KEY, JSON.stringify(videos));
+    store.set(MMKV_TS_KEY, Date.now());
+  } catch {}
 }
 
-function clearCache() {
-  mmkv.delete(MMKV_KEY);
-  mmkv.delete(MMKV_TS_KEY);
-}
-
-// ── Types ─────────────────────────────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────────────────
 type VideoItem = {
   videoId: string;
   title: string;
@@ -66,43 +87,50 @@ type VideoItem = {
   commentCount: number | null;
 };
 
-// ── Hardcoded fallback — shown only if both MMKV and backend fail ─────────────
+// ─── Fallback ─────────────────────────────────────────────────────────────────
 const FALLBACK: VideoItem[] = [
   {
-    videoId: 'X6-jQFdQHUY',
-    title: 'Youth Empowerment — Find Your Purpose',
-    channelTitle: 'YPN Zimbabwe',
-    thumbnail: 'https://img.youtube.com/vi/X6-jQFdQHUY/hqdefault.jpg',
-    url: 'https://www.youtube.com/watch?v=X6-jQFdQHUY',
-    viewCount: null, likeCount: null, commentCount: null,
+    videoId: "X6-jQFdQHUY",
+    title: "Youth Empowerment — Find Your Purpose",
+    channelTitle: "YPN Zimbabwe",
+    thumbnail: "https://img.youtube.com/vi/X6-jQFdQHUY/hqdefault.jpg",
+    url: "https://www.youtube.com/watch?v=X6-jQFdQHUY",
+    viewCount: null,
+    likeCount: null,
+    commentCount: null,
   },
   {
-    videoId: 'ugcSDR_Z0sA',
-    title: 'Mental Health Tips for Young People',
-    channelTitle: 'Mental Health Africa',
-    thumbnail: 'https://img.youtube.com/vi/ugcSDR_Z0sA/hqdefault.jpg',
-    url: 'https://www.youtube.com/watch?v=ugcSDR_Z0sA',
-    viewCount: null, likeCount: null, commentCount: null,
+    videoId: "ugcSDR_Z0sA",
+    title: "Mental Health Tips for Young People",
+    channelTitle: "Mental Health Africa",
+    thumbnail: "https://img.youtube.com/vi/ugcSDR_Z0sA/hqdefault.jpg",
+    url: "https://www.youtube.com/watch?v=ugcSDR_Z0sA",
+    viewCount: null,
+    likeCount: null,
+    commentCount: null,
   },
   {
-    videoId: 'ZmWBrN7QV6Y',
-    title: 'How to Build Skills for the Future',
-    channelTitle: 'Education Hub',
-    thumbnail: 'https://img.youtube.com/vi/ZmWBrN7QV6Y/hqdefault.jpg',
-    url: 'https://www.youtube.com/watch?v=ZmWBrN7QV6Y',
-    viewCount: null, likeCount: null, commentCount: null,
+    videoId: "ZmWBrN7QV6Y",
+    title: "How to Build Skills for the Future",
+    channelTitle: "Education Hub",
+    thumbnail: "https://img.youtube.com/vi/ZmWBrN7QV6Y/hqdefault.jpg",
+    url: "https://www.youtube.com/watch?v=ZmWBrN7QV6Y",
+    viewCount: null,
+    likeCount: null,
+    commentCount: null,
   },
 ];
 
-// ── Number formatter ──────────────────────────────────────────────────────────
+// ─── Formatters ───────────────────────────────────────────────────────────────
 function fmt(n: number | null | undefined): string {
-  if (n == null) return '—';
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1).replace(/\.0$/, '') + 'M';
-  if (n >= 1_000) return (n / 1_000).toFixed(1).replace(/\.0$/, '') + 'K';
+  if (n == null) return "—";
+  if (n >= 1_000_000)
+    return (n / 1_000_000).toFixed(1).replace(/\.0$/, "") + "M";
+  if (n >= 1_000) return (n / 1_000).toFixed(1).replace(/\.0$/, "") + "K";
   return n.toString();
 }
 
-// ── Retry on 503 (Render cold start) ─────────────────────────────────────────
+// ─── Retry fetch ──────────────────────────────────────────────────────────────
 async function fetchWithRetry(
   url: string,
   options: RequestInit,
@@ -126,165 +154,265 @@ async function fetchWithRetry(
   throw lastErr;
 }
 
-// ── Stat pill ─────────────────────────────────────────────────────────────────
-const Stat = ({ icon, value, color = '#fff' }: { icon: string; value: string; color?: string }) => (
-  <View style={s.statPill}>
-    <Ionicons name={icon as any} size={14} color={color} />
-    <Text style={[s.statText, { color }]}>{value}</Text>
-  </View>
-);
+// ─── Inline video player ──────────────────────────────────────────────────────
+// Error 143 fix for Android:
+//   • Initial embed URL does NOT include autoplay=1
+//   • After the WebView finishes loading we inject JS to call playVideo()
+//     This bypasses Android's restrictive media-config policy that rejects
+//     autoplay requests made inside the iframe src (Error 143 / PlayerError)
+//   • On iOS, autoplay in the URL still works fine so we keep it
+const buildEmbedHtml = (videoId: string) => {
+  const isAndroid = Platform.OS === "android";
 
-// ── Single video card ─────────────────────────────────────────────────────────
-const VideoCard = React.memo(({
-  item,
-  onWatched,
-}: {
-  item: VideoItem;
-  onWatched: (id: string) => void;
-}) => {
-  const [liked, setLiked] = useState(false);
-  const [playing, setPlaying] = useState(false);
+  // Android: no autoplay in URL — we'll trigger via postMessage after load
+  // iOS: autoplay=1 in URL works fine
+  const autoplayParam = isAndroid ? "0" : "1";
 
-  const handlePlay = useCallback(() => {
-    onWatched(item.videoId);
-    setPlaying(true);
-  }, [item.videoId, onWatched]);
+  return `<!DOCTYPE html>
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+    <style>
+      *{margin:0;padding:0;background:#000;box-sizing:border-box}
+      html,body{width:100%;height:100%;overflow:hidden}
+      iframe{width:100%;height:100%;border:none;display:block}
+    </style>
+  </head>
+  <body>
+    <iframe
+      id="player"
+      src="https://www.youtube.com/embed/${videoId}?autoplay=${autoplayParam}&playsinline=1&rel=0&modestbranding=1&enablejsapi=1&origin=https://ypn.app"
+      allow="accelerometer;autoplay;clipboard-write;encrypted-media;gyroscope;picture-in-picture;fullscreen"
+      allowfullscreen
+    ></iframe>
+    <script>
+      // Android autoplay workaround: use YouTube IFrame API postMessage
+      // to call playVideo() after the player is ready, avoiding Error 143
+      var player = document.getElementById('player');
+      var played = false;
 
-  const handleShare = useCallback(async () => {
-    try { await Share.share({ message: `${item.title}\n${item.url}` }); } catch { }
-  }, [item]);
+      function tryPlay() {
+        if (played) return;
+        played = true;
+        player.contentWindow.postMessage(
+          JSON.stringify({ event: 'command', func: 'playVideo', args: [] }),
+          '*'
+        );
+      }
 
-  return (
-    <View style={s.card}>
-      {playing ? (
-        <VideoPlayer videoId={item.videoId} onClose={() => setPlaying(false)} />
-      ) : (
-        <>
-          <TouchableOpacity activeOpacity={0.92} onPress={handlePlay} style={StyleSheet.absoluteFill}>
-            <Image source={{ uri: item.thumbnail }} style={StyleSheet.absoluteFill} resizeMode="cover" />
+      // Fire after a short delay to give the player time to initialise
+      setTimeout(tryPlay, 800);
+
+      // Also fire on any touch — belt-and-braces for strict Android policies
+      document.addEventListener('touchend', tryPlay, { once: true });
+    </script>
+  </body>
+</html>`;
+};
+
+// ─── Video card ───────────────────────────────────────────────────────────────
+const VideoCard = React.memo(
+  ({
+    item,
+    isActive,
+    onWatched,
+  }: {
+    item: VideoItem;
+    isActive: boolean;
+    onWatched: (id: string) => void;
+  }) => {
+    const [liked, setLiked] = useState(false);
+    const [playing, setPlaying] = useState(false);
+    const webViewRef = useRef<any>(null);
+
+    // Auto-play when card scrolls into view; pause when it leaves
+    useEffect(() => {
+      if (isActive) {
+        setPlaying(true);
+        onWatched(item.videoId);
+      } else {
+        setPlaying(false);
+      }
+    }, [isActive]);
+
+    const handleShare = useCallback(async () => {
+      try {
+        await Share.share({ message: `${item.title}\n${item.url}` });
+      } catch {}
+    }, [item]);
+
+    return (
+      <View style={s.card}>
+        {/* ── Video / Thumbnail ── */}
+        {playing ? (
+          <WebView
+            ref={webViewRef}
+            source={{ html: buildEmbedHtml(item.videoId) }}
+            style={StyleSheet.absoluteFill}
+            allowsInlineMediaPlayback
+            // Android: must be true to allow JS-triggered autoplay
+            mediaPlaybackRequiresUserAction={false}
+            allowsFullscreenVideo
+            javaScriptEnabled
+            domStorageEnabled
+            originWhitelist={["*"]}
+            // Suppress the yellow box warning on Android about mixed content
+            mixedContentMode="always"
+          />
+        ) : (
+          <TouchableOpacity
+            activeOpacity={0.95}
+            style={StyleSheet.absoluteFill}
+            onPress={() => {
+              setPlaying(true);
+              onWatched(item.videoId);
+            }}
+          >
+            <Image
+              source={{ uri: item.thumbnail }}
+              style={StyleSheet.absoluteFill}
+              resizeMode="cover"
+            />
             <View style={s.scrimTop} />
             <View style={s.scrimBottom} />
+            {/* Play button */}
             <View style={s.playWrap} pointerEvents="none">
               <View style={s.playCircle}>
-                <Ionicons name="play" size={30} color="#fff" />
+                <Ionicons name="play" size={32} color="#fff" />
               </View>
             </View>
           </TouchableOpacity>
+        )}
 
-          {/* LEFT actions */}
-          <View style={s.actions}>
-            <TouchableOpacity onPress={() => setLiked((p) => !p)} style={s.actionBtn}>
-              <Ionicons
-                name={liked ? 'heart' : 'heart-outline'}
-                size={30}
-                color={liked ? '#FF3B57' : '#fff'}
-              />
-              <Text style={s.actionLabel}>
-                {fmt(liked ? (item.likeCount ?? 0) + 1 : item.likeCount)}
+        {/* ── Gradient scrims (always on top) ── */}
+        {playing && (
+          <>
+            <View style={s.scrimTop} pointerEvents="none" />
+            <View style={s.scrimBottom} pointerEvents="none" />
+          </>
+        )}
+
+        {/* ── RIGHT side action buttons (TikTok style) ── */}
+        <View style={s.actions} pointerEvents="box-none">
+          {/* Like */}
+          <TouchableOpacity
+            onPress={() => setLiked((p) => !p)}
+            style={s.actionBtn}
+            activeOpacity={0.7}
+          >
+            <Ionicons
+              name={liked ? "heart" : "heart-outline"}
+              size={32}
+              color={liked ? "#FF3B57" : "#fff"}
+            />
+            <Text style={s.actionLabel}>
+              {fmt(liked ? (item.likeCount ?? 0) + 1 : item.likeCount)}
+            </Text>
+          </TouchableOpacity>
+
+          {/* Share */}
+          <TouchableOpacity
+            onPress={handleShare}
+            style={s.actionBtn}
+            activeOpacity={0.7}
+          >
+            <Ionicons name="share-social-outline" size={29} color="#fff" />
+            <Text style={s.actionLabel}>Share</Text>
+          </TouchableOpacity>
+
+          {/* Comments placeholder */}
+          <TouchableOpacity style={s.actionBtn} activeOpacity={0.7}>
+            <Ionicons name="chatbubble-outline" size={29} color="#fff" />
+            <Text style={s.actionLabel}>{fmt(item.commentCount)}</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* ── Bottom info (channel + title + stats) ── */}
+        <View style={s.info} pointerEvents="none">
+          <View style={s.channelRow}>
+            <View style={s.channelDot} />
+            <Text style={s.channelText} numberOfLines={1}>
+              {item.channelTitle}
+            </Text>
+          </View>
+          <Text style={s.titleText} numberOfLines={2}>
+            {item.title}
+          </Text>
+          <View style={s.statsRow}>
+            <View style={s.statPill}>
+              <Ionicons name="eye-outline" size={13} color="#fff" />
+              <Text style={s.statText}>{fmt(item.viewCount)}</Text>
+            </View>
+            <View style={s.statPill}>
+              <Ionicons name="heart-outline" size={13} color="#FF3B57" />
+              <Text style={[s.statText, { color: "#FF3B57" }]}>
+                {fmt(item.likeCount)}
               </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity onPress={handleShare} style={s.actionBtn}>
-              <Ionicons name="share-social-outline" size={28} color="#fff" />
-              <Text style={s.actionLabel}>Share</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity onPress={handlePlay} style={s.actionBtn}>
-              <Ionicons name="play-circle-outline" size={30} color="#fff" />
-              <Text style={s.actionLabel}>Play</Text>
-            </TouchableOpacity>
-          </View>
-
-          {/* Info above bottom tab bar */}
-          <View style={s.info}>
-            <View style={s.channelRow}>
-              <View style={s.channelDot} />
-              <Text style={s.channelText} numberOfLines={1}>{item.channelTitle}</Text>
-            </View>
-            <Text style={s.titleText} numberOfLines={2}>{item.title}</Text>
-            <View style={s.statsRow}>
-              <Stat icon="eye-outline" value={fmt(item.viewCount)} />
-              <Stat icon="heart-outline" value={fmt(item.likeCount)} color="#FF3B57" />
-              <Stat icon="chatbubble-outline" value={fmt(item.commentCount)} />
             </View>
           </View>
-        </>
-      )}
-    </View>
-  );
-});
+        </View>
+      </View>
+    );
+  },
+);
 
-// ── Main screen ───────────────────────────────────────────────────────────────
-// Cache strategy:
-//   1. Read MMKV immediately → show feed with zero loading spinner
-//   2. If MMKV is fresh (< 1h), skip network call entirely
-//   3. If stale / missing, fetch from backend in background,
-//      update MMKV + state when done
-//   4. If backend fails, keep showing MMKV data (or FALLBACK as last resort)
-
+// ─── Main screen ──────────────────────────────────────────────────────────────
 export default function ForYouScreen() {
   const [videos, setVideos] = useState<VideoItem[]>([]);
-  const [loading, setLoading] = useState(true);       // true only on first ever load
-  const [refreshing, setRefreshing] = useState(false); // pull-to-refresh spinner
-  const [cacheSource, setCacheSource] = useState<'live' | 'device' | 'saved' | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [cacheSource, setCacheSource] = useState<
+    "live" | "device" | "saved" | null
+  >(null);
+  const [activeIndex, setActiveIndex] = useState(0);
+
   const flatRef = useRef<FlatList>(null);
 
   useEffect(() => {
     bootFeed();
   }, []);
 
-  /** Called once on mount. Shows MMKV instantly, refreshes if stale. */
   const bootFeed = async () => {
     const cached = readCache();
     if (cached && cached.length > 0) {
       setVideos(cached);
-      setCacheSource('device');
+      setCacheSource("device");
       setLoading(false);
-      // Still refresh in the background if > 30 min old
-      const ts = mmkv.getNumber(MMKV_TS_KEY) ?? 0;
-      if (Date.now() - ts > 30 * 60 * 1000) {
-        backgroundRefresh();
-      }
+      const ts = getMMKV().getNumber(MMKV_TS_KEY) ?? 0;
+      if (Date.now() - ts > 30 * 60 * 1000) backgroundRefresh();
     } else {
-      // No device cache at all — must fetch
       await fetchFeed(false);
     }
   };
 
-  /** Silent background refresh — does NOT show a spinner */
   const backgroundRefresh = async () => {
     try {
       const data = await fetchFromBackend();
       if (data.length > 0) {
         writeCache(data);
         setVideos(data);
-        setCacheSource('live');
+        setCacheSource("live");
       }
-    } catch {
-      // Already showing device cache — just leave it
-    }
+    } catch {}
   };
 
-  /** Full refresh (pull-to-refresh or manual retry) */
   const fetchFeed = async (isManual = true) => {
     if (isManual) setRefreshing(true);
     else setLoading(true);
-
     try {
       const data = await fetchFromBackend();
       if (data.length > 0) {
         writeCache(data);
         setVideos(data);
-        setCacheSource('live');
+        setCacheSource("live");
       } else {
         fallback();
       }
     } catch {
-      // Try device cache first
       const cached = readCache();
       if (cached && cached.length > 0) {
         setVideos(cached);
-        setCacheSource('device');
+        setCacheSource("device");
       } else {
         fallback();
       }
@@ -296,15 +424,14 @@ export default function ForYouScreen() {
 
   const fallback = () => {
     setVideos(FALLBACK);
-    setCacheSource('saved');
+    setCacheSource("saved");
   };
 
-  /** Raw network call to backend */
   const fetchFromBackend = async (): Promise<VideoItem[]> => {
-    const uid = auth?.currentUser?.uid ?? 'anonymous';
+    const uid = auth?.currentUser?.uid ?? "anonymous";
     const res = await fetchWithRetry(
       `${API_URL}/api/videos/foryou`,
-      { headers: { 'x-user-uid': uid } },
+      { headers: { "x-user-uid": uid } },
       3,
       3000,
     );
@@ -317,12 +444,23 @@ export default function ForYouScreen() {
       const uid = auth?.currentUser?.uid;
       if (!uid) return;
       await fetch(`${API_URL}/api/videos/watched`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-user-uid': uid },
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-user-uid": uid },
         body: JSON.stringify({ videoId }),
       });
-    } catch { }
+    } catch {}
   }, []);
+
+  const onViewableItemsChanged = useCallback(
+    ({ viewableItems }: { viewableItems: any[] }) => {
+      if (viewableItems.length > 0) {
+        setActiveIndex(viewableItems[0].index ?? 0);
+      }
+    },
+    [],
+  );
+
+  const viewabilityConfig = useRef({ itemVisiblePercentThreshold: 80 });
 
   if (loading) {
     return (
@@ -335,17 +473,39 @@ export default function ForYouScreen() {
 
   const bannerConfig = {
     live: null,
-    device: { icon: 'flash-outline', color: '#1DB954', text: 'Feed loaded from device' },
-    saved: { icon: 'bookmark-outline', color: '#FFD60A', text: 'Showing saved videos — pull to refresh' },
-  };
-  const banner = cacheSource ? bannerConfig[cacheSource] : null;
+    device: {
+      icon: "flash-outline",
+      color: "#1DB954",
+      text: "Feed loaded from device",
+    },
+    saved: {
+      icon: "bookmark-outline",
+      color: "#FFD60A",
+      text: "Showing saved videos — pull to refresh",
+    },
+  } as const;
+  const banner =
+    cacheSource && cacheSource !== "live" ? bannerConfig[cacheSource] : null;
 
   return (
     <View style={s.root}>
+      {/* Cache banner — shown briefly above the floating nav */}
       {banner && (
-        <View style={[s.banner, { backgroundColor: `${banner.color}18`, borderBottomColor: `${banner.color}33` }]}>
+        <View
+          style={[
+            s.banner,
+            {
+              top: TOP_NAV_H + 4,
+              backgroundColor: `${banner.color}18`,
+              borderBottomColor: `${banner.color}33`,
+            },
+          ]}
+          pointerEvents="none"
+        >
           <Ionicons name={banner.icon as any} size={13} color={banner.color} />
-          <Text style={[s.bannerText, { color: banner.color }]}>{banner.text}</Text>
+          <Text style={[s.bannerText, { color: banner.color }]}>
+            {banner.text}
+          </Text>
         </View>
       )}
 
@@ -353,68 +513,170 @@ export default function ForYouScreen() {
         ref={flatRef}
         data={videos}
         keyExtractor={(v) => v.videoId}
-        renderItem={({ item }) => <VideoCard item={item} onWatched={markWatched} />}
+        renderItem={({ item, index }) => (
+          <VideoCard
+            item={item}
+            isActive={index === activeIndex}
+            onWatched={markWatched}
+          />
+        )}
         pagingEnabled
+        // Snap each card to exactly the full screen height
         snapToInterval={H}
         snapToAlignment="start"
         decelerationRate="fast"
         showsVerticalScrollIndicator={false}
         onRefresh={() => fetchFeed(true)}
         refreshing={refreshing}
+        onViewableItemsChanged={onViewableItemsChanged}
+        viewabilityConfig={viewabilityConfig.current}
+        // Render one extra card above and below for smoother swiping
+        windowSize={3}
+        maxToRenderPerBatch={2}
+        initialNumToRender={2}
       />
     </View>
   );
 }
 
-// ── Styles ────────────────────────────────────────────────────────────────────
+// ─── Styles ───────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
-  root: { flex: 1, backgroundColor: '#000' },
-  centre: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#000', gap: 12 },
-  loadingText: { color: '#8E8E93', fontSize: 14 },
+  root: { flex: 1, backgroundColor: "#000" },
+  centre: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: "#000",
+    gap: 12,
+  },
+  loadingText: { color: "#8E8E93", fontSize: 14 },
 
-  card: { width: W, height: H, backgroundColor: '#111', overflow: 'hidden' },
+  // Full-screen card — covers the entire display including under nav bars
+  card: {
+    width: W,
+    height: H,
+    backgroundColor: "#111",
+    overflow: "hidden",
+  },
 
-  scrimTop: { position: 'absolute', top: 0, left: 0, right: 0, height: H * 0.22, backgroundColor: 'rgba(0,0,0,0.32)' },
-  scrimBottom: { position: 'absolute', bottom: 0, left: 0, right: 0, height: H * 0.55, backgroundColor: 'rgba(0,0,0,0.58)' },
+  // Gradient overlays for legibility
+  scrimTop: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    height: H * 0.25,
+    backgroundColor: "rgba(0,0,0,0.35)",
+  },
+  scrimBottom: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    height: H * 0.5,
+    backgroundColor: "rgba(0,0,0,0.55)",
+  },
 
-  playWrap: { ...StyleSheet.absoluteFillObject, justifyContent: 'center', alignItems: 'center' },
+  // Play button centred overlay
+  playWrap: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: "center",
+    alignItems: "center",
+  },
   playCircle: {
-    width: 70, height: 70, borderRadius: 35,
-    backgroundColor: 'rgba(0,0,0,0.48)',
-    borderWidth: 2, borderColor: 'rgba(255,255,255,0.65)',
-    justifyContent: 'center', alignItems: 'center', paddingLeft: 4,
+    width: 74,
+    height: 74,
+    borderRadius: 37,
+    backgroundColor: "rgba(0,0,0,0.5)",
+    borderWidth: 2,
+    borderColor: "rgba(255,255,255,0.6)",
+    justifyContent: "center",
+    alignItems: "center",
+    paddingLeft: 4,
   },
 
-  actions: { position: 'absolute', left: 14, bottom: BOTTOM_TAB_HEIGHT + 110, alignItems: 'center', gap: 20 },
-  actionBtn: { alignItems: 'center', gap: 3 },
+  // ── RIGHT side actions (TikTok style) ──────────────────────────
+  actions: {
+    position: "absolute",
+    right: 12,
+    // Sit above the bottom tab bar with comfortable padding
+    bottom: BOTTOM_TAB_H + 80,
+    alignItems: "center",
+    gap: 22,
+  },
+  actionBtn: { alignItems: "center", gap: 3 },
   actionLabel: {
-    color: '#fff', fontSize: 11, fontWeight: '600',
-    textShadowColor: 'rgba(0,0,0,0.9)', textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 3,
+    color: "#fff",
+    fontSize: 11,
+    fontWeight: "600",
+    textShadowColor: "rgba(0,0,0,0.9)",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 3,
   },
 
-  info: { position: 'absolute', left: 62, right: 14, bottom: BOTTOM_TAB_HEIGHT + 14, gap: 5 },
-  channelRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  channelDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: '#1DB954', flexShrink: 0 },
+  // ── Bottom info block ───────────────────────────────────────────
+  // Left edge to just before the action buttons
+  info: {
+    position: "absolute",
+    left: 14,
+    right: 70, // leave room for the right-side actions column
+    bottom: BOTTOM_TAB_H + 20,
+    gap: 5,
+  },
+  channelRow: { flexDirection: "row", alignItems: "center", gap: 6 },
+  channelDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: "#1DB954",
+    flexShrink: 0,
+  },
   channelText: {
-    color: '#1DB954', fontSize: 13, fontWeight: '700', flexShrink: 1,
-    textShadowColor: 'rgba(0,0,0,0.9)', textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 4,
+    color: "#1DB954",
+    fontSize: 13,
+    fontWeight: "700",
+    flexShrink: 1,
+    textShadowColor: "rgba(0,0,0,0.9)",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 4,
   },
   titleText: {
-    color: '#fff', fontSize: 15, fontWeight: '700', lineHeight: 21,
-    textShadowColor: 'rgba(0,0,0,0.9)', textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 6,
+    color: "#fff",
+    fontSize: 15,
+    fontWeight: "700",
+    lineHeight: 21,
+    textShadowColor: "rgba(0,0,0,0.9)",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 6,
   },
-
-  statsRow: { flexDirection: 'row', alignItems: 'center', gap: 12, marginTop: 2 },
-  statPill: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  statsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    marginTop: 2,
+  },
+  statPill: { flexDirection: "row", alignItems: "center", gap: 4 },
   statText: {
-    color: '#fff', fontSize: 12, fontWeight: '600',
-    textShadowColor: 'rgba(0,0,0,0.9)', textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 3,
+    color: "#fff",
+    fontSize: 12,
+    fontWeight: "600",
+    textShadowColor: "rgba(0,0,0,0.9)",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 3,
   },
 
+  // Cache source banner
   banner: {
-    position: 'absolute', top: STATUS_BAR_H, left: 0, right: 0, zIndex: 10,
-    flexDirection: 'row', alignItems: 'center', gap: 6,
-    borderBottomWidth: 1, paddingHorizontal: 14, paddingVertical: 7,
+    position: "absolute",
+    left: 0,
+    right: 0,
+    zIndex: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    borderBottomWidth: 1,
+    paddingHorizontal: 14,
+    paddingVertical: 7,
   },
   bannerText: { fontSize: 12 },
 });

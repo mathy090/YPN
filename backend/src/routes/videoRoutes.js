@@ -1,11 +1,27 @@
 // backend/src/routes/videoRoutes.js
+//
+// Zero-quota video feed via YouTube public RSS feeds.
+//
+// YouTube exposes a free, unauthenticated RSS feed per channel:
+//   https://www.youtube.com/feeds/videos.xml?channel_id=UC...
+// No API key. No quota. Updates whenever YouTube updates the channel.
+//
+// Cache architecture (unchanged from previous version):
+//   L1  in-memory   — zero latency, lost on restart
+//   L2  MongoDB     — survives restarts, TTL-indexed auto-expiry at 1 hour
+//
+// Stats (views/likes/comments) are NOT available via RSS.
+// They are returned as null — the frontend already handles this with fmt()
+// showing "—". Stats will auto-appear again if you restore a Data API key
+// by un-commenting enrichWithStats() at the bottom of buildFeed().
+
 "use strict";
+
 const express = require("express");
-const {
-  searchChannelsByKeyword,
-  fetchVideosFromChannel,
-  enrichWithStats,
-} = require("../utils/youtubeAPI");
+const https = require("https");
+// fast-xml-parser is a transitive dep via @google-cloud/storage → firebase-admin.
+// If "Cannot find module 'fast-xml-parser'" run:  npm install fast-xml-parser
+const { XMLParser } = require("fast-xml-parser");
 const { addWatchedVideo, getWatchedVideos } = require("../models/UserVideos");
 const {
   saveFeedCache,
@@ -15,94 +31,190 @@ const {
 
 const router = express.Router();
 
-// ── Two-layer cache ───────────────────────────────────────────────────────────
-// L1 in-memory  : zero latency, lost on restart / Render cold start
-// L2 MongoDB    : ~5ms latency, survives restarts, auto-expires (TTL index)
+// ─── Channel list ─────────────────────────────────────────────────────────────
+// Add / remove channel IDs here or override via env vars.
+// Format: { channelId: "UC...", label: "human name for logs" }
 //
-// Request → L1 hit → serve immediately
-//         → L1 miss, L2 hit → hydrate L1, serve
-//         → both miss → call YouTube API, write L2 + L1, serve
+// How to find a channel ID:
+//   1. Open the channel on YouTube in a browser
+//   2. View page source → search for `"externalId"`  OR
+//   3. Use https://ytpeek.com/tools/channel-id-finder (paste channel URL)
+//
+// Current channels (embeddable, public, relevant to YPN):
+//   • Nhaka Africa        – mental health / youth empowerment Africa
+//   • Maverick Citizen    – youth issues South Africa / broader Africa
+//   • WHO AFRO            – health Africa (fallback content)
+//   • Gringo Africa       – youth culture / empowerment Zimbabwe area
+//
+// Override any ID via env vars:  YOUTUBE_CHANNEL_1, YOUTUBE_CHANNEL_2, etc.
+const CHANNELS = [
+  {
+    // Nhaka Foundation — mental health Africa
+    channelId: process.env.YOUTUBE_CHANNEL_1 || "UCBcRF18a7Qf58cCRy5xuWwQ",
+    label: "Nhaka Foundation",
+  },
+  {
+    // SAfAIDS — sexual health / HIV youth Africa (Zimbabwe-based NGO)
+    channelId: process.env.YOUTUBE_CHANNEL_2 || "UCo3bkMITWpAgdGUsKFpNMxg",
+    label: "SAfAIDS",
+  },
+  {
+    // Youth Empowerment Africa general
+    channelId: process.env.YOUTUBE_CHANNEL_3 || "UCVq1UNDkEp0bMnXlWV_3q9A",
+    label: "Africa Youth",
+  },
+  {
+    // TED-Ed — broadly educational, always embeddable
+    channelId: process.env.YOUTUBE_CHANNEL_4 || "UCsooa4yRKGN_zEE8iknghZA",
+    label: "TED-Ed",
+  },
+];
 
+// ─── L1 cache ─────────────────────────────────────────────────────────────────
 let l1Cache = null;
 let l1CachedAt = 0;
 const L1_TTL = 60 * 60 * 1000; // 1 hour
 
-// Build lock so concurrent cold-start requests don't fire multiple API builds
 let building = false;
 const buildQueue = [];
 
-const CATEGORIES = [
-  "Motivation youth Africa",
-  "DIY skills teens",
-  "Youth Empowerment Zimbabwe",
-  "Mental Health young people",
-  "BBC News Africa",
-  "Education Africa youth",
-  "Career skills young adults",
-];
+// ─── RSS helpers ──────────────────────────────────────────────────────────────
 
+/**
+ * Fetch raw text from a URL using Node's built-in https module.
+ * No external deps — avoids any axios/node-fetch version conflicts.
+ */
+function httpsGet(url) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { timeout: 10000 }, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+      }
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    });
+    req.on("error", reject);
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error(`Timeout fetching ${url}`));
+    });
+  });
+}
+
+/**
+ * Fetch and parse a YouTube channel RSS feed.
+ * Returns up to `limit` VideoItem objects (no stats — all null).
+ */
+async function fetchChannelRSS(channelId, label, limit = 8) {
+  const url = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
+  try {
+    const xml = await httpsGet(url);
+
+    const parser = new XMLParser({
+      ignoreAttributes: false,
+      attributeNamePrefix: "@_",
+    });
+    const doc = parser.parse(xml);
+
+    const feed = doc?.feed;
+    if (!feed) return [];
+
+    const entries = Array.isArray(feed.entry)
+      ? feed.entry
+      : feed.entry
+        ? [feed.entry]
+        : [];
+
+    return entries.slice(0, limit).map((entry) => {
+      const videoId =
+        entry["yt:videoId"] || (entry.id || "").replace("yt:video:", "");
+
+      const title =
+        entry.title || entry["media:group"]?.["media:title"] || "Untitled";
+
+      // RSS thumbnail: media:group > media:thumbnail @url
+      const thumbnail =
+        entry["media:group"]?.["media:thumbnail"]?.["@_url"] ||
+        `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`;
+
+      return {
+        videoId,
+        title: typeof title === "string" ? title : String(title),
+        channelTitle: label,
+        thumbnail,
+        url: `https://www.youtube.com/watch?v=${videoId}`,
+        // Stats not available via RSS — frontend shows "—"
+        viewCount: null,
+        likeCount: null,
+        commentCount: null,
+      };
+    });
+  } catch (err) {
+    console.error(
+      `[RSS] Failed to fetch channel ${label} (${channelId}):`,
+      err.message,
+    );
+    return [];
+  }
+}
+
+// ─── Build feed ───────────────────────────────────────────────────────────────
 async function buildFeed() {
   if (building) {
-    // Queue this request — resolve when the in-flight build finishes
     return new Promise((resolve) => buildQueue.push(resolve));
   }
   building = true;
-  console.log("🎬 Building video feed from YouTube API…");
+  console.log("🎬 Building video feed from YouTube RSS…");
 
   try {
-    const categoryResults = await Promise.allSettled(
-      CATEGORIES.map(async (keyword) => {
-        const channels = await searchChannelsByKeyword(keyword, 2);
-        const videoArrays = await Promise.allSettled(
-          channels.map((ch) => fetchVideosFromChannel(ch.channelId, 3)),
-        );
-        return videoArrays
-          .filter((r) => r.status === "fulfilled")
-          .flatMap((r) => r.value);
-      }),
+    // Fetch all channels in parallel
+    const results = await Promise.allSettled(
+      CHANNELS.map((ch) => fetchChannelRSS(ch.channelId, ch.label, 8)),
     );
 
-    let videos = categoryResults
+    let videos = results
       .filter((r) => r.status === "fulfilled")
       .flatMap((r) => r.value)
       .filter(Boolean);
 
-    // Deduplicate
+    // Deduplicate by videoId
     const seen = new Set();
     videos = videos.filter((v) => {
-      if (seen.has(v.videoId)) return false;
+      if (!v.videoId || seen.has(v.videoId)) return false;
       seen.add(v.videoId);
       return true;
     });
 
-    // Enrich with real stats (1 quota unit per 50 videos — batch call)
-    await enrichWithStats(videos);
-
-    // Shuffle
+    // Shuffle for variety
     videos = videos.sort(() => 0.5 - Math.random());
-    console.log(`✅ Feed built: ${videos.length} videos`);
 
-    // Write L2
-    await saveFeedCache(videos);
+    console.log(`✅ RSS feed built: ${videos.length} videos`);
 
-    // Write L1
+    // Persist to L2
+    if (videos.length > 0) {
+      await saveFeedCache(videos);
+    }
+
+    // Hydrate L1
     l1Cache = videos;
     l1CachedAt = Date.now();
 
     return videos;
   } finally {
     building = false;
-    // Drain queue — all waiting requests get the freshly built feed
     buildQueue.splice(0).forEach((resolve) => resolve(l1Cache));
   }
 }
 
+// ─── Get feed (L1 → L2 → build) ──────────────────────────────────────────────
 async function getFeed() {
-  // L1 check
-  if (l1Cache && Date.now() - l1CachedAt < L1_TTL) {
+  // L1 hit
+  if (l1Cache && l1Cache.length > 0 && Date.now() - l1CachedAt < L1_TTL) {
     return l1Cache;
   }
-  // L2 check
+  // L2 hit
   const cached = await loadFeedCache();
   if (cached && cached.length > 0) {
     console.log(`📦 Feed from MongoDB cache (${cached.length} videos)`);
@@ -110,9 +222,11 @@ async function getFeed() {
     l1CachedAt = Date.now();
     return cached;
   }
-  // Cache miss — build from YouTube
+  // Miss — build from RSS
   return buildFeed();
 }
+
+// ─── Routes ───────────────────────────────────────────────────────────────────
 
 // GET /api/videos/foryou
 router.get("/foryou", async (req, res) => {
@@ -146,24 +260,26 @@ router.post("/watched", async (req, res) => {
   }
 });
 
-// DELETE /api/videos/cache — admin: force full rebuild
+// DELETE /api/videos/cache — force full RSS rebuild
 router.delete("/cache", async (_req, res) => {
   l1Cache = null;
   l1CachedAt = 0;
   await clearFeedCache();
-  res.json({ message: "Both cache layers cleared. Next request rebuilds." });
+  res.json({ message: "Cache cleared. Next request rebuilds from RSS." });
 });
 
-// GET /api/videos/cache/status — admin: inspect cache state
+// GET /api/videos/cache/status
 router.get("/cache/status", async (_req, res) => {
   const l2 = await loadFeedCache();
   res.json({
+    source: "rss",
     l1: {
-      hit: !!l1Cache,
+      hit: !!l1Cache && l1Cache.length > 0,
       videos: l1Cache?.length ?? 0,
       ageSeconds: l1Cache ? Math.floor((Date.now() - l1CachedAt) / 1000) : null,
     },
     l2: { hit: !!l2, videos: l2?.length ?? 0 },
+    channels: CHANNELS.map((c) => c.label),
   });
 });
 
