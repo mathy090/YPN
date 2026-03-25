@@ -1,26 +1,18 @@
 // backend/src/routes/videoRoutes.js
 //
-// Zero-quota video feed via YouTube public RSS feeds.
+// Zero-quota video feed:
+//   1. YouTube public RSS  — fetches videoId/title/thumbnail, no API key
+//   2. oEmbed filter       — removes non-embeddable videos (kills Error 153/150)
+//   3. Two-layer cache     — L1 in-memory + L2 MongoDB TTL
 //
-// YouTube exposes a free, unauthenticated RSS feed per channel:
-//   https://www.youtube.com/feeds/videos.xml?channel_id=UC...
-// No API key. No quota. Updates whenever YouTube updates the channel.
-//
-// Cache architecture (unchanged from previous version):
-//   L1  in-memory   — zero latency, lost on restart
-//   L2  MongoDB     — survives restarts, TTL-indexed auto-expiry at 1 hour
-//
-// Stats (views/likes/comments) are NOT available via RSS.
-// They are returned as null — the frontend already handles this with fmt()
-// showing "—". Stats will auto-appear again if you restore a Data API key
-// by un-commenting enrichWithStats() at the bottom of buildFeed().
+// Stats (views/likes/comments) not available via RSS → shown as "—" on frontend.
 
 "use strict";
 
 const express = require("express");
 const https = require("https");
-// fast-xml-parser is a transitive dep via @google-cloud/storage → firebase-admin.
-// If "Cannot find module 'fast-xml-parser'" run:  npm install fast-xml-parser
+// fast-xml-parser is a transitive dep via firebase-admin → @google-cloud/storage
+// If missing: npm install fast-xml-parser
 const { XMLParser } = require("fast-xml-parser");
 const { addWatchedVideo, getWatchedVideos } = require("../models/UserVideos");
 const {
@@ -32,45 +24,28 @@ const {
 const router = express.Router();
 
 // ─── Channel list ─────────────────────────────────────────────────────────────
-// Add / remove channel IDs here or override via env vars.
-// Format: { channelId: "UC...", label: "human name for logs" }
-//
-// How to find a channel ID:
-//   1. Open the channel on YouTube in a browser
-//   2. View page source → search for `"externalId"`  OR
-//   3. Use https://ytpeek.com/tools/channel-id-finder (paste channel URL)
-//
-// Current channels (embeddable, public, relevant to YPN):
-//   • Nhaka Africa        – mental health / youth empowerment Africa
-//   • Maverick Citizen    – youth issues South Africa / broader Africa
-//   • WHO AFRO            – health Africa (fallback content)
-//   • Gringo Africa       – youth culture / empowerment Zimbabwe area
-//
-// Override any ID via env vars:  YOUTUBE_CHANNEL_1, YOUTUBE_CHANNEL_2, etc.
+// Override via env vars YOUTUBE_CHANNEL_1 … YOUTUBE_CHANNEL_4 on Render.
+// To find a channel ID: view-source on the channel page, search "externalId".
 const CHANNELS = [
   {
-    // Nhaka Foundation — mental health Africa
     channelId: process.env.YOUTUBE_CHANNEL_1 || "UCBcRF18a7Qf58cCRy5xuWwQ",
-    label: "Nhaka Foundation",
+    label: "Nhaka Foundation", // mental health Africa
   },
   {
-    // SAfAIDS — sexual health / HIV youth Africa (Zimbabwe-based NGO)
     channelId: process.env.YOUTUBE_CHANNEL_2 || "UCo3bkMITWpAgdGUsKFpNMxg",
-    label: "SAfAIDS",
+    label: "SAfAIDS", // youth health Zimbabwe
   },
   {
-    // Youth Empowerment Africa general
     channelId: process.env.YOUTUBE_CHANNEL_3 || "UCVq1UNDkEp0bMnXlWV_3q9A",
-    label: "Africa Youth",
+    label: "Africa Youth", // youth empowerment
   },
   {
-    // TED-Ed — broadly educational, always embeddable
     channelId: process.env.YOUTUBE_CHANNEL_4 || "UCsooa4yRKGN_zEE8iknghZA",
-    label: "TED-Ed",
+    label: "TED-Ed", // always embeddable, educational
   },
 ];
 
-// ─── L1 cache ─────────────────────────────────────────────────────────────────
+// ─── L1 in-memory cache ───────────────────────────────────────────────────────
 let l1Cache = null;
 let l1CachedAt = 0;
 const L1_TTL = 60 * 60 * 1000; // 1 hour
@@ -78,18 +53,13 @@ const L1_TTL = 60 * 60 * 1000; // 1 hour
 let building = false;
 const buildQueue = [];
 
-// ─── RSS helpers ──────────────────────────────────────────────────────────────
-
-/**
- * Fetch raw text from a URL using Node's built-in https module.
- * No external deps — avoids any axios/node-fetch version conflicts.
- */
+// ─── Helpers: low-level HTTPS GET ─────────────────────────────────────────────
 function httpsGet(url) {
   return new Promise((resolve, reject) => {
     const req = https.get(url, { timeout: 10000 }, (res) => {
       if (res.statusCode !== 200) {
         res.resume();
-        return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+        return reject(new Error(`HTTP ${res.statusCode} — ${url}`));
       }
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
@@ -98,26 +68,21 @@ function httpsGet(url) {
     req.on("error", reject);
     req.on("timeout", () => {
       req.destroy();
-      reject(new Error(`Timeout fetching ${url}`));
+      reject(new Error(`Timeout: ${url}`));
     });
   });
 }
 
-/**
- * Fetch and parse a YouTube channel RSS feed.
- * Returns up to `limit` VideoItem objects (no stats — all null).
- */
+// ─── RSS feed parser ──────────────────────────────────────────────────────────
 async function fetchChannelRSS(channelId, label, limit = 8) {
   const url = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
   try {
     const xml = await httpsGet(url);
-
     const parser = new XMLParser({
       ignoreAttributes: false,
       attributeNamePrefix: "@_",
     });
     const doc = parser.parse(xml);
-
     const feed = doc?.feed;
     if (!feed) return [];
 
@@ -130,34 +95,75 @@ async function fetchChannelRSS(channelId, label, limit = 8) {
     return entries.slice(0, limit).map((entry) => {
       const videoId =
         entry["yt:videoId"] || (entry.id || "").replace("yt:video:", "");
-
-      const title =
+      const rawTitle =
         entry.title || entry["media:group"]?.["media:title"] || "Untitled";
-
-      // RSS thumbnail: media:group > media:thumbnail @url
+      const title = typeof rawTitle === "string" ? rawTitle : String(rawTitle);
       const thumbnail =
         entry["media:group"]?.["media:thumbnail"]?.["@_url"] ||
         `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`;
 
       return {
         videoId,
-        title: typeof title === "string" ? title : String(title),
+        title,
         channelTitle: label,
         thumbnail,
         url: `https://www.youtube.com/watch?v=${videoId}`,
-        // Stats not available via RSS — frontend shows "—"
-        viewCount: null,
+        viewCount: null, // not in RSS
         likeCount: null,
         commentCount: null,
       };
     });
   } catch (err) {
-    console.error(
-      `[RSS] Failed to fetch channel ${label} (${channelId}):`,
-      err.message,
-    );
+    console.error(`[RSS] ${label} (${channelId}):`, err.message);
     return [];
   }
+}
+
+// ─── oEmbed embeddability filter ──────────────────────────────────────────────
+//
+// YouTube oEmbed endpoint (no key, no quota):
+//   200  → publicly embeddable   ✓ keep
+//   401  → embedding disabled    ✗ drop  (would show Error 153 in player)
+//   404  → deleted / private     ✗ drop
+//
+// We check in parallel batches of 10 to keep build time short.
+
+const OEMBED_BASE = "https://www.youtube.com/oembed?format=json&url=";
+const OEMBED_BATCH = 10;
+
+function isEmbeddable(videoId) {
+  return new Promise((resolve) => {
+    const url =
+      OEMBED_BASE +
+      encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`);
+    const req = https.get(url, { timeout: 8000 }, (res) => {
+      res.resume(); // drain — we only need the status code
+      resolve(res.statusCode === 200);
+    });
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
+}
+
+async function filterEmbeddable(videos) {
+  const kept = [];
+  for (let i = 0; i < videos.length; i += OEMBED_BATCH) {
+    const batch = videos.slice(i, i + OEMBED_BATCH);
+    const checks = await Promise.all(batch.map((v) => isEmbeddable(v.videoId)));
+    batch.forEach((v, idx) => {
+      if (checks[idx]) {
+        kept.push(v);
+      } else {
+        console.log(
+          `[oEmbed] ✗ blocked ${v.videoId} — "${v.title.slice(0, 50)}"`,
+        );
+      }
+    });
+  }
+  return kept;
 }
 
 // ─── Build feed ───────────────────────────────────────────────────────────────
@@ -166,20 +172,19 @@ async function buildFeed() {
     return new Promise((resolve) => buildQueue.push(resolve));
   }
   building = true;
-  console.log("🎬 Building video feed from YouTube RSS…");
+  console.log("🎬 Building feed: RSS → oEmbed filter → cache…");
 
   try {
-    // Fetch all channels in parallel
-    const results = await Promise.allSettled(
+    // 1. Fetch RSS from all channels in parallel
+    const settled = await Promise.allSettled(
       CHANNELS.map((ch) => fetchChannelRSS(ch.channelId, ch.label, 8)),
     );
-
-    let videos = results
+    let videos = settled
       .filter((r) => r.status === "fulfilled")
       .flatMap((r) => r.value)
       .filter(Boolean);
 
-    // Deduplicate by videoId
+    // 2. Deduplicate
     const seen = new Set();
     videos = videos.filter((v) => {
       if (!v.videoId || seen.has(v.videoId)) return false;
@@ -187,20 +192,22 @@ async function buildFeed() {
       return true;
     });
 
-    // Shuffle for variety
+    // 3. oEmbed filter — drop anything that would show Error 153
+    console.log(`[oEmbed] Checking ${videos.length} videos for embeddability…`);
+    videos = await filterEmbeddable(videos);
+    console.log(`[oEmbed] ${videos.length} embeddable videos passed`);
+
+    // 4. Shuffle
     videos = videos.sort(() => 0.5 - Math.random());
 
-    console.log(`✅ RSS feed built: ${videos.length} videos`);
+    // 5. Persist to L2 MongoDB (TTL 1 hour)
+    if (videos.length > 0) await saveFeedCache(videos);
 
-    // Persist to L2
-    if (videos.length > 0) {
-      await saveFeedCache(videos);
-    }
-
-    // Hydrate L1
+    // 6. Hydrate L1
     l1Cache = videos;
     l1CachedAt = Date.now();
 
+    console.log(`✅ Feed ready: ${videos.length} embeddable videos`);
     return videos;
   } finally {
     building = false;
@@ -208,27 +215,23 @@ async function buildFeed() {
   }
 }
 
-// ─── Get feed (L1 → L2 → build) ──────────────────────────────────────────────
+// ─── getFeed: L1 → L2 → build ─────────────────────────────────────────────────
 async function getFeed() {
-  // L1 hit
   if (l1Cache && l1Cache.length > 0 && Date.now() - l1CachedAt < L1_TTL) {
     return l1Cache;
   }
-  // L2 hit
   const cached = await loadFeedCache();
   if (cached && cached.length > 0) {
-    console.log(`📦 Feed from MongoDB cache (${cached.length} videos)`);
+    console.log(`📦 Feed from MongoDB (${cached.length} videos)`);
     l1Cache = cached;
     l1CachedAt = Date.now();
     return cached;
   }
-  // Miss — build from RSS
   return buildFeed();
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-// GET /api/videos/foryou
 router.get("/foryou", async (req, res) => {
   try {
     const uid = req.headers["x-user-uid"];
@@ -246,7 +249,6 @@ router.get("/foryou", async (req, res) => {
   }
 });
 
-// POST /api/videos/watched
 router.post("/watched", async (req, res) => {
   try {
     const uid = req.headers["x-user-uid"];
@@ -260,19 +262,21 @@ router.post("/watched", async (req, res) => {
   }
 });
 
-// DELETE /api/videos/cache — force full RSS rebuild
+// Admin: force full rebuild
 router.delete("/cache", async (_req, res) => {
   l1Cache = null;
   l1CachedAt = 0;
   await clearFeedCache();
-  res.json({ message: "Cache cleared. Next request rebuilds from RSS." });
+  res.json({
+    message:
+      "Cache cleared. Next /foryou request will rebuild from RSS + oEmbed.",
+  });
 });
 
-// GET /api/videos/cache/status
 router.get("/cache/status", async (_req, res) => {
   const l2 = await loadFeedCache();
   res.json({
-    source: "rss",
+    source: "rss+oembed",
     l1: {
       hit: !!l1Cache && l1Cache.length > 0,
       videos: l1Cache?.length ?? 0,
