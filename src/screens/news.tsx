@@ -1,17 +1,11 @@
 // src/screens/news.tsx
-//
-// Zimbabwe News Feed — pulls RSS from 5 sources in parallel.
-// Parses XML client-side (no backend needed).
-// MMKV L1 cache with 30-min TTL.
-// Tap article → expo-web-browser in-app browser.
-
 import { Ionicons } from "@expo/vector-icons";
-import * as WebBrowser from "expo-web-browser";
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   FlatList,
   Image,
+  Modal,
   Platform,
   RefreshControl,
   StatusBar as RNStatusBar,
@@ -21,49 +15,27 @@ import {
   View,
 } from "react-native";
 import { MMKV } from "react-native-mmkv";
+import { WebView } from "react-native-webview";
 
-// ─── MMKV lazy singleton ───────────────────────────────────────────────────────
+// ─── MMKV device cache (L1) ───────────────────────────────────────────────────
 let _store: MMKV | null = null;
 const store = () => {
   if (!_store) _store = new MMKV({ id: "news-cache" });
   return _store;
 };
-const NEWS_KEY = "zw_news_v1";
-const NEWS_TS = "zw_news_ts_v1";
-const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+const NEWS_KEY = "zw_news_v2";
+const NEWS_TS = "zw_news_ts_v2";
+const CACHE_TTL = 20 * 60 * 1000; // 20 minutes — matches backend
 
-// ─── Sources ──────────────────────────────────────────────────────────────────
+const API_URL = process.env.EXPO_PUBLIC_API_URL;
+
 const SOURCES = [
-  {
-    key: "herald",
-    name: "Herald",
-    color: "#C0392B",
-    url: "https://www.herald.co.zw/feed/",
-  },
-  {
-    key: "newsday",
-    name: "NewsDay",
-    color: "#2980B9",
-    url: "https://www.newsday.co.zw/feed/",
-  },
-  {
-    key: "263chat",
-    name: "263Chat",
-    color: "#27AE60",
-    url: "https://263chat.com/feed/",
-  },
-  {
-    key: "zimlive",
-    name: "ZimLive",
-    color: "#8E44AD",
-    url: "https://www.zimlive.com/feed/",
-  },
-  {
-    key: "chronicle",
-    name: "Chronicle",
-    color: "#E67E22",
-    url: "https://www.chronicle.co.zw/feed/",
-  },
+  { key: "all", name: "All", color: "#FFFFFF" },
+  { key: "herald", name: "Herald", color: "#C0392B" },
+  { key: "newsday", name: "NewsDay", color: "#2980B9" },
+  { key: "263chat", name: "263Chat", color: "#27AE60" },
+  { key: "zimlive", name: "ZimLive", color: "#8E44AD" },
+  { key: "chronicle", name: "Chronicle", color: "#E67E22" },
 ];
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -71,106 +43,14 @@ type NewsItem = {
   id: string;
   title: string;
   link: string;
-  pubDate: number; // timestamp ms
+  pubDate: number;
   source: string;
   sourceColor: string;
   thumbnail: string | null;
   description: string;
 };
 
-// ─── XML parser ───────────────────────────────────────────────────────────────
-// Lightweight regex-based RSS parser — no external deps needed.
-
-function decodeEntities(str: string): string {
-  return str
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#039;/g, "'")
-    .replace(/&nbsp;/g, " ")
-    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
-    .replace(/<[^>]+>/g, "")
-    .trim();
-}
-
-function extractTag(xml: string, tag: string): string {
-  const m = xml.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i"));
-  return m ? decodeEntities(m[1]) : "";
-}
-
-function extractAttr(xml: string, tag: string, attr: string): string {
-  const m = xml.match(new RegExp(`<${tag}[^>]*${attr}=["']([^"']+)["']`, "i"));
-  return m ? m[1] : "";
-}
-
-function extractThumbnail(itemXml: string): string | null {
-  // 1. media:content url
-  let url = extractAttr(itemXml, "media:content", "url");
-  if (url) return url;
-  // 2. media:thumbnail url
-  url = extractAttr(itemXml, "media:thumbnail", "url");
-  if (url) return url;
-  // 3. enclosure url (type image/*)
-  const enc = itemXml.match(
-    /<enclosure[^>]*type=["']image[^"']*["'][^>]*url=["']([^"']+)["']/i,
-  );
-  if (enc) return enc[1];
-  // 4. first <img src in description
-  const img = itemXml.match(/<img[^>]+src=["']([^"']+)["']/i);
-  if (img) return img[1];
-  return null;
-}
-
-function parseRSS(xml: string, source: (typeof SOURCES)[0]): NewsItem[] {
-  const items: NewsItem[] = [];
-  const itemRx = /<item[\s>]([\s\S]*?)<\/item>/gi;
-  let match;
-
-  while ((match = itemRx.exec(xml)) !== null) {
-    const block = match[1];
-    const title = extractTag(block, "title");
-    const link =
-      extractTag(block, "link") || extractAttr(block, "link", "href");
-    const pub = extractTag(block, "pubDate");
-    const desc = extractTag(block, "description").slice(0, 160);
-
-    if (!title || !link) continue;
-
-    const ts = pub ? new Date(pub).getTime() : Date.now();
-
-    items.push({
-      id: `${source.key}-${link}`,
-      title,
-      link,
-      pubDate: isNaN(ts) ? Date.now() : ts,
-      source: source.name,
-      sourceColor: source.color,
-      thumbnail: extractThumbnail(block),
-      description: desc,
-    });
-  }
-
-  return items;
-}
-
-// ─── Fetch one RSS source ─────────────────────────────────────────────────────
-async function fetchSource(source: (typeof SOURCES)[0]): Promise<NewsItem[]> {
-  try {
-    const res = await fetch(source.url, {
-      headers: { "User-Agent": "YPN-App/1.0 (RSS Reader)" },
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const xml = await res.text();
-    return parseRSS(xml, source);
-  } catch (err) {
-    console.warn(`[News] ${source.name} failed:`, err);
-    return [];
-  }
-}
-
-// ─── Cache helpers ────────────────────────────────────────────────────────────
+// ─── Device cache helpers ─────────────────────────────────────────────────────
 function readCache(): NewsItem[] | null {
   try {
     const ts = store().getNumber(NEWS_TS);
@@ -200,18 +80,111 @@ function relativeTime(ts: number): string {
   return `${Math.floor(h / 24)}d ago`;
 }
 
-// ─── News card ────────────────────────────────────────────────────────────────
-const NewsCard = React.memo(({ item }: { item: NewsItem }) => {
-  const openArticle = useCallback(async () => {
-    await WebBrowser.openBrowserAsync(item.link, {
-      toolbarColor: "#111111",
-      controlsColor: "#FFFFFF",
-      presentationStyle: WebBrowser.WebBrowserPresentationStyle.FULL_SCREEN,
-    });
-  }, [item.link]);
+// ─── In-app article reader ────────────────────────────────────────────────────
+function ArticleReader({
+  url,
+  title,
+  onClose,
+}: {
+  url: string;
+  title: string;
+  onClose: () => void;
+}) {
+  const [webLoading, setWebLoading] = useState(true);
 
   return (
-    <TouchableOpacity style={s.card} onPress={openArticle} activeOpacity={0.85}>
+    <Modal visible animationType="slide" onRequestClose={onClose}>
+      <View style={r.root}>
+        {/* Header */}
+        <View style={r.header}>
+          <TouchableOpacity
+            onPress={onClose}
+            style={r.closeBtn}
+            activeOpacity={0.7}
+          >
+            <Ionicons name="arrow-back" size={22} color="#fff" />
+          </TouchableOpacity>
+          <Text style={r.headerTitle} numberOfLines={1}>
+            {title}
+          </Text>
+        </View>
+
+        {/* WebView — loads article URL fully in-app */}
+        <WebView
+          source={{ uri: url }}
+          style={{ flex: 1, backgroundColor: "#111" }}
+          onLoadStart={() => setWebLoading(true)}
+          onLoadEnd={() => setWebLoading(false)}
+          javaScriptEnabled
+          domStorageEnabled
+          startInLoadingState={false}
+          // Block popups / redirects to other apps
+          setSupportMultipleWindows={false}
+        />
+
+        {webLoading && (
+          <View style={r.loadingOverlay}>
+            <ActivityIndicator size="large" color="#1DB954" />
+          </View>
+        )}
+      </View>
+    </Modal>
+  );
+}
+
+const r = StyleSheet.create({
+  root: {
+    flex: 1,
+    backgroundColor: "#000",
+    paddingTop:
+      Platform.OS === "android" ? (RNStatusBar.currentHeight ?? 24) : 44,
+  },
+  header: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: "#222",
+    backgroundColor: "#111",
+    gap: 10,
+  },
+  closeBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: "#222",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  headerTitle: {
+    flex: 1,
+    color: "#fff",
+    fontSize: 15,
+    fontWeight: "600",
+  },
+  loadingOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "#000",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+});
+
+// ─── News card ────────────────────────────────────────────────────────────────
+const NewsCard = React.memo(
+  ({
+    item,
+    onPress,
+  }: {
+    item: NewsItem;
+    onPress: (item: NewsItem) => void;
+  }) => (
+    <TouchableOpacity
+      style={s.card}
+      onPress={() => onPress(item)}
+      activeOpacity={0.85}
+    >
       {item.thumbnail ? (
         <Image
           source={{ uri: item.thumbnail }}
@@ -223,9 +196,7 @@ const NewsCard = React.memo(({ item }: { item: NewsItem }) => {
           <Ionicons name="newspaper-outline" size={28} color="#444" />
         </View>
       )}
-
       <View style={s.cardBody}>
-        {/* Source badge + time */}
         <View style={s.meta}>
           <View style={[s.badge, { backgroundColor: item.sourceColor + "22" }]}>
             <View style={[s.badgeDot, { backgroundColor: item.sourceColor }]} />
@@ -235,25 +206,22 @@ const NewsCard = React.memo(({ item }: { item: NewsItem }) => {
           </View>
           <Text style={s.time}>{relativeTime(item.pubDate)}</Text>
         </View>
-
         <Text style={s.title} numberOfLines={3}>
           {item.title}
         </Text>
-
         {item.description ? (
           <Text style={s.desc} numberOfLines={2}>
             {item.description}
           </Text>
         ) : null}
-
         <View style={s.readRow}>
-          <Text style={s.readMore}>Read more</Text>
-          <Ionicons name="arrow-forward" size={13} color="#8E8E93" />
+          <Text style={s.readMore}>Read article</Text>
+          <Ionicons name="arrow-forward" size={13} color="#1DB954" />
         </View>
       </View>
     </TouchableOpacity>
-  );
-});
+  ),
+);
 
 // ─── Filter bar ───────────────────────────────────────────────────────────────
 const FilterBar = ({
@@ -265,7 +233,7 @@ const FilterBar = ({
 }) => (
   <FlatList
     horizontal
-    data={[{ key: "all", name: "All", color: "#FFFFFF" }, ...SOURCES]}
+    data={SOURCES}
     keyExtractor={(i) => i.key}
     showsHorizontalScrollIndicator={false}
     contentContainerStyle={s.filterRow}
@@ -303,7 +271,6 @@ const FilterBar = ({
 // ─── Main screen ──────────────────────────────────────────────────────────────
 const STATUS_H =
   Platform.OS === "android" ? (RNStatusBar.currentHeight ?? 24) : 0;
-// Leave room for community floating tab bar
 const TOP_OFFSET = STATUS_H + 48;
 
 export default function NewsScreen() {
@@ -312,44 +279,54 @@ export default function NewsScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [filter, setFilter] = useState("all");
   const [error, setError] = useState(false);
+  const [reading, setReading] = useState<NewsItem | null>(null);
+
+  // Background refresh timer
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     boot();
+    return () => {
+      if (refreshTimer.current) clearTimeout(refreshTimer.current);
+    };
   }, []);
 
+  // Schedule next background refresh in 20 min
+  const scheduleRefresh = () => {
+    if (refreshTimer.current) clearTimeout(refreshTimer.current);
+    refreshTimer.current = setTimeout(() => fetchFromBackend(false), CACHE_TTL);
+  };
+
   const boot = async () => {
+    // Instant load from device cache
     const cached = readCache();
     if (cached && cached.length > 0) {
       setArticles(cached);
       setLoading(false);
-      // Background refresh if older than 10 min
+      // Background refresh if cache is older than 20 min
       const ts = store().getNumber(NEWS_TS) ?? 0;
-      if (Date.now() - ts > 10 * 60 * 1000) fetchAll(false);
+      if (Date.now() - ts > CACHE_TTL) {
+        fetchFromBackend(false);
+      } else {
+        scheduleRefresh();
+      }
     } else {
-      await fetchAll(false);
+      await fetchFromBackend(false);
     }
   };
 
-  const fetchAll = async (manual = true) => {
+  const fetchFromBackend = async (manual = true) => {
     if (manual) setRefreshing(true);
-    else setLoading(true);
+    else if (!articles.length) setLoading(true);
     setError(false);
-
     try {
-      const results = await Promise.all(SOURCES.map(fetchSource));
-      const merged = results
-        .flat()
-        .filter(Boolean)
-        // Deduplicate by id
-        .filter(
-          (item, idx, arr) => arr.findIndex((a) => a.id === item.id) === idx,
-        )
-        // Newest first
-        .sort((a, b) => b.pubDate - a.pubDate);
-
-      if (merged.length > 0) {
-        writeCache(merged);
-        setArticles(merged);
+      const res = await fetch(`${API_URL}/api/news`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data: NewsItem[] = await res.json();
+      if (data.length > 0) {
+        writeCache(data);
+        setArticles(data);
+        scheduleRefresh();
       } else {
         setError(true);
       }
@@ -365,21 +342,23 @@ export default function NewsScreen() {
     filter === "all"
       ? articles
       : articles.filter(
-          (a) => a.source === SOURCES.find((s) => s.key === filter)?.name,
+          (a) => a.source === SOURCES.find((src) => src.key === filter)?.name,
         );
+
+  const openArticle = useCallback((item: NewsItem) => setReading(item), []);
 
   if (loading) {
     return (
       <View style={s.centre}>
         <ActivityIndicator size="large" color="#1DB954" />
-        <Text style={s.loadingText}>Fetching Zimbabwe news…</Text>
+        <Text style={s.loadingText}>Loading Zimbabwe news…</Text>
       </View>
     );
   }
 
   return (
     <View style={s.root}>
-      {/* Push content below floating community tab bar */}
+      {/* Spacer for floating community tab bar */}
       <View style={{ height: TOP_OFFSET }} />
 
       <FilterBar active={filter} onSelect={setFilter} />
@@ -388,7 +367,10 @@ export default function NewsScreen() {
         <View style={s.centre}>
           <Ionicons name="wifi-outline" size={48} color="#444" />
           <Text style={s.errorText}>Could not load news</Text>
-          <TouchableOpacity style={s.retryBtn} onPress={() => fetchAll(true)}>
+          <TouchableOpacity
+            style={s.retryBtn}
+            onPress={() => fetchFromBackend(true)}
+          >
             <Text style={s.retryText}>Retry</Text>
           </TouchableOpacity>
         </View>
@@ -396,13 +378,15 @@ export default function NewsScreen() {
         <FlatList
           data={filtered}
           keyExtractor={(item) => item.id}
-          renderItem={({ item }) => <NewsCard item={item} />}
+          renderItem={({ item }) => (
+            <NewsCard item={item} onPress={openArticle} />
+          )}
           contentContainerStyle={s.list}
           showsVerticalScrollIndicator={false}
           refreshControl={
             <RefreshControl
               refreshing={refreshing}
-              onRefresh={() => fetchAll(true)}
+              onRefresh={() => fetchFromBackend(true)}
               tintColor="#1DB954"
               colors={["#1DB954"]}
             />
@@ -412,6 +396,15 @@ export default function NewsScreen() {
               <Text style={s.errorText}>No articles for this source</Text>
             </View>
           }
+        />
+      )}
+
+      {/* In-app article reader */}
+      {reading && (
+        <ArticleReader
+          url={reading.link}
+          title={reading.title}
+          onClose={() => setReading(null)}
         />
       )}
     </View>
@@ -428,7 +421,6 @@ const s = StyleSheet.create({
     gap: 12,
     padding: 24,
   },
-
   loadingText: { color: "#8E8E93", fontSize: 14, marginTop: 8 },
   errorText: { color: "#8E8E93", fontSize: 16, textAlign: "center" },
   retryBtn: {
@@ -440,7 +432,6 @@ const s = StyleSheet.create({
   },
   retryText: { color: "#000", fontWeight: "700", fontSize: 14 },
 
-  // Filter bar
   filterRow: { paddingHorizontal: 12, paddingVertical: 10, gap: 8 },
   filterChip: {
     paddingHorizontal: 14,
@@ -454,7 +445,6 @@ const s = StyleSheet.create({
 
   list: { paddingHorizontal: 12, paddingBottom: 120 },
 
-  // Card
   card: {
     flexDirection: "row",
     backgroundColor: "#111",
@@ -471,7 +461,6 @@ const s = StyleSheet.create({
     alignItems: "center",
   },
   cardBody: { flex: 1, padding: 10, justifyContent: "space-between" },
-
   meta: {
     flexDirection: "row",
     alignItems: "center",
@@ -489,10 +478,8 @@ const s = StyleSheet.create({
   badgeDot: { width: 6, height: 6, borderRadius: 3 },
   badgeText: { fontSize: 11, fontWeight: "700" },
   time: { color: "#555", fontSize: 11 },
-
   title: { color: "#FFFFFF", fontSize: 14, fontWeight: "600", lineHeight: 20 },
   desc: { color: "#8E8E93", fontSize: 12, lineHeight: 17, marginTop: 4 },
-
   readRow: { flexDirection: "row", alignItems: "center", gap: 3, marginTop: 6 },
-  readMore: { color: "#8E8E93", fontSize: 12 },
+  readMore: { color: "#1DB954", fontSize: 12, fontWeight: "600" },
 });

@@ -243,6 +243,10 @@ app.get("/photos/:filename", async (req, res) => {
 const videoRoutes = require("./src/routes/videoRoutes");
 app.use("/api/videos", videoRoutes);
 
+//implementing news cache routes
+// After the video routes line:
+const newsRoutes = require("./src/routes/newsRoutes");
+app.use("/api/news", newsRoutes);
 /* =====================
    Start Server
 ===================== */
