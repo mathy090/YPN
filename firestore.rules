@@ -1,0 +1,95 @@
+// firestore.rules
+// ─────────────────────────────────────────────────────────────────────────────
+// Firestore Security Rules for YPN
+//
+// KEY SECURITY PROPERTIES:
+//   1. Messages MUST have _ciphertext + _iv fields (no plaintext allowed)
+//   2. Messages MUST have expireAt (Firestore TTL — auto-deleted by server)
+//   3. Only authenticated users can read/write channels
+//   4. Users can only delete their OWN messages
+//   5. expireAt cannot be set more than 30 minutes in the future
+// ─────────────────────────────────────────────────────────────────────────────
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helper functions ────────────────────────────────────────────────────
+
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    function isVerifiedEmail() {
+      return isAuthenticated() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(uid) {
+      return isAuthenticated() && request.auth.uid == uid;
+    }
+
+    // Validate encrypted message structure
+    // Must have ciphertext + IV, must NOT have plaintext field
+    function isValidEncryptedMessage(data) {
+      return
+        data.keys().hasAll(['_ciphertext', '_iv', 'uid', 'displayName', 'createdAt', 'expireAt', 'type'])
+        && !data.keys().hasAny(['text', 'plaintext', 'content', 'body'])
+        && data._ciphertext is string
+        && data._ciphertext.size() > 0
+        && data._iv is string
+        && data._iv.size() >= 16
+        && data.type in ['text', 'audio', 'image']
+        && data.uid is string
+        && data.displayName is string;
+    }
+
+    // expireAt must be set and within 30 minutes from now (prevent eternal messages)
+    function hasValidTTL(data) {
+      return
+        data.expireAt is timestamp
+        && data.expireAt > request.time
+        && data.expireAt < request.time + duration.value(30 * 60, 's');
+    }
+
+    // ── Channel messages ────────────────────────────────────────────────────
+
+    match /channels/{channelId}/messages/{messageId} {
+
+      // Read: authenticated + email verified
+      allow read: if isVerifiedEmail();
+
+      // Create: authenticated + email verified + valid encrypted structure + valid TTL
+      allow create: if
+        isVerifiedEmail()
+        && isValidEncryptedMessage(request.resource.data)
+        && hasValidTTL(request.resource.data)
+        && request.resource.data.uid == request.auth.uid;
+
+      // Update: NOT allowed — messages are immutable
+      allow update: if false;
+
+      // Delete: only the message owner OR server-side TTL (handled by Firestore)
+      allow delete: if isOwner(resource.data.uid);
+    }
+
+    // ── Channel metadata (read-only for users) ──────────────────────────────
+
+    match /channels/{channelId} {
+      allow read: if isVerifiedEmail();
+      allow write: if false; // managed via Firebase Admin SDK only
+    }
+
+    // ── User profiles (non-sensitive) ───────────────────────────────────────
+
+    match /users/{uid} {
+      allow read: if isVerifiedEmail();
+      allow write: if isOwner(uid);
+    }
+
+    // ── Deny everything else ────────────────────────────────────────────────
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -2,6 +2,10 @@
 "use strict";
 require("dotenv").config();
 
+const {
+  router: keyRoutes,
+  init: initKeyStore,
+} = require("./src/routes/keyRoutes");
 const express = require("express");
 const { MongoClient, GridFSBucket } = require("mongodb");
 const cors = require("cors");
@@ -10,6 +14,7 @@ const { GridFsStorage } = require("multer-gridfs-storage");
 const admin = require("firebase-admin");
 const { init: initUserVideos } = require("./src/models/UserVideos");
 const { init: initDiscordChannels } = require("./src/models/DiscordChannels");
+initKeyStore(db);
 /* =====================
    Firebase Admin SDK
    Credentials live in FIREBASE_ADMIN_KEY env var (JSON string).
@@ -252,6 +257,8 @@ app.use("/api/discord", discordRoutes);
 // After the video routes line:
 const newsRoutes = require("./src/routes/newsRoutes");
 app.use("/api/news", newsRoutes);
+app.use("/api/keys", verifyFirebaseToken, keyRoutes);
+
 /* =====================
    Start Server
 ===================== */

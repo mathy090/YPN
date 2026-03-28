@@ -1,12 +1,10 @@
-// src/firebase/firestore.ts
+// app/discord.tsx
 // ─────────────────────────────────────────────────────────────────────────────
-// Single import point for Firestore db AND Firebase Storage.
-// Discord screen imports both from here.
+// Full-screen Stack route for Discord community chat.
+// Rendered completely outside the tab navigator — bottom nav never shows.
+// Keyboard, safe area, and input bar all handled inside DiscordScreen.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getFirestore } from "firebase/firestore";
-import { getStorage } from "firebase/storage";
-import { app } from "./firebase";
+import DiscordScreen from "../src/screens/discord";
 
-export const db = getFirestore(app);
-export const storage = getStorage(app);
+export default DiscordScreen;
