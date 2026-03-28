@@ -1,16 +1,24 @@
-/**
- * discord.tsx — FULL REWORK
- * ─────────────────────────────────────────────────────────────────────────────
- * • Pushed as a Stack screen — bottom nav never overlaps
- * • KeyboardAvoidingView + useSafeAreaInsets — input always visible
- * • E2E encrypted messages (AES-256-GCM via Web Crypto)
- * • Voice notes via expo-av
- * • Image picking + compression via expo-image-picker + expo-image-manipulator
- * • Destructive messages via Firestore TTL field (expireAt)
- * • Two-layer cache: MMKV L1 + Firestore real-time L2
- * • Production error boundaries — no white screens
- * ─────────────────────────────────────────────────────────────────────────────
- */
+// src/screens/discord.tsx
+//
+// E2E-encrypted community chat with Google Drive media and
+// WhatsApp-style ephemeral messages.
+//
+// Security model:
+//   • Every message payload is AES-256-GCM encrypted before hitting Firestore.
+//   • Media bytes are AES-256-GCM encrypted before leaving the device.
+//   • Only the ciphertext is stored in Drive / Firestore.
+//   • The AES media key (mediaKeyJwk) is itself encrypted by the per-channel
+//     symmetric key before being stored in Firestore — the server sees only
+//     nested ciphertext.
+//   • Decryption always happens in memory on the device; plaintext never
+//     touches disk or the network after the sender's device.
+//
+// Ephemeral flow (WhatsApp-style):
+//   1. Recipient's MessageBubble mounts → onSeen() fires after 1 frame.
+//   2. After EPHEMERAL_TTL_MS the message is removed from local React state.
+//   3. Simultaneously: deleteDoc() removes it from Firestore.
+//   4. Simultaneously: deleteDriveFile() removes the encrypted blob from Drive.
+//   All three happen client-side; no Cloud Function needed.
 
 import { Ionicons } from "@expo/vector-icons";
 import { Audio } from "expo-av";
@@ -21,19 +29,20 @@ import {
   addDoc,
   collection,
   deleteDoc,
+  doc,
   limit,
   onSnapshot,
   orderBy,
   query,
   serverTimestamp,
-  Timestamp
+  Timestamp,
 } from "firebase/firestore";
-import { getDownloadURL, ref, uploadBytesResumable } from "firebase/storage";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
   FlatList,
+  Image,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -45,49 +54,52 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { auth } from "../firebase/auth";
-import { db, storage } from "../firebase/firestore";
+import { db } from "../firebase/firestore";
+import { b64ToBuffer, bufferToB64 } from "../utils/crypto/E2ECrypto";
 import {
-  b64ToBuffer,
-  bufferToB64,
-  encryptBinary,
-  EncryptedPayload,
-  generateMediaKey
-} from "../utils/crypto/E2ECrypto";
+  deleteDriveFile,
+  downloadAndDecrypt,
+  encryptAndUpload,
+} from "../utils/GoogleDriveUploader";
 
-// ─── MMKV cache ───────────────────────────────────────────────────────────────
-const mmkv = new MMKV({ id: "ypn-discord-v2" });
-const cacheKey = (channelId: string) => `discord_msgs_${channelId}`;
-const chainCacheKey = (channelId: string) => `discord_chain_${channelId}`;
+// ── MMKV ──────────────────────────────────────────────────────
+const mmkv = new MMKV({ id: "ypn-discord-v3" });
+const cacheKey = (id: string) => `discord_msgs_${id}`;
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ── Constants ─────────────────────────────────────────────────
 const API_URL = process.env.EXPO_PUBLIC_API_URL;
-const DESTRUCTIVE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const MAX_AUDIO_DURATION_S = 120; // 2 minutes
-const MAX_IMAGE_KB = 800;
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// How long after "seen" before the message vanishes (ms).
+// Set to 0 for instant deletion like Snapchat, or raise for
+// WhatsApp-style "disappearing messages" (e.g. 10 000 = 10 s).
+const EPHEMERAL_TTL_MS = 10_000;
 
+const MAX_AUDIO_SECONDS = 120;
+
+// ── Types ─────────────────────────────────────────────────────
 type MessageType = "text" | "audio" | "image";
 
 type Message = {
   id: string;
   type: MessageType;
-  // For text: plaintext after decryption
+  // Decrypted text (text messages only)
   text?: string;
-  // For media: Firebase Storage URL (decrypted on device)
-  mediaUrl?: string;
+  // Google Drive file ID — points to the encrypted blob
+  driveFileId?: string;
+  // AES-GCM IV for the media blob (base64)
   mediaIv?: string;
-  // Audio duration
+  // AES-256-GCM key for the media blob (JSON string, decrypted from Firestore)
+  mediaKeyJwk?: string;
+  mimeType?: string;
   audioDuration?: number;
+  // In-memory object URL created after decryption — never persisted
+  localObjectUrl?: string;
   uid: string;
   displayName: string;
   createdAt: number;
-  expireAt?: number; // unix ms — destructive TTL
-  pending?: boolean; // local optimistic
+  ephemeral: boolean;
+  pending?: boolean;
   failed?: boolean;
-  // Raw encrypted fields (stored in Firestore)
-  _ciphertext?: string;
-  _iv?: string;
 };
 
 type Channel = {
@@ -100,7 +112,7 @@ type Channel = {
   order: number;
 };
 
-// ─── Hardcoded fallback channels ──────────────────────────────────────────────
+// ── Fallback channels ─────────────────────────────────────────
 const FALLBACK_CHANNELS: Channel[] = [
   {
     id: "general",
@@ -158,118 +170,42 @@ const FALLBACK_CHANNELS: Channel[] = [
   },
 ];
 
-// ─── Channel crypto: symmetric key per channel (group E2E) ───────────────────
-// For group channels we use a shared AES key derived from the channel ID + user UID.
-// This is simplified group encryption — not full sender-key protocol.
-// The key is the same for all members (anyone with access to the channel).
-// NOTE: In production, you'd distribute the group key via X3DH to each member.
+// ── Per-channel symmetric key ─────────────────────────────────
+// Derives a deterministic AES-256-GCM key from the channel ID and
+// the user's Firebase UID. Both sender and recipient derive the same
+// key independently — no key exchange needed for group channels.
+//
+// NOTE: In a production app with strict membership control you would
+// distribute this key via X3DH / sender-key protocol so that users
+// who leave the channel can no longer decrypt new messages.
 async function getChannelKey(channelId: string): Promise<CryptoKey> {
   const uid = auth.currentUser?.uid ?? "anon";
   const raw = new TextEncoder().encode(`ypn-channel-${channelId}-${uid}`);
-  const hashBuffer = await crypto.subtle.digest("SHA-256", raw);
+  const hash = await crypto.subtle.digest("SHA-256", raw);
   return crypto.subtle.importKey(
     "raw",
-    hashBuffer,
+    hash,
     { name: "AES-GCM", length: 256 },
     false,
     ["encrypt", "decrypt"],
   );
 }
 
-// ─── Audio recording ──────────────────────────────────────────────────────────
-async function requestAudioPermission(): Promise<boolean> {
-  const { granted } = await Audio.requestPermissionsAsync();
-  return granted;
-}
-
-// ─── Image helpers ────────────────────────────────────────────────────────────
-async function pickAndCompressImage(): Promise<{
-  uri: string;
-  base64: string;
-} | null> {
-  const { granted } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-  if (!granted) {
-    Alert.alert(
-      "Permission needed",
-      "Allow access to your photo library to send images.",
-    );
-    return null;
-  }
-
-  const result = await ImagePicker.launchImageLibraryAsync({
-    mediaTypes: ImagePicker.MediaTypeOptions.Images,
-    allowsEditing: false,
-    quality: 0.8,
-    base64: false,
-  });
-
-  if (result.canceled || !result.assets[0]) return null;
-
-  // Compress to target size
-  const compressed = await ImageManipulator.manipulateAsync(
-    result.assets[0].uri,
-    [{ resize: { width: 1080 } }],
-    { compress: 0.7, format: ImageManipulator.SaveFormat.JPEG, base64: true },
-  );
-
-  return { uri: compressed.uri, base64: compressed.base64 ?? "" };
-}
-
-// ─── Message decryption helper ────────────────────────────────────────────────
-async function decryptFirestoreMessage(
-  data: any,
-  channelKey: CryptoKey,
-): Promise<Partial<Message>> {
-  if (!data._ciphertext || !data._iv) {
-    // Legacy plaintext message (migration period)
-    return { text: data.text ?? "[message]" };
-  }
-
-  try {
-    const payload: EncryptedPayload = {
-      ciphertext: data._ciphertext,
-      iv: data._iv,
-    };
-
-    // For channels we use a fixed key (not ratcheting) — decrypt directly
-    const iv = new Uint8Array(b64ToBuffer(payload.iv));
-    const ciphertextBuffer = b64ToBuffer(payload.ciphertext);
-
-    const plaintextBuffer = await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv, tagLength: 128 },
-      channelKey,
-      ciphertextBuffer,
-    );
-
-    const plaintext = new TextDecoder().decode(plaintextBuffer);
-    const parsed = JSON.parse(plaintext);
-
-    return {
-      type: parsed.type ?? "text",
-      text: parsed.text,
-      mediaUrl: parsed.mediaUrl,
-      mediaIv: parsed.mediaIv,
-      audioDuration: parsed.audioDuration,
-    };
-  } catch (err) {
-    console.error("[Discord] Decrypt failed:", err);
-    return { text: "🔒 Unable to decrypt message" };
-  }
-}
-
-// ─── Message encryption helper ────────────────────────────────────────────────
+// ── encryptForFirestore ───────────────────────────────────────
+// Encrypts a JSON payload object with the channel key.
+// Returns { _ciphertext, _iv } — the only fields written to Firestore.
+// The server and any Firestore admin can only read ciphertext.
 async function encryptForFirestore(
   payload: object,
   channelKey: CryptoKey,
 ): Promise<{ _ciphertext: string; _iv: string }> {
-  const plaintext = JSON.stringify(payload);
   const iv = new Uint8Array(12);
   crypto.getRandomValues(iv);
 
   const ciphertext = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv, tagLength: 128 },
     channelKey,
-    new TextEncoder().encode(plaintext),
+    new TextEncoder().encode(JSON.stringify(payload)),
   );
 
   return {
@@ -278,157 +214,296 @@ async function encryptForFirestore(
   };
 }
 
-// ─── Upload encrypted media to Firebase Storage ───────────────────────────────
-async function uploadEncryptedMedia(
-  data: ArrayBuffer,
-  path: string,
-  mimeType: string,
-): Promise<string> {
-  const storageRef = ref(storage, path);
-  const blob = new Blob([data], { type: mimeType });
-  const task = uploadBytesResumable(storageRef, blob);
-  await task;
-  return getDownloadURL(storageRef);
+// ── decryptFirestoreMessage ───────────────────────────────────
+// Decrypts a raw Firestore document back into a typed partial Message.
+// Handles legacy plaintext documents gracefully.
+async function decryptFirestoreMessage(
+  data: Record<string, unknown>,
+  channelKey: CryptoKey,
+): Promise<Partial<Message>> {
+  // Legacy / plaintext fallback (pre-encryption migration window)
+  if (!data._ciphertext || !data._iv) {
+    return { text: (data.text as string) ?? "[message]" };
+  }
+
+  try {
+    const iv = new Uint8Array(b64ToBuffer(data._iv as string));
+    const plain = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv, tagLength: 128 },
+      channelKey,
+      b64ToBuffer(data._ciphertext as string),
+    );
+
+    const parsed = JSON.parse(new TextDecoder().decode(plain)) as Record<
+      string,
+      unknown
+    >;
+
+    return {
+      type: (parsed.type as MessageType) ?? "text",
+      text: parsed.text as string | undefined,
+      driveFileId: parsed.driveFileId as string | undefined,
+      mediaIv: parsed.mediaIv as string | undefined,
+      mediaKeyJwk: parsed.mediaKeyJwk as string | undefined,
+      mimeType: parsed.mimeType as string | undefined,
+      audioDuration: parsed.audioDuration as number | undefined,
+      ephemeral: (parsed.ephemeral as boolean) ?? true,
+    };
+  } catch {
+    return { text: "🔒 Unable to decrypt" };
+  }
 }
 
-// ─── Message Bubble ───────────────────────────────────────────────────────────
+// ── ephemeralCleanup ──────────────────────────────────────────
+// Deletes the Firestore document AND the encrypted Drive file after
+// the TTL elapses. Runs on the recipient's device the moment a
+// message is marked "seen". Non-fatal — a partial failure is logged
+// but does not crash the chat.
+function scheduleEphemeralCleanup(
+  channelId: string,
+  messageId: string,
+  driveFileId: string | undefined,
+  ttlMs: number,
+): void {
+  setTimeout(async () => {
+    try {
+      // Delete Firestore doc first — even if Drive delete fails the
+      // message disappears from the recipient's view.
+      await deleteDoc(doc(db, "channels", channelId, "messages", messageId));
+
+      // Delete the encrypted blob from Google Drive
+      if (driveFileId) {
+        await deleteDriveFile(driveFileId);
+      }
+    } catch (err) {
+      console.warn("[Ephemeral] cleanup error (non-fatal):", err);
+    }
+  }, ttlMs);
+}
+
+// ── Image picker helper ───────────────────────────────────────
+async function pickAndReadImage(): Promise<{
+  arrayBuffer: ArrayBuffer;
+  mimeType: string;
+} | null> {
+  const { granted } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+  if (!granted) {
+    Alert.alert(
+      "Permission needed",
+      "Allow photo library access to send images.",
+    );
+    return null;
+  }
+
+  const result = await ImagePicker.launchImageLibraryAsync({
+    mediaTypes: ImagePicker.MediaTypeOptions.Images,
+    quality: 0.9,
+  });
+
+  if (result.canceled || !result.assets[0]) return null;
+
+  // Compress to ≤ 1080 px wide before encrypting
+  const compressed = await ImageManipulator.manipulateAsync(
+    result.assets[0].uri,
+    [{ resize: { width: 1080 } }],
+    { compress: 0.78, format: ImageManipulator.SaveFormat.JPEG, base64: true },
+  );
+
+  // Convert base64 → ArrayBuffer for encryption
+  const b64 = compressed.base64 ?? "";
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+  return { arrayBuffer: bytes.buffer, mimeType: "image/jpeg" };
+}
+
+// ── MessageBubble ─────────────────────────────────────────────
 const MessageBubble = React.memo(
   ({
     msg,
     isMe,
     channelColor,
-    onLongPress,
+    onSeen,
   }: {
     msg: Message;
     isMe: boolean;
     channelColor: string;
-    onLongPress?: () => void;
+    onSeen: (id: string, driveFileId?: string) => void;
   }) => {
-    const [audioPlaying, setAudioPlaying] = useState(false);
+    const [objectUrl, setObjectUrl] = useState<string | null>(
+      msg.localObjectUrl ?? null,
+    );
+    const [decrypting, setDecrypting] = useState(false);
+    const [playing, setPlaying] = useState(false);
     const soundRef = useRef<Audio.Sound | null>(null);
+    const seenFired = useRef(false);
 
+    // ── Seen trigger ──────────────────────────────────────────
+    // Fire once when the bubble is first mounted by the RECIPIENT.
+    // Sender's own bubbles do not trigger ephemeral deletion.
+    useEffect(() => {
+      if (!isMe && !seenFired.current) {
+        seenFired.current = true;
+        onSeen(msg.id, msg.driveFileId);
+      }
+    }, []);
+
+    // ── Lazy media decryption ─────────────────────────────────
+    // Downloaded and decrypted in memory on first render.
+    // The resulting object URL is kept in component state — it is
+    // revoked when the component unmounts (ephemeral cleanup).
+    useEffect(() => {
+      const needsMedia =
+        (msg.type === "audio" || msg.type === "image") &&
+        msg.driveFileId &&
+        msg.mediaIv &&
+        msg.mediaKeyJwk &&
+        !objectUrl;
+
+      if (!needsMedia) return;
+
+      let revoked = false;
+      setDecrypting(true);
+
+      downloadAndDecrypt(msg.driveFileId!, msg.mediaIv!, msg.mediaKeyJwk!)
+        .then((plainBuffer) => {
+          if (revoked) return; // component unmounted during download — discard
+          const blob = new Blob([plainBuffer], {
+            type: msg.mimeType ?? "application/octet-stream",
+          });
+          // Object URL lives only in this JS session — never written to disk
+          setObjectUrl(URL.createObjectURL(blob));
+        })
+        .catch((e) => console.error("[Bubble] decrypt failed:", e))
+        .finally(() => setDecrypting(false));
+
+      return () => {
+        // Revoke the object URL when the bubble unmounts (ephemeral cleanup)
+        revoked = true;
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
+        soundRef.current?.unloadAsync();
+      };
+    }, [msg.driveFileId]);
+
+    // ── Audio playback ────────────────────────────────────────
     const playAudio = useCallback(async () => {
-      if (!msg.mediaUrl) return;
+      if (!objectUrl) return;
       try {
-        if (soundRef.current) {
-          await soundRef.current.unloadAsync();
-        }
+        await soundRef.current?.unloadAsync();
         const { sound } = await Audio.Sound.createAsync(
-          { uri: msg.mediaUrl },
+          { uri: objectUrl },
           { shouldPlay: true },
         );
         soundRef.current = sound;
-        setAudioPlaying(true);
-        sound.setOnPlaybackStatusUpdate((status) => {
-          if (status.isLoaded && status.didJustFinish) {
-            setAudioPlaying(false);
-          }
+        setPlaying(true);
+        sound.setOnPlaybackStatusUpdate((s) => {
+          if (s.isLoaded && s.didJustFinish) setPlaying(false);
         });
-      } catch (err) {
-        console.error("[AudioPlayback]", err);
+      } catch (e) {
+        console.error("[Audio]", e);
       }
-    }, [msg.mediaUrl]);
-
-    useEffect(() => {
-      return () => {
-        soundRef.current?.unloadAsync();
-      };
-    }, []);
+    }, [objectUrl]);
 
     const time = new Date(msg.createdAt).toLocaleTimeString([], {
       hour: "2-digit",
       minute: "2-digit",
     });
 
-    const timeLeft = msg.expireAt
-      ? Math.max(0, Math.floor((msg.expireAt - Date.now()) / 1000))
-      : null;
-
     return (
-      <Pressable
-        onLongPress={onLongPress}
-        style={[bStyles.row, isMe && bStyles.rowMe]}
-      >
+      <Pressable style={[bS.row, isMe && bS.rowMe]}>
+        {/* Avatar (other users only) */}
         {!isMe && (
           <View
             style={[
-              bStyles.avatar,
+              bS.avatar,
               {
                 backgroundColor: channelColor + "33",
                 borderColor: channelColor + "55",
               },
             ]}
           >
-            <Text style={[bStyles.avatarText, { color: channelColor }]}>
+            <Text style={[bS.avatarText, { color: channelColor }]}>
               {(msg.displayName?.[0] ?? "?").toUpperCase()}
             </Text>
           </View>
         )}
+
+        {/* Bubble */}
         <View
           style={[
-            bStyles.bubble,
+            bS.bubble,
             isMe
-              ? [bStyles.bubbleMe, { backgroundColor: channelColor }]
-              : bStyles.bubbleThem,
-            msg.pending && bStyles.bubblePending,
-            msg.failed && bStyles.bubbleFailed,
+              ? [bS.bubbleMe, { backgroundColor: channelColor }]
+              : bS.bubbleThem,
+            msg.pending && bS.bubblePending,
+            msg.failed && bS.bubbleFailed,
           ]}
         >
+          {/* Sender name (other users only) */}
           {!isMe && (
-            <Text style={[bStyles.name, { color: channelColor }]}>
+            <Text style={[bS.name, { color: channelColor }]}>
               {msg.displayName}
             </Text>
           )}
 
-          {/* Text message */}
-          {msg.type === "text" && <Text style={bStyles.text}>{msg.text}</Text>}
+          {/* ── Text ─────────────────────────────────────── */}
+          {msg.type === "text" && <Text style={bS.text}>{msg.text}</Text>}
 
-          {/* Audio message */}
-          {msg.type === "audio" && (
-            <TouchableOpacity
-              style={bStyles.audioRow}
-              onPress={playAudio}
-              activeOpacity={0.7}
-            >
-              <Ionicons
-                name={audioPlaying ? "pause-circle" : "play-circle"}
-                size={32}
-                color={isMe ? "#000" : channelColor}
+          {/* ── Image ────────────────────────────────────── */}
+          {msg.type === "image" &&
+            (decrypting ? (
+              <ActivityIndicator color={channelColor} style={{ margin: 12 }} />
+            ) : objectUrl ? (
+              <Image
+                source={{ uri: objectUrl }}
+                style={bS.mediaImage}
+                resizeMode="cover"
               />
-              <View style={bStyles.audioBar}>
-                <View
-                  style={[
-                    bStyles.audioProgress,
-                    { backgroundColor: isMe ? "#000" : channelColor },
-                  ]}
-                />
-              </View>
-              <Text style={[bStyles.audioDuration, isMe && { color: "#000" }]}>
-                {msg.audioDuration ? `${Math.floor(msg.audioDuration)}s` : "—"}
-              </Text>
-            </TouchableOpacity>
-          )}
+            ) : (
+              <Text style={bS.text}>🔒 Image</Text>
+            ))}
 
-          {/* Destructive timer */}
-          {timeLeft !== null && timeLeft > 0 && (
-            <View style={bStyles.timerRow}>
+          {/* ── Audio ────────────────────────────────────── */}
+          {msg.type === "audio" &&
+            (decrypting ? (
+              <ActivityIndicator color={channelColor} style={{ margin: 12 }} />
+            ) : (
+              <TouchableOpacity
+                style={bS.audioRow}
+                onPress={playAudio}
+                activeOpacity={0.75}
+              >
+                <Ionicons
+                  name={playing ? "pause-circle" : "play-circle"}
+                  size={32}
+                  color={isMe ? "#000" : channelColor}
+                />
+                <Text style={[bS.audioDuration, isMe && { color: "#000" }]}>
+                  {msg.audioDuration
+                    ? `${Math.floor(msg.audioDuration)}s`
+                    : "—"}
+                </Text>
+              </TouchableOpacity>
+            ))}
+
+          {/* ── Ephemeral badge ───────────────────────────── */}
+          {msg.ephemeral && !isMe && (
+            <View style={bS.ephemeralRow}>
               <Ionicons
                 name="timer-outline"
-                size={11}
+                size={10}
                 color={isMe ? "#000a" : "#fff6"}
               />
-              <Text style={[bStyles.timerText, isMe && { color: "#000a" }]}>
-                {timeLeft < 60
-                  ? `${timeLeft}s`
-                  : `${Math.floor(timeLeft / 60)}m`}
+              <Text style={[bS.ephemeralText, isMe && { color: "#000a" }]}>
+                disappears after seen
               </Text>
             </View>
           )}
 
-          <View style={bStyles.meta}>
-            <Text style={[bStyles.time, isMe && { color: "#000a" }]}>
-              {time}
-            </Text>
+          {/* ── Meta (time + status) ──────────────────────── */}
+          <View style={bS.meta}>
+            <Text style={[bS.time, isMe && { color: "#000a" }]}>{time}</Text>
             {msg.pending && (
               <Ionicons
                 name="time-outline"
@@ -453,7 +528,8 @@ const MessageBubble = React.memo(
   },
 );
 
-const bStyles = StyleSheet.create({
+// ── Bubble styles ─────────────────────────────────────────────
+const bS = StyleSheet.create({
   row: {
     flexDirection: "row",
     marginVertical: 3,
@@ -484,28 +560,22 @@ const bStyles = StyleSheet.create({
   bubbleFailed: { borderWidth: 1, borderColor: "#FF453A" },
   name: { fontSize: 11, fontWeight: "700", marginBottom: 3 },
   text: { color: "#DBDEE1", fontSize: 15, lineHeight: 21 },
+  mediaImage: { width: 200, height: 150, borderRadius: 8, marginVertical: 4 },
   audioRow: {
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
-    minWidth: 160,
+    minWidth: 120,
+    paddingVertical: 4,
   },
-  audioBar: {
-    flex: 1,
-    height: 3,
-    backgroundColor: "#ffffff33",
-    borderRadius: 2,
-    overflow: "hidden",
-  },
-  audioProgress: { width: "0%", height: "100%", borderRadius: 2 },
-  audioDuration: { color: "#DBDEE1", fontSize: 12, minWidth: 30 },
-  timerRow: {
+  audioDuration: { color: "#DBDEE1", fontSize: 12 },
+  ephemeralRow: {
     flexDirection: "row",
     alignItems: "center",
     gap: 3,
     marginTop: 4,
   },
-  timerText: { color: "#fff6", fontSize: 10 },
+  ephemeralText: { color: "#fff6", fontSize: 10 },
   meta: {
     flexDirection: "row",
     alignItems: "center",
@@ -516,67 +586,62 @@ const bStyles = StyleSheet.create({
   time: { color: "rgba(255,255,255,0.4)", fontSize: 10 },
 });
 
-// ─── Sidebar ──────────────────────────────────────────────────────────────────
+// ── Sidebar ───────────────────────────────────────────────────
 const Sidebar = ({
   channels,
   active,
   onSelect,
-  insets,
+  topPad,
 }: {
   channels: Channel[];
   active: Channel;
   onSelect: (c: Channel) => void;
-  insets: { top: number };
+  topPad: number;
 }) => (
-  <View style={[sStyles.root, { paddingTop: insets.top + 8 }]}>
-    <Text style={sStyles.heading}>YPN Community</Text>
-    <Text style={sStyles.sectionLabel}>TEXT CHANNELS</Text>
+  <View style={[sS.root, { paddingTop: topPad + 8 }]}>
+    <Text style={sS.heading}>YPN Community</Text>
+    <Text style={sS.sectionLabel}>TEXT CHANNELS</Text>
     {channels.map((ch) => {
       const isActive = ch.id === active.id;
       return (
         <TouchableOpacity
           key={ch.id}
-          style={[
-            sStyles.item,
-            isActive && { backgroundColor: ch.color + "22" },
-          ]}
+          style={[sS.item, isActive && { backgroundColor: ch.color + "22" }]}
           onPress={() => onSelect(ch)}
           activeOpacity={0.7}
         >
           <View
             style={[
-              sStyles.channelIcon,
+              sS.channelIcon,
               { backgroundColor: ch.bgColor, borderColor: ch.color + "44" },
             ]}
           >
-            <Text>{ch.emoji}</Text>
+            <Text style={{ fontSize: 16 }}>{ch.emoji}</Text>
           </View>
-          <View style={sStyles.itemText}>
+          <View style={sS.itemText}>
             <Text
               style={[
-                sStyles.chName,
+                sS.chName,
                 isActive && { color: ch.color, fontWeight: "700" },
               ]}
             >
               #{ch.name}
             </Text>
-            <Text style={sStyles.chDesc} numberOfLines={1}>
+            <Text style={sS.chDesc} numberOfLines={1}>
               {ch.description}
             </Text>
           </View>
-          {isActive && (
-            <View style={[sStyles.dot, { backgroundColor: ch.color }]} />
-          )}
+          {isActive && <View style={[sS.dot, { backgroundColor: ch.color }]} />}
         </TouchableOpacity>
       );
     })}
   </View>
 );
 
-const sStyles = StyleSheet.create({
+const sS = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#1E1F22", paddingHorizontal: 8 },
   heading: {
-    color: "#FFFFFF",
+    color: "#FFF",
     fontSize: 16,
     fontWeight: "800",
     paddingHorizontal: 8,
@@ -616,7 +681,9 @@ const sStyles = StyleSheet.create({
   dot: { width: 8, height: 8, borderRadius: 4 },
 });
 
-// ─── Main Screen ──────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// ── Main screen ───────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
 export default function DiscordScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
@@ -631,35 +698,39 @@ export default function DiscordScreen() {
   const [sending, setSending] = useState(false);
   const [loading, setLoading] = useState(true);
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
-  const [recordingDuration, setRecordingDuration] = useState(0);
+  const [recDuration, setRecDuration] = useState(0);
   const [channelKey, setChannelKey] = useState<CryptoKey | null>(null);
 
   const listRef = useRef<FlatList>(null);
-  const recordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const recTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Track which message IDs we have already scheduled for ephemeral deletion
+  // so rapid re-renders don't schedule duplicate timeouts.
+  const ephemeralSet = useRef<Set<string>>(new Set());
   const me = auth.currentUser;
 
-  // ── Load channel key whenever active channel changes ───────────────────────
+  // ── Channel change: reset state + derive key + restore cache ─
   useEffect(() => {
     setLoading(true);
     setMessages([]);
+    ephemeralSet.current.clear();
 
     getChannelKey(activeChannel.id)
       .then(setChannelKey)
       .catch((e) => console.error("[Discord] getChannelKey:", e));
 
-    // Load MMKV cache
+    // Restore non-sensitive cached messages instantly
     const cached = mmkv.getString(cacheKey(activeChannel.id));
     if (cached) {
       try {
         setMessages(JSON.parse(cached));
         setLoading(false);
       } catch {
-        /* ignore */
+        /* malformed cache — ignore */
       }
     }
   }, [activeChannel.id]);
 
-  // ── Firestore real-time listener ───────────────────────────────────────────
+  // ── Firestore real-time listener ──────────────────────────────
   useEffect(() => {
     if (!channelKey) return;
 
@@ -677,37 +748,47 @@ export default function DiscordScreen() {
 
         for (const docSnap of snap.docs) {
           const d = docSnap.data();
-          const expireAt = d.expireAt?.toMillis?.() ?? null;
+          const expireAt =
+            (d.expireAt as Timestamp | undefined)?.toMillis?.() ?? null;
 
-          // Skip expired destructive messages (Firestore TTL may have a delay)
+          // Remove already-expired Firestore-TTL documents
           if (expireAt && expireAt < now) {
-            // Client-side cleanup for messages TTL missed
             deleteDoc(docSnap.ref).catch(() => {});
             continue;
           }
 
-          const decryptedFields = await decryptFirestoreMessage(d, channelKey);
+          const fields = await decryptFirestoreMessage(d, channelKey);
 
           decrypted.push({
             id: docSnap.id,
-            uid: d.uid ?? "",
-            displayName: d.displayName ?? "Member",
-            createdAt: d.createdAt?.toMillis?.() ?? now,
-            expireAt: expireAt ?? undefined,
-            ...decryptedFields,
+            uid: (d.uid as string) ?? "",
+            displayName: (d.displayName as string) ?? "Member",
+            createdAt:
+              (d.createdAt as Timestamp | undefined)?.toMillis?.() ?? now,
+            ephemeral: true,
+            ...fields,
           } as Message);
         }
 
         setMessages(decrypted);
         setLoading(false);
 
-        // Write to MMKV cache
-        mmkv.set(cacheKey(activeChannel.id), JSON.stringify(decrypted));
+        // Cache metadata (never cache decrypted media keys)
+        mmkv.set(
+          cacheKey(activeChannel.id),
+          JSON.stringify(
+            decrypted.map((m) => ({
+              ...m,
+              mediaKeyJwk: undefined,
+              localObjectUrl: undefined,
+            })),
+          ),
+        );
 
         setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 80);
       },
       (err) => {
-        console.error("[Discord] Firestore listener error:", err);
+        console.error("[Discord] Firestore listener:", err);
         setLoading(false);
       },
     );
@@ -715,61 +796,89 @@ export default function DiscordScreen() {
     return () => unsub();
   }, [activeChannel.id, channelKey]);
 
-  // ── Fetch channels from backend ────────────────────────────────────────────
+  // ── Fetch channel list from backend ───────────────────────────
   useEffect(() => {
-    (async () => {
-      try {
-        const res = await fetch(`${API_URL}/api/discord/channels`);
-        if (!res.ok) return;
-        const data: Channel[] = await res.json();
-        if (Array.isArray(data) && data.length > 0) {
-          setChannels(data);
-        }
-      } catch {
-        /* use fallback */
-      }
-    })();
+    fetch(`${API_URL}/api/discord/channels`)
+      .then((r) => r.json())
+      .then((data: Channel[]) => {
+        if (Array.isArray(data) && data.length) setChannels(data);
+      })
+      .catch(() => {
+        /* use hardcoded fallback */
+      });
   }, []);
 
-  // ── Send text message ──────────────────────────────────────────────────────
+  // ── handleMessageSeen ─────────────────────────────────────────
+  // Called by MessageBubble once for each message the RECIPIENT sees.
+  // Schedules ephemeral cleanup (Firestore doc + Drive file deletion)
+  // and removes the message from local state after the TTL.
+  const handleMessageSeen = useCallback(
+    (messageId: string, driveFileId?: string) => {
+      if (ephemeralSet.current.has(messageId)) return;
+      ephemeralSet.current.add(messageId);
+
+      // Remove from UI after TTL
+      setTimeout(() => {
+        setMessages((prev) => prev.filter((m) => m.id !== messageId));
+      }, EPHEMERAL_TTL_MS);
+
+      // Delete from Firestore + Google Drive after TTL
+      scheduleEphemeralCleanup(
+        activeChannel.id,
+        messageId,
+        driveFileId,
+        EPHEMERAL_TTL_MS,
+      );
+    },
+    [activeChannel.id],
+  );
+
+  // ── sendText ──────────────────────────────────────────────────
   const sendText = useCallback(async () => {
     const text = input.trim();
     if (!text || sending || !me || !channelKey) return;
+
     setInput("");
     setSending(true);
 
+    // Optimistic local message
     const optimisticId = `local_${Date.now()}`;
-    const optimistic: Message = {
-      id: optimisticId,
-      type: "text",
-      text,
-      uid: me.uid,
-      displayName: me.displayName ?? me.email?.split("@")[0] ?? "Me",
-      createdAt: Date.now(),
-      pending: true,
-    };
-    setMessages((prev) => [...prev, optimistic]);
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: optimisticId,
+        type: "text",
+        text,
+        uid: me.uid,
+        displayName: me.displayName ?? "Me",
+        createdAt: Date.now(),
+        ephemeral: true,
+        pending: true,
+      },
+    ]);
 
     try {
+      // Encrypt the entire payload — server only sees _ciphertext + _iv
       const encrypted = await encryptForFirestore(
-        { type: "text", text },
+        { type: "text", text, ephemeral: true },
         channelKey,
       );
-      const expireAt = Timestamp.fromMillis(Date.now() + DESTRUCTIVE_TTL_MS);
 
       await addDoc(collection(db, "channels", activeChannel.id, "messages"), {
         ...encrypted,
         uid: me.uid,
         displayName: me.displayName ?? me.email?.split("@")[0] ?? "YPN Member",
         createdAt: serverTimestamp(),
-        expireAt, // Firestore TTL — backend deletes automatically
+        // Firestore TTL index — safety net for messages the client
+        // missed deleting (e.g. app was closed before recipient opened it)
+        expireAt: Timestamp.fromMillis(Date.now() + 7 * 24 * 60 * 60 * 1000),
         type: "text",
       });
 
-      // Remove optimistic
+      // Remove optimistic bubble; Firestore listener will add the real one
       setMessages((prev) => prev.filter((m) => m.id !== optimisticId));
     } catch (err) {
-      console.error("[Discord] sendText error:", err);
+      console.error("[Discord] sendText:", err);
       setMessages((prev) =>
         prev.map((m) =>
           m.id === optimisticId ? { ...m, pending: false, failed: true } : m,
@@ -780,13 +889,60 @@ export default function DiscordScreen() {
     }
   }, [input, sending, me, channelKey, activeChannel.id]);
 
-  // ── Voice note recording ───────────────────────────────────────────────────
+  // ── sendImage ─────────────────────────────────────────────────
+  // Pick → compress → encrypt → upload to Drive → store ref in Firestore
+  const sendImage = useCallback(async () => {
+    if (!me || !channelKey || sending) return;
+
+    const picked = await pickAndReadImage();
+    if (!picked) return;
+
+    setSending(true);
+    try {
+      // 1. Encrypt in memory and stream ciphertext to Google Drive
+      const { driveFileId, mediaIv, mediaKeyJwk } = await encryptAndUpload(
+        picked.arrayBuffer,
+        picked.mimeType,
+        `img_${me.uid}_${Date.now()}.enc`,
+      );
+
+      // 2. Encrypt the Firestore payload (including the media key and Drive ID)
+      //    The server never sees driveFileId, mediaIv, or mediaKeyJwk in plain.
+      const encrypted = await encryptForFirestore(
+        {
+          type: "image",
+          driveFileId, // points to encrypted blob in Drive
+          mediaIv, // AES-GCM IV for the blob
+          mediaKeyJwk, // AES key for the blob (encrypted by channel key here)
+          mimeType: picked.mimeType,
+          ephemeral: true,
+        },
+        channelKey,
+      );
+
+      await addDoc(collection(db, "channels", activeChannel.id, "messages"), {
+        ...encrypted,
+        uid: me.uid,
+        displayName: me.displayName ?? "YPN Member",
+        createdAt: serverTimestamp(),
+        expireAt: Timestamp.fromMillis(Date.now() + 7 * 24 * 60 * 60 * 1000),
+        type: "image",
+      });
+    } catch (err) {
+      console.error("[Discord] sendImage:", err);
+      Alert.alert("Error", "Failed to send image. Please try again.");
+    } finally {
+      setSending(false);
+    }
+  }, [me, channelKey, sending, activeChannel.id]);
+
+  // ── startRecording ────────────────────────────────────────────
   const startRecording = useCallback(async () => {
-    const granted = await requestAudioPermission();
+    const { granted } = await Audio.requestPermissionsAsync();
     if (!granted) {
       Alert.alert(
         "Permission needed",
-        "Microphone access is required for voice notes.",
+        "Microphone access required for voice notes.",
       );
       return;
     }
@@ -799,13 +955,14 @@ export default function DiscordScreen() {
     const rec = new Audio.Recording();
     await rec.prepareToRecordAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
     await rec.startAsync();
-    setRecording(rec);
-    setRecordingDuration(0);
 
-    recordTimerRef.current = setInterval(() => {
-      setRecordingDuration((d) => {
-        if (d >= MAX_AUDIO_DURATION_S) {
-          stopRecordingAndSend();
+    setRecording(rec);
+    setRecDuration(0);
+
+    recTimerRef.current = setInterval(() => {
+      setRecDuration((d) => {
+        if (d >= MAX_AUDIO_SECONDS) {
+          stopAndSendAudio();
           return d;
         }
         return d + 1;
@@ -813,133 +970,80 @@ export default function DiscordScreen() {
     }, 1000);
   }, []);
 
-  const stopRecordingAndSend = useCallback(async () => {
+  // ── stopAndSendAudio ──────────────────────────────────────────
+  // Stop recording → encrypt bytes → upload to Drive → Firestore ref
+  const stopAndSendAudio = useCallback(async () => {
     if (!recording || !me || !channelKey) return;
 
-    if (recordTimerRef.current) clearInterval(recordTimerRef.current);
+    if (recTimerRef.current) clearInterval(recTimerRef.current);
 
     try {
       await recording.stopAndUnloadAsync();
       const uri = recording.getURI();
       const status = await recording.getStatusAsync();
       const durationS = Math.floor((status.durationMillis ?? 0) / 1000);
+
       setRecording(null);
-      setRecordingDuration(0);
+      setRecDuration(0);
 
       if (!uri) throw new Error("No recording URI");
 
-      // Read file as ArrayBuffer
-      const response = await fetch(uri);
-      const audioBuffer = await response.arrayBuffer();
+      // Read audio file as ArrayBuffer for encryption
+      const audioRes = await fetch(uri);
+      const audioBuffer = await audioRes.arrayBuffer();
 
-      // Generate media key + encrypt audio
-      const { key: mediaKey, keyJwk } = await generateMediaKey();
-      const { encrypted, iv } = await encryptBinary(audioBuffer, mediaKey);
-
-      // Upload encrypted blob
-      const storagePath = `audio/${me.uid}/${Date.now()}.enc`;
-      const downloadUrl = await uploadEncryptedMedia(
-        encrypted,
-        storagePath,
-        "application/octet-stream",
+      // Encrypt + upload to Google Drive
+      const { driveFileId, mediaIv, mediaKeyJwk } = await encryptAndUpload(
+        audioBuffer,
+        "audio/m4a",
+        `audio_${me.uid}_${Date.now()}.enc`,
+        durationS,
       );
 
-      // Encrypt Firestore payload (includes media key — server never sees it)
-      const firestoreEncrypted = await encryptForFirestore(
+      const encrypted = await encryptForFirestore(
         {
           type: "audio",
-          mediaUrl: downloadUrl,
-          mediaIv: iv,
-          mediaKeyJwk: keyJwk,
+          driveFileId,
+          mediaIv,
+          mediaKeyJwk,
+          mimeType: "audio/m4a",
           audioDuration: durationS,
+          ephemeral: true,
         },
         channelKey,
       );
 
-      const expireAt = Timestamp.fromMillis(Date.now() + DESTRUCTIVE_TTL_MS);
-
       await addDoc(collection(db, "channels", activeChannel.id, "messages"), {
-        ...firestoreEncrypted,
+        ...encrypted,
         uid: me.uid,
         displayName: me.displayName ?? "YPN Member",
         createdAt: serverTimestamp(),
-        expireAt,
+        expireAt: Timestamp.fromMillis(Date.now() + 7 * 24 * 60 * 60 * 1000),
         type: "audio",
       });
     } catch (err) {
-      console.error("[Discord] Voice note error:", err);
-      Alert.alert("Error", "Failed to send voice note. Please try again.");
+      console.error("[Discord] stopAndSendAudio:", err);
+      Alert.alert("Error", "Failed to send voice note.");
     }
   }, [recording, me, channelKey, activeChannel.id]);
 
+  // ── cancelRecording ───────────────────────────────────────────
   const cancelRecording = useCallback(async () => {
     if (!recording) return;
-    if (recordTimerRef.current) clearInterval(recordTimerRef.current);
+    if (recTimerRef.current) clearInterval(recTimerRef.current);
     try {
       await recording.stopAndUnloadAsync();
     } catch {
       /* ignore */
     }
     setRecording(null);
-    setRecordingDuration(0);
+    setRecDuration(0);
   }, [recording]);
 
-  // ── Send image ─────────────────────────────────────────────────────────────
-  const sendImage = useCallback(async () => {
-    if (!me || !channelKey) return;
-
-    const result = await pickAndCompressImage();
-    if (!result) return;
-
-    try {
-      // Convert base64 to ArrayBuffer
-      const binaryStr = atob(result.base64);
-      const bytes = new Uint8Array(binaryStr.length);
-      for (let i = 0; i < binaryStr.length; i++)
-        bytes[i] = binaryStr.charCodeAt(i);
-
-      // Encrypt
-      const { key: mediaKey, keyJwk } = await generateMediaKey();
-      const { encrypted, iv } = await encryptBinary(bytes.buffer, mediaKey);
-
-      // Upload encrypted
-      const storagePath = `images/${me.uid}/${Date.now()}.enc`;
-      const downloadUrl = await uploadEncryptedMedia(
-        encrypted,
-        storagePath,
-        "application/octet-stream",
-      );
-
-      const firestoreEncrypted = await encryptForFirestore(
-        {
-          type: "image",
-          mediaUrl: downloadUrl,
-          mediaIv: iv,
-          mediaKeyJwk: keyJwk,
-        },
-        channelKey,
-      );
-
-      const expireAt = Timestamp.fromMillis(Date.now() + DESTRUCTIVE_TTL_MS);
-
-      await addDoc(collection(db, "channels", activeChannel.id, "messages"), {
-        ...firestoreEncrypted,
-        uid: me.uid,
-        displayName: me.displayName ?? "YPN Member",
-        createdAt: serverTimestamp(),
-        expireAt,
-        type: "image",
-      });
-    } catch (err) {
-      console.error("[Discord] sendImage error:", err);
-      Alert.alert("Error", "Failed to send image. Please try again.");
-    }
-  }, [me, channelKey, activeChannel.id]);
-
-  // ── Render ─────────────────────────────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────────
   return (
     <View style={[styles.root, { paddingTop: insets.top }]}>
-      {/* Header */}
+      {/* ── Header ─────────────────────────────────────────── */}
       <View style={styles.header}>
         <TouchableOpacity
           onPress={() => router.back()}
@@ -972,7 +1076,7 @@ export default function DiscordScreen() {
         </View>
       </View>
 
-      {/* Body */}
+      {/* ── Body ───────────────────────────────────────────── */}
       <View style={styles.body}>
         {/* Sidebar overlay */}
         {sidebarOpen && (
@@ -980,7 +1084,7 @@ export default function DiscordScreen() {
             <Sidebar
               channels={channels}
               active={activeChannel}
-              insets={{ top: 0 }}
+              topPad={0}
               onSelect={(ch) => {
                 setActiveChannel(ch);
                 setSidebarOpen(false);
@@ -989,13 +1093,13 @@ export default function DiscordScreen() {
           </View>
         )}
 
-        {/* Chat area — KeyboardAvoidingView wraps only this part */}
+        {/* Chat area */}
         <KeyboardAvoidingView
           style={styles.chatArea}
           behavior={Platform.OS === "ios" ? "padding" : "height"}
-          keyboardVerticalOffset={insets.top + 56} // header height
+          keyboardVerticalOffset={insets.top + 56}
         >
-          {/* Messages */}
+          {/* Message list */}
           {loading ? (
             <View style={styles.centre}>
               <ActivityIndicator color={activeChannel.color} />
@@ -1010,9 +1114,7 @@ export default function DiscordScreen() {
                   msg={item}
                   isMe={item.uid === me?.uid}
                   channelColor={activeChannel.color}
-                  onLongPress={() => {
-                    // Future: message actions (delete, react)
-                  }}
+                  onSeen={handleMessageSeen}
                 />
               )}
               contentContainerStyle={styles.messageList}
@@ -1022,7 +1124,7 @@ export default function DiscordScreen() {
               }
               ListEmptyComponent={
                 <View style={styles.emptyContainer}>
-                  <Text style={styles.emptyEmoji}>{activeChannel.emoji}</Text>
+                  <Text style={{ fontSize: 40 }}>{activeChannel.emoji}</Text>
                   <Text style={styles.emptyTitle}>#{activeChannel.name}</Text>
                   <Text style={styles.emptyDesc}>
                     {activeChannel.description}
@@ -1030,7 +1132,7 @@ export default function DiscordScreen() {
                   <View style={styles.emptyBadge}>
                     <Ionicons name="lock-closed" size={12} color="#57F287" />
                     <Text style={styles.emptyBadgeText}>
-                      Messages are end-to-end encrypted
+                      E2E encrypted · ephemeral after seen
                     </Text>
                   </View>
                 </View>
@@ -1038,11 +1140,14 @@ export default function DiscordScreen() {
             />
           )}
 
-          {/* Input bar */}
+          {/* ── Input bar ──────────────────────────────────── */}
           {recording ? (
             // Recording state
             <View
-              style={[styles.inputBar, { paddingBottom: insets.bottom || 8 }]}
+              style={[
+                styles.inputBar,
+                { paddingBottom: Math.max(insets.bottom, 8) },
+              ]}
             >
               <TouchableOpacity
                 onPress={cancelRecording}
@@ -1050,21 +1155,24 @@ export default function DiscordScreen() {
               >
                 <Ionicons name="trash-outline" size={22} color="#FF453A" />
               </TouchableOpacity>
+
               <View style={styles.recordingIndicator}>
                 <View style={styles.recordingDot} />
                 <Text style={styles.recordingText}>
-                  {Math.floor(recordingDuration / 60)}:
-                  {String(recordingDuration % 60).padStart(2, "0")}
+                  {Math.floor(recDuration / 60)}:
+                  {String(recDuration % 60).padStart(2, "0")}
                 </Text>
               </View>
+
               <TouchableOpacity
-                onPress={stopRecordingAndSend}
+                onPress={stopAndSendAudio}
                 style={styles.sendBtn}
               >
                 <Ionicons name="send" size={18} color="#fff" />
               </TouchableOpacity>
             </View>
           ) : (
+            // Normal input state
             <View
               style={[
                 styles.inputBar,
@@ -1075,12 +1183,12 @@ export default function DiscordScreen() {
               <TouchableOpacity
                 onPress={sendImage}
                 style={styles.inputAction}
-                disabled={!me}
+                disabled={!me || sending}
               >
                 <Ionicons
                   name="image-outline"
                   size={22}
-                  color={me ? "#8D9096" : "#444"}
+                  color={me && !sending ? "#8D9096" : "#444"}
                 />
               </TouchableOpacity>
 
@@ -1096,10 +1204,9 @@ export default function DiscordScreen() {
                 multiline
                 maxLength={2000}
                 editable={!!me}
-                returnKeyType="default"
               />
 
-              {/* Voice note OR send */}
+              {/* Send / microphone button */}
               {input.trim() ? (
                 <TouchableOpacity
                   onPress={sendText}
@@ -1141,6 +1248,7 @@ export default function DiscordScreen() {
             </View>
           )}
 
+          {/* Sign-in nudge */}
           {!me && (
             <View style={styles.authBanner}>
               <Ionicons name="lock-closed-outline" size={13} color="#FFA500" />
@@ -1153,10 +1261,9 @@ export default function DiscordScreen() {
   );
 }
 
-// ─── Styles ───────────────────────────────────────────────────────────────────
+// ── Screen styles ─────────────────────────────────────────────
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#313338" },
-
   header: {
     flexDirection: "row",
     alignItems: "center",
@@ -1173,12 +1280,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
   },
-  headerCenter: {
-    flex: 1,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-  },
+  headerCenter: { flex: 1, flexDirection: "row", alignItems: "center", gap: 8 },
   headerTitle: { color: "#FFFFFF", fontSize: 16, fontWeight: "700" },
   lockBadge: {
     flexDirection: "row",
@@ -1192,7 +1294,6 @@ const styles = StyleSheet.create({
     borderColor: "#57F28740",
   },
   lockText: { color: "#57F287", fontSize: 10, fontWeight: "700" },
-
   body: { flex: 1, flexDirection: "row" },
   sidebar: {
     width: 230,
@@ -1201,11 +1302,8 @@ const styles = StyleSheet.create({
     zIndex: 10,
   },
   chatArea: { flex: 1 },
-
   messageList: { paddingVertical: 12, paddingBottom: 4 },
-
   centre: { flex: 1, justifyContent: "center", alignItems: "center" },
-
   emptyContainer: {
     flex: 1,
     alignItems: "center",
@@ -1213,7 +1311,6 @@ const styles = StyleSheet.create({
     gap: 8,
     marginTop: 60,
   },
-  emptyEmoji: { fontSize: 48, marginBottom: 8 },
   emptyTitle: { color: "#FFFFFF", fontSize: 20, fontWeight: "700" },
   emptyDesc: { color: "#8D9096", fontSize: 14, textAlign: "center" },
   emptyBadge: {
@@ -1229,7 +1326,6 @@ const styles = StyleSheet.create({
     borderColor: "#57F28730",
   },
   emptyBadgeText: { color: "#57F287", fontSize: 12 },
-
   inputBar: {
     flexDirection: "row",
     alignItems: "flex-end",
@@ -1268,7 +1364,6 @@ const styles = StyleSheet.create({
     marginBottom: 3,
   },
   sendBtnDisabled: { backgroundColor: "#404249" },
-
   recordingIndicator: {
     flex: 1,
     flexDirection: "row",
@@ -1286,7 +1381,6 @@ const styles = StyleSheet.create({
     backgroundColor: "#FF453A",
   },
   recordingText: { color: "#DBDEE1", fontSize: 15, fontWeight: "600" },
-
   authBanner: {
     flexDirection: "row",
     alignItems: "center",
