@@ -32,7 +32,68 @@ import { db } from "../firebase/firestore";
 const API_URL = process.env.EXPO_PUBLIC_API_URL;
 const CHANNELS_KEY = "discord_channels_v1";
 const CHANNELS_TS = "discord_channels_ts_v1";
-const CHANNELS_TTL = 24 * 60 * 60 * 1000; // 24h — channels rarely change
+const CHANNELS_TTL = 24 * 60 * 60 * 1000;
+
+// ─── HARDCODED FALLBACK CHANNELS ─────────────────────────────────────────────
+// These are used when the backend is unreachable, ensuring the screen never crashes.
+// Firestore messaging still works fully with these — the channel IDs just need to
+// match what you seeded in MongoDB (see backend/src/models/DiscordChannels.js).
+const FALLBACK_CHANNELS: Channel[] = [
+  {
+    id: "general",
+    name: "general",
+    description: "General YPN community chat",
+    color: "#5865F2",
+    bgColor: "#5865F222",
+    emoji: "💬",
+    order: 1,
+  },
+  {
+    id: "mental-health",
+    name: "mental-health",
+    description: "Safe space to talk",
+    color: "#57F287",
+    bgColor: "#57F28722",
+    emoji: "💚",
+    order: 2,
+  },
+  {
+    id: "jobs",
+    name: "jobs",
+    description: "Opportunities & careers",
+    color: "#FEE75C",
+    bgColor: "#FEE75C22",
+    emoji: "💼",
+    order: 3,
+  },
+  {
+    id: "education",
+    name: "education",
+    description: "Learning & resources",
+    color: "#EB459E",
+    bgColor: "#EB459E22",
+    emoji: "📚",
+    order: 4,
+  },
+  {
+    id: "prayer",
+    name: "prayer",
+    description: "Prayer & community support",
+    color: "#FF7043",
+    bgColor: "#FF704322",
+    emoji: "🙏",
+    order: 5,
+  },
+  {
+    id: "announcements",
+    name: "announcements",
+    description: "YPN news & updates",
+    color: "#ED4245",
+    bgColor: "#ED424522",
+    emoji: "📢",
+    order: 6,
+  },
+];
 
 // ─── MMKV singleton ───────────────────────────────────────────────────────────
 let _store: MMKV | null = null;
@@ -79,11 +140,34 @@ function writeChannelCache(channels: Channel[]) {
   } catch {}
 }
 
-// ─── Fetch channels from backend ──────────────────────────────────────────────
+// ─── Fetch channels — NEVER throws, always returns something usable ───────────
 async function fetchChannels(): Promise<Channel[]> {
-  const res = await fetch(`${API_URL}/api/discord/channels`);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+  // 1. Try device cache first (instant)
+  const cached = readChannelCache();
+
+  try {
+    // 2. Attempt backend with a 5-second timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+    const res = await fetch(`${API_URL}/api/discord/channels`, {
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const data: Channel[] = await res.json();
+    if (Array.isArray(data) && data.length > 0) {
+      writeChannelCache(data);
+      return data;
+    }
+    throw new Error("Empty response");
+  } catch (err) {
+    // 3. Backend failed → use cache if available, else hardcoded fallback
+    console.warn("[Discord] fetchChannels failed, using fallback:", err);
+    return cached ?? FALLBACK_CHANNELS;
+  }
 }
 
 // ─── Time helpers ─────────────────────────────────────────────────────────────
@@ -108,7 +192,6 @@ function formatDateHeader(ts: number): string {
 }
 
 // ─── Channel Avatar ───────────────────────────────────────────────────────────
-// Rendered from backend-provided color + emoji — no hardcoded values on frontend
 function ChannelAvatar({
   channel,
   size = 48,
@@ -327,7 +410,6 @@ function ChatView({ channel }: { channel: Channel }) {
   const listRef = useRef<FlatList>(null);
   const me = auth?.currentUser;
 
-  // Real-time Firestore listener
   useEffect(() => {
     setLoading(true);
     setMessages([]);
@@ -378,7 +460,7 @@ function ChatView({ channel }: { channel: Channel }) {
       });
     } catch (e) {
       console.error("[Discord] Send failed:", e);
-      setInput(text); // restore on failure
+      setInput(text);
     } finally {
       setSending(false);
     }
@@ -469,6 +551,7 @@ function ChatView({ channel }: { channel: Channel }) {
               <Text style={{ fontSize: 36 }}>{channel.emoji}</Text>
               <Text style={chat.emptyTitle}>Welcome to #{channel.name}</Text>
               <Text style={chat.emptyDesc}>{channel.description}</Text>
+              <Text style={chat.emptyHint}>Be the first to say something!</Text>
             </View>
           }
         />
@@ -542,6 +625,7 @@ const chat = StyleSheet.create({
     marginTop: 8,
   },
   emptyDesc: { color: "#8D9096", fontSize: 14, textAlign: "center" },
+  emptyHint: { color: "#555", fontSize: 12, marginTop: 4 },
   dateRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -597,40 +681,29 @@ export default function DiscordScreen() {
   const [activeChannel, setActiveChannel] = useState<Channel | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [loadingChannels, setLoadingChannels] = useState(true);
-  const [channelError, setChannelError] = useState(false);
 
   useEffect(() => {
     bootChannels();
   }, []);
 
   const bootChannels = async () => {
-    // Show cached channels instantly
+    // Show cached or fallback immediately so there's no crash
     const cached = readChannelCache();
-    if (cached && cached.length > 0) {
-      setChannels(cached);
-      setActiveChannel(cached[0]);
-      setLoadingChannels(false);
-      // Background refresh
-      refreshChannels(cached);
-    } else {
-      await refreshChannels(null);
-    }
-  };
+    const initial = cached ?? FALLBACK_CHANNELS;
+    setChannels(initial);
+    setActiveChannel(initial[0]);
+    setLoadingChannels(false);
 
-  const refreshChannels = async (existing: Channel[] | null) => {
+    // Then try to refresh from backend in the background (non-blocking)
     try {
-      const data = await fetchChannels();
-      if (data.length > 0) {
-        writeChannelCache(data);
-        setChannels(data);
-        // Only set active if we don't have one yet
-        if (!existing) setActiveChannel(data[0]);
-      }
-    } catch (e) {
-      console.error("[Discord] Failed to fetch channels:", e);
-      if (!existing) setChannelError(true);
-    } finally {
-      setLoadingChannels(false);
+      const fresh = await fetchChannels();
+      setChannels(fresh);
+      // Only update active channel if user hasn't switched yet
+      setActiveChannel((prev) =>
+        prev ? (fresh.find((c) => c.id === prev.id) ?? fresh[0]) : fresh[0],
+      );
+    } catch {
+      // Already showing fallback — nothing to do
     }
   };
 
@@ -643,19 +716,12 @@ export default function DiscordScreen() {
     );
   }
 
-  if (channelError || !activeChannel) {
+  if (!activeChannel) {
+    // Should never happen because we always set fallback, but just in case
     return (
       <View style={main.loadingRoot}>
-        <Ionicons name="wifi-outline" size={48} color="#444" />
-        <Text style={main.loadingText}>Could not load channels</Text>
-        <TouchableOpacity
-          style={main.retryBtn}
-          onPress={() => {
-            setChannelError(false);
-            setLoadingChannels(true);
-            bootChannels();
-          }}
-        >
+        <Text style={main.loadingText}>Something went wrong.</Text>
+        <TouchableOpacity style={main.retryBtn} onPress={bootChannels}>
           <Text style={main.retryText}>Retry</Text>
         </TouchableOpacity>
       </View>
@@ -719,7 +785,6 @@ export default function DiscordScreen() {
 const main = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#313338" },
   body: { flex: 1, flexDirection: "row" },
-
   loadingRoot: {
     flex: 1,
     backgroundColor: "#313338",
@@ -736,10 +801,8 @@ const main = StyleSheet.create({
     borderRadius: 20,
   },
   retryText: { color: "#fff", fontWeight: "700", fontSize: 14 },
-
   sidebar: { width: 230, borderRightWidth: 1, borderRightColor: "#1E1F22" },
   chat: { flex: 1 },
-
   topBar: {
     flexDirection: "row",
     alignItems: "center",
@@ -764,7 +827,6 @@ const main = StyleSheet.create({
     gap: 8,
   },
   topBarTitle: { color: "#FFFFFF", fontSize: 16, fontWeight: "700" },
-
   onlineIndicator: {
     flexDirection: "row",
     alignItems: "center",
