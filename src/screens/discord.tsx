@@ -1,14 +1,4 @@
 // src/screens/discord.tsx
-//
-// Discord-style multi-channel community chat.
-// Powered by Firebase Firestore realtime (onSnapshot).
-//
-// Firestore structure:
-//   channels/{channelId}/messages/{msgId}
-//     → text, uid, displayName, createdAt (serverTimestamp)
-//
-// Security: add Firestore rules so only authenticated users can read/write.
-
 import { Ionicons } from "@expo/vector-icons";
 import {
   addDoc,
@@ -33,45 +23,35 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import { MMKV } from "react-native-mmkv";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { auth } from "../firebase/auth";
 import { db } from "../firebase/firestore";
 
-// ─── Channels ─────────────────────────────────────────────────────────────────
-const CHANNELS = [
-  {
-    id: "general",
-    name: "general",
-    icon: "chatbubbles-outline",
-    desc: "General YPN chat",
-  },
-  {
-    id: "mental-health",
-    name: "mental-health",
-    icon: "heart-outline",
-    desc: "Safe space to talk",
-  },
-  {
-    id: "jobs",
-    name: "jobs",
-    icon: "briefcase-outline",
-    desc: "Opportunities & careers",
-  },
-  {
-    id: "education",
-    name: "education",
-    icon: "school-outline",
-    desc: "Learning & resources",
-  },
-  {
-    id: "prayer",
-    name: "prayer",
-    icon: "sparkles-outline",
-    desc: "Prayer & support",
-  },
-];
+// ─── Config ───────────────────────────────────────────────────────────────────
+const API_URL = process.env.EXPO_PUBLIC_API_URL;
+const CHANNELS_KEY = "discord_channels_v1";
+const CHANNELS_TS = "discord_channels_ts_v1";
+const CHANNELS_TTL = 24 * 60 * 60 * 1000; // 24h — channels rarely change
+
+// ─── MMKV singleton ───────────────────────────────────────────────────────────
+let _store: MMKV | null = null;
+const store = () => {
+  if (!_store) _store = new MMKV({ id: "discord-cache" });
+  return _store;
+};
 
 // ─── Types ────────────────────────────────────────────────────────────────────
+type Channel = {
+  id: string;
+  name: string;
+  description: string;
+  color: string;
+  bgColor: string;
+  emoji: string;
+  order: number;
+};
+
 type Message = {
   id: string;
   text: string;
@@ -80,12 +60,38 @@ type Message = {
   createdAt: number;
 };
 
-type Channel = (typeof CHANNELS)[0];
+// ─── Channel cache helpers ────────────────────────────────────────────────────
+function readChannelCache(): Channel[] | null {
+  try {
+    const ts = store().getNumber(CHANNELS_TS);
+    if (!ts || Date.now() - ts > CHANNELS_TTL) return null;
+    const raw = store().getString(CHANNELS_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
 
-// ─── Time formatter ───────────────────────────────────────────────────────────
+function writeChannelCache(channels: Channel[]) {
+  try {
+    store().set(CHANNELS_KEY, JSON.stringify(channels));
+    store().set(CHANNELS_TS, Date.now());
+  } catch {}
+}
+
+// ─── Fetch channels from backend ──────────────────────────────────────────────
+async function fetchChannels(): Promise<Channel[]> {
+  const res = await fetch(`${API_URL}/api/discord/channels`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+// ─── Time helpers ─────────────────────────────────────────────────────────────
 function formatTime(ts: number): string {
-  const d = new Date(ts);
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return new Date(ts).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function formatDateHeader(ts: number): string {
@@ -101,32 +107,83 @@ function formatDateHeader(ts: number): string {
   });
 }
 
+// ─── Channel Avatar ───────────────────────────────────────────────────────────
+// Rendered from backend-provided color + emoji — no hardcoded values on frontend
+function ChannelAvatar({
+  channel,
+  size = 48,
+}: {
+  channel: Channel;
+  size?: number;
+}) {
+  return (
+    <View
+      style={{
+        width: size,
+        height: size,
+        borderRadius: size / 2,
+        backgroundColor: channel.bgColor,
+        borderWidth: 2,
+        borderColor: channel.color + "55",
+        justifyContent: "center",
+        alignItems: "center",
+      }}
+    >
+      <Text style={{ fontSize: size * 0.45 }}>{channel.emoji}</Text>
+    </View>
+  );
+}
+
 // ─── Message bubble ───────────────────────────────────────────────────────────
 const Bubble = React.memo(
   ({
     msg,
     isMe,
     showName,
+    channelColor,
   }: {
     msg: Message;
     isMe: boolean;
     showName: boolean;
-  }) => (
-    <View style={[bub.row, isMe && bub.rowMe]}>
-      {!isMe && (
-        <View style={bub.avatar}>
-          <Text style={bub.avatarText}>
-            {(msg.displayName?.[0] ?? "?").toUpperCase()}
-          </Text>
+    channelColor: string;
+  }) => {
+    const initials = (msg.displayName?.[0] ?? "?").toUpperCase();
+    return (
+      <View style={[bub.row, isMe && bub.rowMe]}>
+        {!isMe && (
+          <View
+            style={[
+              bub.avatar,
+              {
+                backgroundColor: channelColor + "33",
+                borderColor: channelColor + "55",
+              },
+            ]}
+          >
+            <Text style={[bub.avatarText, { color: channelColor }]}>
+              {initials}
+            </Text>
+          </View>
+        )}
+        <View
+          style={[
+            bub.bubble,
+            isMe
+              ? [bub.bubbleMe, { backgroundColor: channelColor }]
+              : bub.bubbleThem,
+          ]}
+        >
+          {showName && !isMe && (
+            <Text style={[bub.name, { color: channelColor }]}>
+              {msg.displayName}
+            </Text>
+          )}
+          <Text style={bub.text}>{msg.text}</Text>
+          <Text style={bub.time}>{formatTime(msg.createdAt)}</Text>
         </View>
-      )}
-      <View style={[bub.bubble, isMe ? bub.bubbleMe : bub.bubbleThem]}>
-        {showName && !isMe && <Text style={bub.name}>{msg.displayName}</Text>}
-        <Text style={bub.text}>{msg.text}</Text>
-        <Text style={bub.time}>{formatTime(msg.createdAt)}</Text>
       </View>
-    </View>
-  ),
+    );
+  },
 );
 
 const bub = StyleSheet.create({
@@ -141,22 +198,22 @@ const bub = StyleSheet.create({
     width: 32,
     height: 32,
     borderRadius: 16,
-    backgroundColor: "#5865F2",
+    borderWidth: 1,
     justifyContent: "center",
     alignItems: "center",
     marginRight: 6,
     marginBottom: 2,
   },
-  avatarText: { color: "#fff", fontWeight: "700", fontSize: 13 },
+  avatarText: { fontWeight: "700", fontSize: 13 },
   bubble: {
     maxWidth: "78%",
     paddingHorizontal: 12,
     paddingVertical: 8,
     borderRadius: 16,
   },
-  bubbleMe: { backgroundColor: "#5865F2", borderBottomRightRadius: 4 },
+  bubbleMe: { borderBottomRightRadius: 4 },
   bubbleThem: { backgroundColor: "#2B2D31", borderBottomLeftRadius: 4 },
-  name: { color: "#B5BAC1", fontSize: 11, fontWeight: "700", marginBottom: 2 },
+  name: { fontSize: 11, fontWeight: "700", marginBottom: 2 },
   text: { color: "#DBDEE1", fontSize: 15, lineHeight: 21 },
   time: {
     color: "rgba(255,255,255,0.35)",
@@ -166,83 +223,102 @@ const bub = StyleSheet.create({
   },
 });
 
-// ─── Channel sidebar ──────────────────────────────────────────────────────────
-const Sidebar = ({
+// ─── Channel Sidebar ──────────────────────────────────────────────────────────
+function Sidebar({
+  channels,
   active,
   onSelect,
   onClose,
 }: {
+  channels: Channel[];
   active: Channel;
   onSelect: (c: Channel) => void;
   onClose: () => void;
-}) => {
+}) {
   const insets = useSafeAreaInsets();
   return (
     <View style={[side.root, { paddingTop: insets.top + 8 }]}>
-      <Text style={side.heading}>YPN Community</Text>
-      <Text style={side.subheading}>TEXT CHANNELS</Text>
-      {CHANNELS.map((ch) => {
+      <View style={side.header}>
+        <Text style={side.heading}>YPN Community</Text>
+        <Text style={side.sub}>Youth Positive Network</Text>
+      </View>
+
+      <Text style={side.sectionLabel}>TEXT CHANNELS</Text>
+
+      {channels.map((ch) => {
         const isActive = ch.id === active.id;
         return (
           <TouchableOpacity
             key={ch.id}
-            style={[side.item, isActive && side.itemActive]}
+            style={[
+              side.item,
+              isActive && { backgroundColor: ch.color + "22" },
+            ]}
             onPress={() => {
               onSelect(ch);
               onClose();
             }}
             activeOpacity={0.7}
           >
-            <Text style={[side.hash, isActive && side.hashActive]}>#</Text>
-            <Text style={[side.chName, isActive && side.chNameActive]}>
-              {ch.name}
-            </Text>
+            <ChannelAvatar channel={ch} size={36} />
+            <View style={side.itemText}>
+              <Text
+                style={[
+                  side.chName,
+                  isActive && { color: ch.color, fontWeight: "700" },
+                ]}
+              >
+                #{ch.name}
+              </Text>
+              <Text style={side.chDesc} numberOfLines={1}>
+                {ch.description}
+              </Text>
+            </View>
+            {isActive && (
+              <View style={[side.activeDot, { backgroundColor: ch.color }]} />
+            )}
           </TouchableOpacity>
         );
       })}
     </View>
   );
-};
+}
 
 const side = StyleSheet.create({
-  root: { flex: 1, backgroundColor: "#2B2D31", paddingHorizontal: 8 },
-  heading: {
-    color: "#FFFFFF",
-    fontSize: 16,
-    fontWeight: "700",
+  root: { flex: 1, backgroundColor: "#1E1F22", paddingHorizontal: 8 },
+  header: {
     paddingHorizontal: 8,
-    marginBottom: 16,
+    paddingBottom: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: "#2B2D31",
+    marginBottom: 12,
   },
-  subheading: {
+  heading: { color: "#FFFFFF", fontSize: 17, fontWeight: "800" },
+  sub: { color: "#8D9096", fontSize: 11, marginTop: 2 },
+  sectionLabel: {
     color: "#8D9096",
     fontSize: 11,
     fontWeight: "700",
     letterSpacing: 0.8,
     paddingHorizontal: 8,
-    marginBottom: 4,
+    marginBottom: 6,
   },
   item: {
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: 8,
     paddingVertical: 8,
-    borderRadius: 6,
-    marginBottom: 2,
+    borderRadius: 10,
+    marginBottom: 4,
+    gap: 10,
   },
-  itemActive: { backgroundColor: "#404249" },
-  hash: {
-    color: "#8D9096",
-    fontSize: 18,
-    fontWeight: "700",
-    marginRight: 6,
-    width: 16,
-  },
-  hashActive: { color: "#DBDEE1" },
-  chName: { color: "#8D9096", fontSize: 15, fontWeight: "500" },
-  chNameActive: { color: "#DBDEE1", fontWeight: "600" },
+  itemText: { flex: 1 },
+  chName: { color: "#8D9096", fontSize: 14, fontWeight: "500" },
+  chDesc: { color: "#555", fontSize: 11, marginTop: 1 },
+  activeDot: { width: 8, height: 8, borderRadius: 4 },
 });
 
-// ─── Chat view ────────────────────────────────────────────────────────────────
+// ─── Chat View ────────────────────────────────────────────────────────────────
 function ChatView({ channel }: { channel: Channel }) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [loading, setLoading] = useState(true);
@@ -251,7 +327,7 @@ function ChatView({ channel }: { channel: Channel }) {
   const listRef = useRef<FlatList>(null);
   const me = auth?.currentUser;
 
-  // Realtime Firestore listener
+  // Real-time Firestore listener
   useEffect(() => {
     setLoading(true);
     setMessages([]);
@@ -271,13 +347,12 @@ function ChatView({ channel }: { channel: Channel }) {
             id: doc.id,
             text: d.text ?? "",
             uid: d.uid ?? "",
-            displayName: d.displayName ?? "Anonymous",
+            displayName: d.displayName ?? "Member",
             createdAt: d.createdAt?.toMillis?.() ?? Date.now(),
           };
         });
         setMessages(msgs);
         setLoading(false);
-        // Scroll to bottom when new messages arrive
         setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 80);
       },
       (err) => {
@@ -298,24 +373,24 @@ function ChatView({ channel }: { channel: Channel }) {
       await addDoc(collection(db, "channels", channel.id, "messages"), {
         text,
         uid: me.uid,
-        displayName: me.displayName || me.email?.split("@")[0] || "User",
+        displayName: me.displayName || me.email?.split("@")[0] || "YPN Member",
         createdAt: serverTimestamp(),
       });
     } catch (e) {
       console.error("[Discord] Send failed:", e);
-      // Restore input if send failed
-      setInput(text);
+      setInput(text); // restore on failure
     } finally {
       setSending(false);
     }
   }, [input, sending, me, channel.id]);
 
-  // Group messages by date for date headers
+  // Group messages with date headers
   const grouped = React.useMemo(() => {
-    const result: Array<
+    type Row =
       | { type: "header"; date: string }
-      | { type: "msg"; msg: Message; showName: boolean }
-    > = [];
+      | { type: "msg"; msg: Message; showName: boolean };
+
+    const result: Row[] = [];
     let lastDate = "";
     let lastUid = "";
 
@@ -340,18 +415,23 @@ function ChatView({ channel }: { channel: Channel }) {
       keyboardVerticalOffset={Platform.OS === "ios" ? 90 : 0}
     >
       {/* Channel header */}
-      <View style={chat.channelHeader}>
-        <Text style={chat.hashIcon}>#</Text>
-        <View>
-          <Text style={chat.channelName}>{channel.name}</Text>
-          <Text style={chat.channelDesc}>{channel.desc}</Text>
+      <View
+        style={[
+          chat.channelHeader,
+          { borderBottomColor: channel.color + "33" },
+        ]}
+      >
+        <ChannelAvatar channel={channel} size={36} />
+        <View style={{ flex: 1 }}>
+          <Text style={chat.channelName}>#{channel.name}</Text>
+          <Text style={chat.channelDesc}>{channel.description}</Text>
         </View>
       </View>
 
-      {/* Messages */}
+      {/* Messages list */}
       {loading ? (
         <View style={chat.centre}>
-          <ActivityIndicator color="#5865F2" />
+          <ActivityIndicator color={channel.color} />
         </View>
       ) : (
         <FlatList
@@ -375,6 +455,7 @@ function ChatView({ channel }: { channel: Channel }) {
                 msg={item.msg}
                 isMe={item.msg.uid === me?.uid}
                 showName={item.showName}
+                channelColor={channel.color}
               />
             );
           }}
@@ -385,10 +466,9 @@ function ChatView({ channel }: { channel: Channel }) {
           }
           ListEmptyComponent={
             <View style={chat.centre}>
-              <Ionicons name="chatbubbles-outline" size={40} color="#444" />
-              <Text style={chat.emptyText}>
-                No messages yet.{"\n"}Say hello in #{channel.name}!
-              </Text>
+              <Text style={{ fontSize: 36 }}>{channel.emoji}</Text>
+              <Text style={chat.emptyTitle}>Welcome to #{channel.name}</Text>
+              <Text style={chat.emptyDesc}>{channel.description}</Text>
             </View>
           }
         />
@@ -399,7 +479,7 @@ function ChatView({ channel }: { channel: Channel }) {
         <TextInput
           value={input}
           onChangeText={setInput}
-          placeholder={`Message #${channel.name}`}
+          placeholder={me ? `Message #${channel.name}` : "Sign in to chat"}
           placeholderTextColor="#6D6F78"
           style={chat.input}
           multiline
@@ -413,8 +493,9 @@ function ChatView({ channel }: { channel: Channel }) {
           disabled={!input.trim() || sending || !me}
           style={({ pressed }) => [
             chat.sendBtn,
+            { backgroundColor: channel.color },
             (!input.trim() || !me) && chat.sendBtnOff,
-            pressed && { opacity: 0.7 },
+            pressed && { opacity: 0.75 },
           ]}
         >
           {sending ? (
@@ -439,25 +520,28 @@ const chat = StyleSheet.create({
   channelHeader: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 8,
-    paddingHorizontal: 16,
-    paddingVertical: 12,
+    gap: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
     borderBottomWidth: 1,
-    borderBottomColor: "#1E1F22",
-    backgroundColor: "#313338",
+    backgroundColor: "#232428",
   },
-  hashIcon: { color: "#8D9096", fontSize: 22, fontWeight: "700" },
   channelName: { color: "#FFFFFF", fontSize: 15, fontWeight: "700" },
-  channelDesc: { color: "#8D9096", fontSize: 12 },
-
-  centre: { flex: 1, justifyContent: "center", alignItems: "center", gap: 10 },
-  emptyText: {
-    color: "#6D6F78",
-    fontSize: 14,
-    textAlign: "center",
-    lineHeight: 22,
+  channelDesc: { color: "#8D9096", fontSize: 11, marginTop: 1 },
+  centre: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    gap: 8,
+    padding: 24,
   },
-
+  emptyTitle: {
+    color: "#FFFFFF",
+    fontSize: 18,
+    fontWeight: "700",
+    marginTop: 8,
+  },
+  emptyDesc: { color: "#8D9096", fontSize: 14, textAlign: "center" },
   dateRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -467,13 +551,12 @@ const chat = StyleSheet.create({
   },
   dateLine: { flex: 1, height: 1, backgroundColor: "#3F4147" },
   dateText: { color: "#8D9096", fontSize: 11, fontWeight: "600" },
-
   inputBar: {
     flexDirection: "row",
     alignItems: "flex-end",
-    margin: 12,
+    margin: 10,
     backgroundColor: "#383A40",
-    borderRadius: 12,
+    borderRadius: 14,
     paddingHorizontal: 12,
     paddingVertical: 8,
     gap: 8,
@@ -489,12 +572,10 @@ const chat = StyleSheet.create({
     width: 36,
     height: 36,
     borderRadius: 18,
-    backgroundColor: "#5865F2",
     justifyContent: "center",
     alignItems: "center",
   },
   sendBtnOff: { backgroundColor: "#404249" },
-
   authBanner: {
     flexDirection: "row",
     alignItems: "center",
@@ -506,35 +587,104 @@ const chat = StyleSheet.create({
   authText: { color: "#FFA500", fontSize: 12 },
 });
 
-// ─── Main Discord screen ──────────────────────────────────────────────────────
+// ─── Main screen ──────────────────────────────────────────────────────────────
 const STATUS_H =
   Platform.OS === "android" ? (RNStatusBar.currentHeight ?? 24) : 0;
 const TOP_OFFSET = STATUS_H + 48;
 
 export default function DiscordScreen() {
-  const [activeChannel, setActiveChannel] = useState(CHANNELS[0]);
+  const [channels, setChannels] = useState<Channel[]>([]);
+  const [activeChannel, setActiveChannel] = useState<Channel | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [loadingChannels, setLoadingChannels] = useState(true);
+  const [channelError, setChannelError] = useState(false);
+
+  useEffect(() => {
+    bootChannels();
+  }, []);
+
+  const bootChannels = async () => {
+    // Show cached channels instantly
+    const cached = readChannelCache();
+    if (cached && cached.length > 0) {
+      setChannels(cached);
+      setActiveChannel(cached[0]);
+      setLoadingChannels(false);
+      // Background refresh
+      refreshChannels(cached);
+    } else {
+      await refreshChannels(null);
+    }
+  };
+
+  const refreshChannels = async (existing: Channel[] | null) => {
+    try {
+      const data = await fetchChannels();
+      if (data.length > 0) {
+        writeChannelCache(data);
+        setChannels(data);
+        // Only set active if we don't have one yet
+        if (!existing) setActiveChannel(data[0]);
+      }
+    } catch (e) {
+      console.error("[Discord] Failed to fetch channels:", e);
+      if (!existing) setChannelError(true);
+    } finally {
+      setLoadingChannels(false);
+    }
+  };
+
+  if (loadingChannels) {
+    return (
+      <View style={main.loadingRoot}>
+        <ActivityIndicator size="large" color="#5865F2" />
+        <Text style={main.loadingText}>Loading channels…</Text>
+      </View>
+    );
+  }
+
+  if (channelError || !activeChannel) {
+    return (
+      <View style={main.loadingRoot}>
+        <Ionicons name="wifi-outline" size={48} color="#444" />
+        <Text style={main.loadingText}>Could not load channels</Text>
+        <TouchableOpacity
+          style={main.retryBtn}
+          onPress={() => {
+            setChannelError(false);
+            setLoadingChannels(true);
+            bootChannels();
+          }}
+        >
+          <Text style={main.retryText}>Retry</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
 
   return (
     <View style={main.root}>
-      {/* Spacer for floating community tab bar */}
       <View style={{ height: TOP_OFFSET }} />
 
       <View style={main.body}>
-        {/* Sidebar (conditionally shown) */}
+        {/* Sidebar */}
         {sidebarOpen && (
           <View style={main.sidebar}>
             <Sidebar
+              channels={channels}
               active={activeChannel}
-              onSelect={setActiveChannel}
+              onSelect={(ch) => {
+                setActiveChannel(ch);
+                setSidebarOpen(false);
+              }}
               onClose={() => setSidebarOpen(false)}
             />
           </View>
         )}
 
-        {/* Main chat area */}
+        {/* Main chat */}
         <View style={main.chat}>
-          {/* Top bar with hamburger */}
+          {/* Top bar */}
           <View style={main.topBar}>
             <TouchableOpacity
               onPress={() => setSidebarOpen((p) => !p)}
@@ -547,8 +697,16 @@ export default function DiscordScreen() {
                 color="#DBDEE1"
               />
             </TouchableOpacity>
-            <Text style={main.topBarTitle}>#{activeChannel.name}</Text>
-            <View style={{ width: 36 }} />
+
+            <View style={main.topBarCenter}>
+              <Text style={{ fontSize: 18 }}>{activeChannel.emoji}</Text>
+              <Text style={main.topBarTitle}>#{activeChannel.name}</Text>
+            </View>
+
+            <View style={main.onlineIndicator}>
+              <View style={main.onlineDot} />
+              <Text style={main.onlineText}>Live</Text>
+            </View>
           </View>
 
           <ChatView channel={activeChannel} />
@@ -562,16 +720,33 @@ const main = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#313338" },
   body: { flex: 1, flexDirection: "row" },
 
-  sidebar: { width: 220, borderRightWidth: 1, borderRightColor: "#1E1F22" },
+  loadingRoot: {
+    flex: 1,
+    backgroundColor: "#313338",
+    justifyContent: "center",
+    alignItems: "center",
+    gap: 12,
+  },
+  loadingText: { color: "#8D9096", fontSize: 15 },
+  retryBtn: {
+    marginTop: 8,
+    paddingHorizontal: 24,
+    paddingVertical: 10,
+    backgroundColor: "#5865F2",
+    borderRadius: 20,
+  },
+  retryText: { color: "#fff", fontWeight: "700", fontSize: 14 },
 
+  sidebar: { width: 230, borderRightWidth: 1, borderRightColor: "#1E1F22" },
   chat: { flex: 1 },
+
   topBar: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
     paddingHorizontal: 12,
     paddingVertical: 10,
-    backgroundColor: "#313338",
+    backgroundColor: "#2B2D31",
     borderBottomWidth: 1,
     borderBottomColor: "#1E1F22",
   },
@@ -581,5 +756,27 @@ const main = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
   },
+  topBarCenter: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+  },
   topBarTitle: { color: "#FFFFFF", fontSize: 16, fontWeight: "700" },
+
+  onlineIndicator: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    width: 50,
+    justifyContent: "flex-end",
+  },
+  onlineDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: "#57F287",
+  },
+  onlineText: { color: "#57F287", fontSize: 11, fontWeight: "600" },
 });

@@ -9,6 +9,7 @@ const multer = require("multer");
 const { GridFsStorage } = require("multer-gridfs-storage");
 const admin = require("firebase-admin");
 const { init: initUserVideos } = require("./src/models/UserVideos");
+const { init: initDiscordChannels } = require("./src/models/DiscordChannels");
 /* =====================
    Firebase Admin SDK
    Credentials live in FIREBASE_ADMIN_KEY env var (JSON string).
@@ -242,6 +243,10 @@ app.get("/photos/:filename", async (req, res) => {
 ===================== */
 const videoRoutes = require("./src/routes/videoRoutes");
 app.use("/api/videos", videoRoutes);
+
+// After: app.use("/api/videos", videoRoutes);
+const discordRoutes = require("./src/routes/discordRoutes");
+app.use("/api/discord", discordRoutes);
 
 //implementing news cache routes
 // After the video routes line:
