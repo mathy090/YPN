@@ -2,55 +2,88 @@
 import { Ionicons } from "@expo/vector-icons";
 import { BlurView } from "expo-blur";
 import { Tabs } from "expo-router";
-import { StyleSheet, View } from "react-native";
+import { StyleSheet, Text, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-const TAB_ICONS: Record<string, { active: string; inactive: string }> = {
-  discord: { active: "chatbubbles", inactive: "chatbubbles-outline" },
-  foryou: { active: "play-circle", inactive: "play-circle-outline" },
-  news: { active: "newspaper", inactive: "newspaper-outline" },
-  settings: { active: "settings", inactive: "settings-outline" },
+type TabName = "discord" | "foryou" | "news" | "settings";
+
+const TAB_CONFIG: Record<
+  TabName,
+  { active: string; inactive: string; label: string }
+> = {
+  discord: {
+    active: "chatbubbles",
+    inactive: "chatbubbles-outline",
+    label: "Community",
+  },
+  foryou: {
+    active: "play-circle",
+    inactive: "play-circle-outline",
+    label: "For You",
+  },
+  news: { active: "newspaper", inactive: "newspaper-outline", label: "News" },
+  settings: {
+    active: "settings",
+    inactive: "settings-outline",
+    label: "Settings",
+  },
 };
 
+function TabBarBackground() {
+  return (
+    <BlurView tint="dark" intensity={95} style={StyleSheet.absoluteFill} />
+  );
+}
+
 export default function TabsLayout() {
+  const insets = useSafeAreaInsets();
+
+  // Height: icon + label + padding + safe area
+  const TAB_BAR_HEIGHT = 56 + insets.bottom;
+
   return (
     <Tabs
-      screenOptions={({ route }) => ({
-        headerShown: false,
-        tabBarShowLabel: false,
-        tabBarStyle: {
-          position: "absolute",
-          left: 20,
-          right: 20,
-          bottom: 16,
-          height: 68,
-          borderRadius: 34,
-          backgroundColor: "transparent",
-          borderTopWidth: 0,
-          elevation: 0,
-          shadowOpacity: 0,
-        },
-        tabBarBackground: () => (
-          <BlurView
-            tint="dark"
-            intensity={90}
-            style={[StyleSheet.absoluteFill, { borderRadius: 34 }]}
-          />
-        ),
-        tabBarIcon: ({ focused }) => {
-          const icons = TAB_ICONS[route.name];
-          if (!icons) return null;
-          return (
+      screenOptions={({ route }) => {
+        const name = route.name as TabName;
+        const config = TAB_CONFIG[name];
+
+        return {
+          headerShown: false,
+          tabBarShowLabel: false,
+          tabBarStyle: {
+            position: "absolute",
+            left: 0,
+            right: 0,
+            bottom: 0,
+            height: TAB_BAR_HEIGHT,
+            backgroundColor: "transparent",
+            borderTopWidth: StyleSheet.hairlineWidth,
+            borderTopColor: "rgba(255,255,255,0.12)",
+            elevation: 0,
+            shadowOpacity: 0,
+          },
+          tabBarBackground: TabBarBackground,
+          tabBarIcon: ({ focused }) => (
             <View style={styles.tabItem}>
-              {focused && <View style={styles.activeBg} />}
+              {focused && <View style={styles.activePill} />}
               <Ionicons
-                name={(focused ? icons.active : icons.inactive) as any}
-                size={24}
-                color={focused ? "#FFFFFF" : "#8E8E93"}
+                name={(focused ? config.active : config.inactive) as any}
+                size={22}
+                color={focused ? "#1DB954" : "#8E8E93"}
               />
+              <Text
+                style={[
+                  styles.tabLabel,
+                  { color: focused ? "#1DB954" : "#8E8E93" },
+                ]}
+                numberOfLines={1}
+              >
+                {config.label}
+              </Text>
             </View>
-          );
-        },
-      })}
+          ),
+        };
+      }}
     >
       <Tabs.Screen name="discord" />
       <Tabs.Screen name="foryou" />
@@ -64,15 +97,23 @@ const styles = StyleSheet.create({
   tabItem: {
     alignItems: "center",
     justifyContent: "center",
-    width: "100%",
-    height: "100%",
+    paddingTop: 6,
+    paddingBottom: 2,
+    gap: 3,
+    width: 72,
   },
-  activeBg: {
+  activePill: {
     position: "absolute",
-    width: 48,
-    height: 48,
-    borderRadius: 24,
+    top: -1,
+    width: 36,
+    height: 3,
+    borderRadius: 2,
     backgroundColor: "#1DB954",
-    opacity: 0.9,
+  },
+  tabLabel: {
+    fontSize: 10,
+    fontWeight: "600",
+    letterSpacing: 0.2,
+    textAlign: "center",
   },
 });

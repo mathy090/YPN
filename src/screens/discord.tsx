@@ -18,7 +18,7 @@ import {
   KeyboardAvoidingView,
   Platform,
   Pressable,
-  StatusBar as RNStatusBar,
+  StatusBar,
   StyleSheet,
   Text,
   TextInput,
@@ -38,20 +38,17 @@ const mmkv = () => {
 };
 const L1_KEY = (id: string) => `discord_l1_${id}`;
 const L2_KEY = (id: string) => `discord_l2_${id}`;
-const CACHE_TTL = 30 * 60 * 1000; // 30 min
 
 async function readCache(channelId: string): Promise<Message[] | null> {
-  // L1: MMKV (fast, in-memory)
   try {
     const raw = mmkv().getString(L1_KEY(channelId));
     if (raw) return JSON.parse(raw);
   } catch {}
-  // L2: AsyncStorage (persistent)
   try {
     const raw = await AsyncStorage.getItem(L2_KEY(channelId));
     if (raw) {
       const parsed = JSON.parse(raw);
-      mmkv().set(L1_KEY(channelId), raw); // promote to L1
+      mmkv().set(L1_KEY(channelId), raw);
       return parsed;
     }
   } catch {}
@@ -73,9 +70,10 @@ const AI_URL = process.env.EXPO_PUBLIC_AI_URL
   ? `${process.env.EXPO_PUBLIC_AI_URL}/chat`
   : "https://ypn-1.onrender.com/chat";
 
-// ── Types ──────────────────────────────────────────────────────
-type MessageType = "text";
+// Tab bar height estimate for padding
+const TAB_BAR_H = Platform.OS === "ios" ? 90 : 72;
 
+// ── Types ──────────────────────────────────────────────────────
 type Message = {
   id: string;
   text: string;
@@ -163,6 +161,10 @@ export default function DiscordScreen() {
   const listRef = useRef<FlatList>(null);
   const me = auth.currentUser;
 
+  // Status bar height for Android
+  const statusBarH =
+    Platform.OS === "android" ? (StatusBar.currentHeight ?? 24) : 0;
+
   const scrollToBottom = useCallback(() => {
     setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 80);
   }, []);
@@ -172,7 +174,6 @@ export default function DiscordScreen() {
     setLoading(true);
     setMessages([]);
 
-    // Restore from cache instantly
     readCache(activeChannel.id).then((cached) => {
       if (cached?.length) {
         setMessages(cached);
@@ -182,12 +183,10 @@ export default function DiscordScreen() {
     });
 
     if (activeChannel.isAI) {
-      // AI channel: load from local cache only (no Firestore)
       setLoading(false);
       return;
     }
 
-    // Firestore real-time listener for community channels
     const q = query(
       collection(db, "channels", activeChannel.id, "messages"),
       orderBy("createdAt", "asc"),
@@ -388,28 +387,25 @@ export default function DiscordScreen() {
             </Text>
             <View style={mS.meta}>
               <Text
-                style={[
-                  mS.time,
-                  isMe && !isAI && { color: "rgba(0,0,0,0.45)" },
-                ]}
+                style={[mS.time, isMe && !isAI && { color: "rgba(0,0,0,0.4)" }]}
               >
                 {time}
               </Text>
               {item.pending && (
-                <Ionicons name="time-outline" size={11} color="#8E8E93" />
+                <Ionicons name="time-outline" size={10} color="#8E8E93" />
               )}
               {item.failed && (
                 <Ionicons
                   name="alert-circle-outline"
-                  size={11}
+                  size={10}
                   color="#FF453A"
                 />
               )}
               {isMe && !item.pending && !item.failed && (
                 <Ionicons
                   name="checkmark-done"
-                  size={11}
-                  color={isMe && !isAI ? "rgba(0,0,0,0.45)" : "#8E8E93"}
+                  size={10}
+                  color={isMe && !isAI ? "rgba(0,0,0,0.4)" : "#8E8E93"}
                 />
               )}
             </View>
@@ -420,29 +416,46 @@ export default function DiscordScreen() {
     [me, activeChannel],
   );
 
-  const topPad =
-    insets.top +
-    (Platform.OS === "android" ? (RNStatusBar.currentHeight ?? 0) : 0);
+  // Input bar bottom offset accounts for tab bar + safe area
+  const inputBarBottom = TAB_BAR_H + insets.bottom - insets.bottom;
 
   return (
-    <View style={[dS.root, { paddingTop: topPad }]}>
-      {/* Header */}
+    <View style={dS.root}>
+      {/* Status bar spacer — pushes header flush to top on Android */}
+      {Platform.OS === "android" && (
+        <View style={{ height: statusBarH, backgroundColor: "#111" }} />
+      )}
+
+      {/* Safe area top on iOS */}
+      {Platform.OS === "ios" && (
+        <View style={{ height: insets.top, backgroundColor: "#111" }} />
+      )}
+
+      {/* Header — flush to top, no extra padding */}
       <View style={dS.header}>
         <TouchableOpacity
           onPress={() => setSidebarOpen((p) => !p)}
           style={dS.headerBtn}
-          hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+          hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
         >
           <Ionicons
             name={sidebarOpen ? "close" : "menu"}
-            size={22}
+            size={20}
             color="#fff"
           />
         </TouchableOpacity>
-        <Text style={{ fontSize: 18 }}>{activeChannel.emoji}</Text>
-        <Text style={dS.headerTitle}>
-          {activeChannel.isAI ? activeChannel.name : `#${activeChannel.name}`}
-        </Text>
+
+        <Text style={{ fontSize: 16 }}>{activeChannel.emoji}</Text>
+
+        <View style={dS.headerTitleWrap}>
+          <Text style={dS.headerTitle} numberOfLines={1}>
+            {activeChannel.isAI ? activeChannel.name : `#${activeChannel.name}`}
+          </Text>
+          <Text style={dS.headerSub} numberOfLines={1}>
+            {activeChannel.description}
+          </Text>
+        </View>
+
         {activeChannel.isAI && (
           <View
             style={[
@@ -453,53 +466,71 @@ export default function DiscordScreen() {
               },
             ]}
           >
+            <View
+              style={[dS.aiDot, { backgroundColor: activeChannel.color }]}
+            />
             <Text style={[dS.aiBadgeText, { color: activeChannel.color }]}>
-              AI
+              Online
             </Text>
           </View>
         )}
       </View>
 
+      {/* Body */}
       <View style={dS.body}>
-        {/* Sidebar */}
+        {/* Sidebar overlay */}
         {sidebarOpen && (
-          <View style={dS.sidebar}>
-            <Text style={dS.sidebarHeading}>YPN Community</Text>
+          <>
+            {/* Tap outside to close */}
+            <Pressable
+              style={dS.overlay}
+              onPress={() => setSidebarOpen(false)}
+            />
+            <View
+              style={[
+                dS.sidebar,
+                { paddingBottom: insets.bottom + TAB_BAR_H + 8 },
+              ]}
+            >
+              <Text style={dS.sidebarHeading}>YPN Community</Text>
 
-            {/* AI first */}
-            {CHANNELS.filter((c) => c.isAI).map((ch) => (
-              <ChannelItem
-                key={ch.id}
-                channel={ch}
-                isActive={activeChannel.id === ch.id}
-                onPress={() => {
-                  setActiveChannel(ch);
-                  setSidebarOpen(false);
-                }}
-              />
-            ))}
+              {/* AI channel first */}
+              {CHANNELS.filter((c) => c.isAI).map((ch) => (
+                <ChannelItem
+                  key={ch.id}
+                  channel={ch}
+                  isActive={activeChannel.id === ch.id}
+                  onPress={() => {
+                    setActiveChannel(ch);
+                    setSidebarOpen(false);
+                  }}
+                />
+              ))}
 
-            <Text style={dS.sectionLabel}>TEXT CHANNELS</Text>
+              <Text style={dS.sectionLabel}>TEXT CHANNELS</Text>
 
-            {CHANNELS.filter((c) => !c.isAI).map((ch) => (
-              <ChannelItem
-                key={ch.id}
-                channel={ch}
-                isActive={activeChannel.id === ch.id}
-                onPress={() => {
-                  setActiveChannel(ch);
-                  setSidebarOpen(false);
-                }}
-              />
-            ))}
-          </View>
+              {CHANNELS.filter((c) => !c.isAI).map((ch) => (
+                <ChannelItem
+                  key={ch.id}
+                  channel={ch}
+                  isActive={activeChannel.id === ch.id}
+                  onPress={() => {
+                    setActiveChannel(ch);
+                    setSidebarOpen(false);
+                  }}
+                />
+              ))}
+            </View>
+          </>
         )}
 
-        {/* Chat */}
+        {/* Chat area */}
         <KeyboardAvoidingView
           style={dS.chat}
           behavior={Platform.OS === "ios" ? "padding" : "height"}
-          keyboardVerticalOffset={topPad + 56}
+          keyboardVerticalOffset={
+            (Platform.OS === "ios" ? insets.top : statusBarH) + 52
+          }
         >
           {loading ? (
             <View style={dS.centre}>
@@ -511,15 +542,18 @@ export default function DiscordScreen() {
               data={messages}
               keyExtractor={(m) => m.id}
               renderItem={renderMessage}
-              contentContainerStyle={[dS.messageList, { paddingBottom: 100 }]}
+              contentContainerStyle={[
+                dS.messageList,
+                { paddingBottom: TAB_BAR_H + insets.bottom + 56 },
+              ]}
               showsVerticalScrollIndicator={false}
               onContentSizeChange={scrollToBottom}
               ListEmptyComponent={
                 <View style={dS.emptyContainer}>
-                  <Text style={{ fontSize: 48 }}>{activeChannel.emoji}</Text>
+                  <Text style={{ fontSize: 52 }}>{activeChannel.emoji}</Text>
                   <Text style={dS.emptyTitle}>
                     {activeChannel.isAI
-                      ? "Private Chat 🤖"
+                      ? "Start a conversation"
                       : `#${activeChannel.name}`}
                   </Text>
                   <Text style={dS.emptyDesc}>{activeChannel.description}</Text>
@@ -527,7 +561,7 @@ export default function DiscordScreen() {
               }
               ListFooterComponent={
                 aiTyping ? (
-                  <View style={mS.row}>
+                  <View style={[mS.row, { paddingHorizontal: 10 }]}>
                     <View
                       style={[
                         mS.avatar,
@@ -537,18 +571,10 @@ export default function DiscordScreen() {
                         },
                       ]}
                     >
-                      <Text>🤖</Text>
+                      <Text style={{ fontSize: 14 }}>🤖</Text>
                     </View>
                     <View style={mS.bubbleThem}>
-                      <Text
-                        style={{
-                          color: "#8E8E93",
-                          fontStyle: "italic",
-                          fontSize: 14,
-                        }}
-                      >
-                        typing…
-                      </Text>
+                      <Text style={dS.typingText}>typing…</Text>
                     </View>
                   </View>
                 ) : null
@@ -557,64 +583,76 @@ export default function DiscordScreen() {
           )}
 
           {/* Input bar */}
-          <View style={dS.inputBar}>
-            <TextInput
-              value={input}
-              onChangeText={setInput}
-              placeholder={
-                me
-                  ? `Message ${activeChannel.isAI ? "YPN AI" : `#${activeChannel.name}`}`
-                  : "Sign in to chat"
-              }
-              placeholderTextColor="#555"
-              style={dS.textInput}
-              multiline
-              maxLength={2000}
-              editable={!!me}
-              onSubmitEditing={handleSend}
-              blurOnSubmit={false}
-            />
-            <TouchableOpacity
-              onPress={handleSend}
-              disabled={!input.trim() || sending || !me}
-              style={[
-                dS.sendBtn,
-                {
-                  backgroundColor:
-                    !input.trim() || !me ? "#222" : activeChannel.color,
-                },
-              ]}
-              activeOpacity={0.8}
-            >
-              {sending ? (
-                <ActivityIndicator size="small" color="#fff" />
-              ) : (
+          <View
+            style={[
+              dS.inputBar,
+              { paddingBottom: TAB_BAR_H + insets.bottom - 48 },
+            ]}
+          >
+            {!me && (
+              <View style={dS.authBanner}>
                 <Ionicons
-                  name="send"
-                  size={18}
-                  color={
-                    activeChannel.color === "#FEE75C" && !!input.trim()
-                      ? "#000"
-                      : "#fff"
-                  }
+                  name="lock-closed-outline"
+                  size={11}
+                  color="#FFA500"
                 />
-              )}
-            </TouchableOpacity>
-          </View>
-
-          {!me && (
-            <View style={dS.authBanner}>
-              <Ionicons name="lock-closed-outline" size={12} color="#FFA500" />
-              <Text style={dS.authText}>Sign in to send messages</Text>
+                <Text style={dS.authText}>Sign in to send messages</Text>
+              </View>
+            )}
+            <View style={dS.inputRow}>
+              <TextInput
+                value={input}
+                onChangeText={setInput}
+                placeholder={
+                  me
+                    ? `Message ${
+                        activeChannel.isAI ? "YPN AI" : `#${activeChannel.name}`
+                      }`
+                    : "Sign in to chat"
+                }
+                placeholderTextColor="#555"
+                style={dS.textInput}
+                multiline
+                maxLength={2000}
+                editable={!!me}
+                onSubmitEditing={handleSend}
+                blurOnSubmit={false}
+              />
+              <TouchableOpacity
+                onPress={handleSend}
+                disabled={!input.trim() || sending || !me}
+                style={[
+                  dS.sendBtn,
+                  {
+                    backgroundColor:
+                      !input.trim() || !me ? "#222" : activeChannel.color,
+                  },
+                ]}
+                activeOpacity={0.8}
+              >
+                {sending ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <Ionicons
+                    name="send"
+                    size={17}
+                    color={
+                      activeChannel.color === "#FEE75C" && !!input.trim()
+                        ? "#000"
+                        : "#fff"
+                    }
+                  />
+                )}
+              </TouchableOpacity>
             </View>
-          )}
+          </View>
         </KeyboardAvoidingView>
       </View>
     </View>
   );
 }
 
-// ── ChannelItem ────────────────────────────────────────────────
+// ── ChannelItem component ─────────────────────────────────────
 function ChannelItem({
   channel,
   isActive,
@@ -628,7 +666,7 @@ function ChannelItem({
     <TouchableOpacity
       style={[
         sideS.item,
-        isActive && { backgroundColor: channel.color + "22" },
+        isActive && { backgroundColor: channel.color + "18" },
       ]}
       onPress={onPress}
       activeOpacity={0.7}
@@ -642,7 +680,7 @@ function ChannelItem({
           },
         ]}
       >
-        <Text style={{ fontSize: 16 }}>{channel.emoji}</Text>
+        <Text style={{ fontSize: 15 }}>{channel.emoji}</Text>
       </View>
       <View style={sideS.itemText}>
         <Text
@@ -650,6 +688,7 @@ function ChannelItem({
             sideS.chName,
             isActive && { color: channel.color, fontWeight: "700" },
           ]}
+          numberOfLines={1}
         >
           {channel.isAI ? channel.name : `#${channel.name}`}
         </Text>
@@ -658,7 +697,7 @@ function ChannelItem({
         </Text>
       </View>
       {isActive && (
-        <View style={[sideS.dot, { backgroundColor: channel.color }]} />
+        <View style={[sideS.activeDot, { backgroundColor: channel.color }]} />
       )}
     </TouchableOpacity>
   );
@@ -667,97 +706,148 @@ function ChannelItem({
 // ── Styles ─────────────────────────────────────────────────────
 const dS = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#0D0D0D" },
+
   header: {
     flexDirection: "row",
     alignItems: "center",
-    paddingHorizontal: 14,
-    paddingVertical: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
     backgroundColor: "#111",
-    borderBottomWidth: 1,
-    borderBottomColor: "#222",
-    gap: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: "#2A2A2A",
+    gap: 8,
+    minHeight: 52,
   },
   headerBtn: {
-    width: 36,
-    height: 36,
+    width: 32,
+    height: 32,
     justifyContent: "center",
     alignItems: "center",
-  },
-  headerTitle: { color: "#fff", fontSize: 16, fontWeight: "700", flex: 1 },
-  aiBadge: {
-    paddingHorizontal: 8,
-    paddingVertical: 3,
     borderRadius: 8,
-    borderWidth: 1,
+    backgroundColor: "rgba(255,255,255,0.06)",
   },
+  headerTitleWrap: { flex: 1 },
+  headerTitle: { color: "#fff", fontSize: 15, fontWeight: "700" },
+  headerSub: { color: "#555", fontSize: 11, marginTop: 1 },
+  aiBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 10,
+    borderWidth: 1,
+    gap: 5,
+  },
+  aiDot: { width: 6, height: 6, borderRadius: 3 },
   aiBadgeText: { fontSize: 11, fontWeight: "700" },
-  body: { flex: 1, flexDirection: "row" },
+
+  body: { flex: 1, position: "relative" },
+
+  overlay: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: "rgba(0,0,0,0.5)",
+    zIndex: 10,
+  },
   sidebar: {
-    width: 240,
+    position: "absolute",
+    top: 0,
+    left: 0,
+    bottom: 0,
+    width: 260,
     backgroundColor: "#111",
-    borderRightWidth: 1,
-    borderRightColor: "#222",
+    borderRightWidth: StyleSheet.hairlineWidth,
+    borderRightColor: "#2A2A2A",
     paddingTop: 12,
     paddingHorizontal: 8,
+    zIndex: 20,
   },
   sidebarHeading: {
     color: "#fff",
-    fontSize: 15,
+    fontSize: 14,
     fontWeight: "800",
     paddingHorizontal: 8,
     paddingBottom: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: "#222",
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: "#2A2A2A",
     marginBottom: 8,
+    letterSpacing: 0.3,
   },
   sectionLabel: {
-    color: "#555",
-    fontSize: 11,
+    color: "#444",
+    fontSize: 10,
     fontWeight: "700",
-    letterSpacing: 0.8,
+    letterSpacing: 1,
     paddingHorizontal: 8,
-    marginTop: 12,
+    marginTop: 14,
     marginBottom: 6,
+    textTransform: "uppercase",
   },
+
   chat: { flex: 1 },
-  messageList: { paddingVertical: 12, paddingHorizontal: 4 },
+  messageList: { paddingVertical: 8, paddingHorizontal: 4 },
   centre: {
     flex: 1,
     justifyContent: "center",
     alignItems: "center",
-    minHeight: 200,
+    minHeight: 300,
   },
-  emptyContainer: { alignItems: "center", padding: 32, gap: 10, marginTop: 60 },
-  emptyTitle: { color: "#fff", fontSize: 20, fontWeight: "700" },
-  emptyDesc: { color: "#8E8E93", fontSize: 14, textAlign: "center" },
+  emptyContainer: {
+    alignItems: "center",
+    padding: 32,
+    gap: 10,
+    marginTop: 60,
+  },
+  emptyTitle: {
+    color: "#fff",
+    fontSize: 18,
+    fontWeight: "700",
+    marginTop: 4,
+  },
+  emptyDesc: {
+    color: "#555",
+    fontSize: 13,
+    textAlign: "center",
+    lineHeight: 20,
+  },
+  typingText: {
+    color: "#555",
+    fontStyle: "italic",
+    fontSize: 13,
+  },
+
   inputBar: {
+    backgroundColor: "#111",
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: "#2A2A2A",
+    paddingTop: 8,
+    paddingHorizontal: 10,
+  },
+  inputRow: {
     flexDirection: "row",
     alignItems: "flex-end",
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    backgroundColor: "#111",
-    borderTopWidth: 1,
-    borderTopColor: "#222",
     gap: 8,
-    paddingBottom: 90, // clear tab bar
   },
   textInput: {
     flex: 1,
     backgroundColor: "#1A1A1A",
     borderRadius: 20,
     paddingHorizontal: 14,
-    paddingVertical: 10,
+    paddingVertical: 9,
     color: "#fff",
     fontSize: 15,
-    maxHeight: 120,
+    maxHeight: 100,
     lineHeight: 20,
-    borderWidth: 1,
+    borderWidth: StyleSheet.hairlineWidth,
     borderColor: "#2A2A2A",
   },
   sendBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+    width: 38,
+    height: 38,
+    borderRadius: 19,
     justifyContent: "center",
     alignItems: "center",
   },
@@ -765,11 +855,11 @@ const dS = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
-    gap: 6,
-    paddingVertical: 6,
-    backgroundColor: "#FFA50015",
+    gap: 5,
+    paddingVertical: 4,
+    marginBottom: 6,
   },
-  authText: { color: "#FFA500", fontSize: 12 },
+  authText: { color: "#FFA500", fontSize: 11 },
 });
 
 const sideS = StyleSheet.create({
@@ -777,62 +867,63 @@ const sideS = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: 8,
-    paddingVertical: 9,
+    paddingVertical: 8,
     borderRadius: 10,
-    marginBottom: 3,
+    marginBottom: 2,
     gap: 10,
   },
   icon: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
+    width: 32,
+    height: 32,
+    borderRadius: 16,
     borderWidth: 1.5,
     justifyContent: "center",
     alignItems: "center",
   },
   itemText: { flex: 1 },
-  chName: { color: "#8E8E93", fontSize: 14, fontWeight: "500" },
-  chDesc: { color: "#444", fontSize: 11, marginTop: 1 },
-  dot: { width: 7, height: 7, borderRadius: 4 },
+  chName: { color: "#8E8E93", fontSize: 13, fontWeight: "500" },
+  chDesc: { color: "#3A3A3A", fontSize: 11, marginTop: 1 },
+  activeDot: { width: 6, height: 6, borderRadius: 3 },
 });
 
 const mS = StyleSheet.create({
   row: {
     flexDirection: "row",
-    marginVertical: 3,
-    paddingHorizontal: 10,
+    marginVertical: 2,
+    paddingHorizontal: 8,
     alignItems: "flex-end",
   },
   rowMe: { flexDirection: "row-reverse" },
   avatar: {
-    width: 30,
-    height: 30,
-    borderRadius: 15,
+    width: 28,
+    height: 28,
+    borderRadius: 14,
     borderWidth: 1,
     justifyContent: "center",
     alignItems: "center",
     marginHorizontal: 6,
     marginBottom: 2,
+    flexShrink: 0,
   },
-  avatarText: { fontWeight: "700", fontSize: 12 },
+  avatarText: { fontWeight: "700", fontSize: 11 },
   bubble: {
     maxWidth: "78%",
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 18,
+    paddingHorizontal: 11,
+    paddingVertical: 7,
+    borderRadius: 16,
   },
   bubbleMe: { borderBottomRightRadius: 4 },
   bubbleThem: { backgroundColor: "#1A1A1A", borderBottomLeftRadius: 4 },
-  bubblePending: { opacity: 0.55 },
+  bubblePending: { opacity: 0.5 },
   bubbleFailed: { borderWidth: 1, borderColor: "#FF453A" },
-  senderName: { fontSize: 11, fontWeight: "700", marginBottom: 3 },
-  msgText: { color: "#E0E0E0", fontSize: 15, lineHeight: 21 },
+  senderName: { fontSize: 10, fontWeight: "700", marginBottom: 2 },
+  msgText: { color: "#E0E0E0", fontSize: 14, lineHeight: 20 },
   meta: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "flex-end",
-    marginTop: 4,
-    gap: 4,
+    marginTop: 3,
+    gap: 3,
   },
-  time: { color: "rgba(255,255,255,0.3)", fontSize: 10 },
+  time: { color: "rgba(255,255,255,0.25)", fontSize: 9 },
 });

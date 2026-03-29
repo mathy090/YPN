@@ -1,4 +1,4 @@
-// backend/server.js  — full file, replaces previous version
+// backend/server.js — updated to use newsRoutes with archive init
 "use strict";
 require("dotenv").config();
 
@@ -17,8 +17,11 @@ const { init: initUserVideos } = require("./src/models/UserVideos");
 const { init: initDiscordChannels } = require("./src/models/DiscordChannels");
 const videoRoutes = require("./src/routes/videoRoutes");
 const discordRoutes = require("./src/routes/discordRoutes");
-const newsRoutes = require("./src/routes/newsRoutes");
-const mediaRoutes = require("./src/routes/mediaRoutes"); // Google Drive proxy
+const {
+  router: newsRoutes,
+  initNewsArchive,
+} = require("./src/routes/newsRoutes");
+const mediaRoutes = require("./src/routes/mediaRoutes");
 
 // ── Firebase Admin ──────────────────────────────────────────────
 if (!process.env.FIREBASE_ADMIN_KEY) {
@@ -39,9 +42,6 @@ admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 // ── Express ─────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
-// Do NOT use express.json() globally — the /api/media/upload route
-// receives a raw binary body and must NOT be parsed as JSON.
-// JSON parsing is applied per-route via the json middleware below.
 const jsonBody = express.json();
 
 // ── Firebase token middleware ────────────────────────────────────
@@ -59,12 +59,10 @@ async function verifyFirebaseToken(req, res, next) {
   } catch (err) {
     console.error("Token verification failed:", err.code, err.message);
     if (err.code === "auth/id-token-expired") {
-      return res
-        .status(401)
-        .json({
-          message: "Token expired. Please sign in again.",
-          code: "TOKEN_EXPIRED",
-        });
+      return res.status(401).json({
+        message: "Token expired. Please sign in again.",
+        code: "TOKEN_EXPIRED",
+      });
     }
     return res
       .status(401)
@@ -74,13 +72,11 @@ async function verifyFirebaseToken(req, res, next) {
 
 // ── Health check ─────────────────────────────────────────────────
 app.get("/", (_req, res) =>
-  res
-    .status(200)
-    .json({
-      status: "ok",
-      service: "YPN Backend",
-      time: new Date().toISOString(),
-    }),
+  res.status(200).json({
+    status: "ok",
+    service: "YPN Backend",
+    time: new Date().toISOString(),
+  }),
 );
 app.head("/", (_req, res) => res.status(200).end());
 
@@ -94,9 +90,11 @@ async function connectDB() {
   await client.connect();
   db = client.db("ypn_users");
 
+  // Initialise all models
   initUserVideos(db);
   initDiscordChannels(db);
   initKeyStore(db);
+  initNewsArchive(db); // ← news archive for historical accumulation
 
   bucket = new GridFSBucket(db, { bucketName: "photos" });
   console.log("✅ Connected to MongoDB");
@@ -123,12 +121,10 @@ function registerRoutes() {
       try {
         const { uid, email, email_verified, name } = req.user;
         if (!email_verified) {
-          return res
-            .status(403)
-            .json({
-              message: "Please verify your email before signing in.",
-              code: "EMAIL_NOT_VERIFIED",
-            });
+          return res.status(403).json({
+            message: "Please verify your email before signing in.",
+            code: "EMAIL_NOT_VERIFIED",
+          });
         }
         const result = await db.collection("users").findOneAndUpdate(
           { uid },
@@ -188,21 +184,19 @@ function registerRoutes() {
   // ── GET /api/users/profile ─────────────────────────────────────
   app.get("/api/users/profile", verifyFirebaseToken, async (req, res) => {
     try {
-      const user = await db
-        .collection("users")
-        .findOne(
-          { uid: req.user.uid },
-          {
-            projection: {
-              _id: 0,
-              uid: 1,
-              email: 1,
-              name: 1,
-              photoPath: 1,
-              hasProfile: 1,
-            },
+      const user = await db.collection("users").findOne(
+        { uid: req.user.uid },
+        {
+          projection: {
+            _id: 0,
+            uid: 1,
+            email: 1,
+            name: 1,
+            photoPath: 1,
+            hasProfile: 1,
           },
-        );
+        },
+      );
       if (!user) return res.status(404).json({ message: "Profile not found" });
       res.json(user);
     } catch (e) {
@@ -227,13 +221,12 @@ function registerRoutes() {
   // ── Feature route groups ───────────────────────────────────────
   app.use("/api/videos", videoRoutes);
   app.use("/api/discord", discordRoutes);
-  app.use("/api/news", newsRoutes);
+  app.use("/api/news", newsRoutes); // now uses { router: newsRoutes }
 
   // E2E public key server
   app.use("/api/keys", verifyFirebaseToken, keyRoutes);
 
   // Google Drive encrypted media proxy
-  // NOTE: no jsonBody middleware here — upload endpoint reads raw binary
   app.use("/api/media", verifyFirebaseToken, mediaRoutes);
 
   // 404 catch-all

@@ -17,25 +17,32 @@ import {
 import { MMKV } from "react-native-mmkv";
 import { WebView } from "react-native-webview";
 
-// ─── MMKV device cache (L1) ───────────────────────────────────────────────────
+// ─── MMKV device cache ────────────────────────────────────────────────────────
 let _store: MMKV | null = null;
 const store = () => {
   if (!_store) _store = new MMKV({ id: "news-cache" });
   return _store;
 };
-const NEWS_KEY = "zw_news_v2";
-const NEWS_TS = "zw_news_ts_v2";
-const CACHE_TTL = 20 * 60 * 1000; // 20 minutes — matches backend
+const NEWS_KEY = "zw_news_v3";
+const NEWS_TS = "zw_news_ts_v3";
+const CACHE_TTL = 20 * 60 * 1000; // 20 minutes
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL;
 
-const SOURCES = [
+// ─── Source filter chips ──────────────────────────────────────────────────────
+// "All" + source names that map to article.source field
+const SOURCE_FILTERS = [
   { key: "all", name: "All", color: "#FFFFFF" },
-  { key: "herald", name: "Herald", color: "#C0392B" },
-  { key: "newsday", name: "NewsDay", color: "#2980B9" },
-  { key: "263chat", name: "263Chat", color: "#27AE60" },
-  { key: "zimlive", name: "ZimLive", color: "#8E44AD" },
-  { key: "chronicle", name: "Chronicle", color: "#E67E22" },
+  { key: "Zimbabwe News", name: "Zim News", color: "#1DB954" },
+  { key: "Empowerment", name: "Empowerment", color: "#57F287" },
+  { key: "Mental Health", name: "Mental Health", color: "#5865F2" },
+  { key: "Jobs & Economy", name: "Jobs", color: "#FEE75C" },
+  { key: "Education", name: "Education", color: "#EB459E" },
+  { key: "Herald", name: "Herald", color: "#C0392B" },
+  { key: "NewsDay", name: "NewsDay", color: "#2980B9" },
+  { key: "263Chat", name: "263Chat", color: "#27AE60" },
+  { key: "ZimLive", name: "ZimLive", color: "#8E44AD" },
+  { key: "Africa Youth", name: "Africa", color: "#FF7043" },
 ];
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -69,7 +76,7 @@ function writeCache(items: NewsItem[]) {
   } catch {}
 }
 
-// ─── Relative time ────────────────────────────────────────────────────────────
+// ─── Relative time — handles old articles too ────────────────────────────────
 function relativeTime(ts: number): string {
   const diff = Date.now() - ts;
   const m = Math.floor(diff / 60000);
@@ -77,7 +84,12 @@ function relativeTime(ts: number): string {
   if (m < 60) return `${m}m ago`;
   const h = Math.floor(m / 60);
   if (h < 24) return `${h}h ago`;
-  return `${Math.floor(h / 24)}d ago`;
+  const d = Math.floor(h / 24);
+  if (d < 7) return `${d}d ago`;
+  const w = Math.floor(d / 7);
+  if (w < 52) return `${w}w ago`;
+  const y = Math.floor(d / 365);
+  return `${y}y ago`;
 }
 
 // ─── In-app article reader ────────────────────────────────────────────────────
@@ -95,7 +107,6 @@ function ArticleReader({
   return (
     <Modal visible animationType="slide" onRequestClose={onClose}>
       <View style={r.root}>
-        {/* Header */}
         <View style={r.header}>
           <TouchableOpacity
             onPress={onClose}
@@ -108,8 +119,6 @@ function ArticleReader({
             {title}
           </Text>
         </View>
-
-        {/* WebView — loads article URL fully in-app */}
         <WebView
           source={{ uri: url }}
           style={{ flex: 1, backgroundColor: "#111" }}
@@ -117,11 +126,8 @@ function ArticleReader({
           onLoadEnd={() => setWebLoading(false)}
           javaScriptEnabled
           domStorageEnabled
-          startInLoadingState={false}
-          // Block popups / redirects to other apps
           setSupportMultipleWindows={false}
         />
-
         {webLoading && (
           <View style={r.loadingOverlay}>
             <ActivityIndicator size="large" color="#1DB954" />
@@ -132,19 +138,22 @@ function ArticleReader({
   );
 }
 
+const STATUS_H =
+  Platform.OS === "android" ? (RNStatusBar.currentHeight ?? 24) : 0;
+const TOP_OFFSET = STATUS_H + 48;
+
 const r = StyleSheet.create({
   root: {
     flex: 1,
     backgroundColor: "#000",
-    paddingTop:
-      Platform.OS === "android" ? (RNStatusBar.currentHeight ?? 24) : 44,
+    paddingTop: TOP_OFFSET,
   },
   header: {
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: 12,
     paddingVertical: 10,
-    borderBottomWidth: 1,
+    borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: "#222",
     backgroundColor: "#111",
     gap: 10,
@@ -157,12 +166,7 @@ const r = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
   },
-  headerTitle: {
-    flex: 1,
-    color: "#fff",
-    fontSize: 15,
-    fontWeight: "600",
-  },
+  headerTitle: { flex: 1, color: "#fff", fontSize: 15, fontWeight: "600" },
   loadingOverlay: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: "#000",
@@ -183,7 +187,7 @@ const NewsCard = React.memo(
     <TouchableOpacity
       style={s.card}
       onPress={() => onPress(item)}
-      activeOpacity={0.85}
+      activeOpacity={0.82}
     >
       {item.thumbnail ? (
         <Image
@@ -193,14 +197,17 @@ const NewsCard = React.memo(
         />
       ) : (
         <View style={[s.thumb, s.thumbPlaceholder]}>
-          <Ionicons name="newspaper-outline" size={28} color="#444" />
+          <Ionicons name="newspaper-outline" size={24} color="#333" />
         </View>
       )}
       <View style={s.cardBody}>
         <View style={s.meta}>
-          <View style={[s.badge, { backgroundColor: item.sourceColor + "22" }]}>
+          <View style={[s.badge, { backgroundColor: item.sourceColor + "1A" }]}>
             <View style={[s.badgeDot, { backgroundColor: item.sourceColor }]} />
-            <Text style={[s.badgeText, { color: item.sourceColor }]}>
+            <Text
+              style={[s.badgeText, { color: item.sourceColor }]}
+              numberOfLines={1}
+            >
               {item.source}
             </Text>
           </View>
@@ -215,8 +222,8 @@ const NewsCard = React.memo(
           </Text>
         ) : null}
         <View style={s.readRow}>
-          <Text style={s.readMore}>Read article</Text>
-          <Ionicons name="arrow-forward" size={13} color="#1DB954" />
+          <Text style={s.readMore}>Read more</Text>
+          <Ionicons name="arrow-forward" size={12} color="#1DB954" />
         </View>
       </View>
     </TouchableOpacity>
@@ -233,7 +240,7 @@ const FilterBar = ({
 }) => (
   <FlatList
     horizontal
-    data={SOURCES}
+    data={SOURCE_FILTERS}
     keyExtractor={(i) => i.key}
     showsHorizontalScrollIndicator={false}
     contentContainerStyle={s.filterRow}
@@ -245,7 +252,7 @@ const FilterBar = ({
           style={[
             s.filterChip,
             isActive && {
-              backgroundColor: item.color,
+              backgroundColor: item.color + "22",
               borderColor: item.color,
             },
           ]}
@@ -254,10 +261,7 @@ const FilterBar = ({
           <Text
             style={[
               s.filterText,
-              isActive && {
-                color: item.key === "all" ? "#000" : "#fff",
-                fontWeight: "700",
-              },
+              isActive && { color: item.color, fontWeight: "700" },
             ]}
           >
             {item.name}
@@ -269,10 +273,6 @@ const FilterBar = ({
 );
 
 // ─── Main screen ──────────────────────────────────────────────────────────────
-const STATUS_H =
-  Platform.OS === "android" ? (RNStatusBar.currentHeight ?? 24) : 0;
-const TOP_OFFSET = STATUS_H + 48;
-
 export default function NewsScreen() {
   const [articles, setArticles] = useState<NewsItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -281,7 +281,6 @@ export default function NewsScreen() {
   const [error, setError] = useState(false);
   const [reading, setReading] = useState<NewsItem | null>(null);
 
-  // Background refresh timer
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -291,19 +290,16 @@ export default function NewsScreen() {
     };
   }, []);
 
-  // Schedule next background refresh in 20 min
   const scheduleRefresh = () => {
     if (refreshTimer.current) clearTimeout(refreshTimer.current);
     refreshTimer.current = setTimeout(() => fetchFromBackend(false), CACHE_TTL);
   };
 
   const boot = async () => {
-    // Instant load from device cache
     const cached = readCache();
     if (cached && cached.length > 0) {
       setArticles(cached);
       setLoading(false);
-      // Background refresh if cache is older than 20 min
       const ts = store().getNumber(NEWS_TS) ?? 0;
       if (Date.now() - ts > CACHE_TTL) {
         fetchFromBackend(false);
@@ -338,12 +334,9 @@ export default function NewsScreen() {
     }
   };
 
+  // Filter by source name — "all" shows everything including historical
   const filtered =
-    filter === "all"
-      ? articles
-      : articles.filter(
-          (a) => a.source === SOURCES.find((src) => src.key === filter)?.name,
-        );
+    filter === "all" ? articles : articles.filter((a) => a.source === filter);
 
   const openArticle = useCallback((item: NewsItem) => setReading(item), []);
 
@@ -351,21 +344,30 @@ export default function NewsScreen() {
     return (
       <View style={s.centre}>
         <ActivityIndicator size="large" color="#1DB954" />
-        <Text style={s.loadingText}>Loading Zimbabwe news…</Text>
+        <Text style={s.loadingText}>Loading news…</Text>
       </View>
     );
   }
 
   return (
     <View style={s.root}>
-      {/* Spacer for floating community tab bar */}
       <View style={{ height: TOP_OFFSET }} />
 
       <FilterBar active={filter} onSelect={setFilter} />
 
+      {/* Article count indicator */}
+      {articles.length > 0 && (
+        <View style={s.countRow}>
+          <Text style={s.countText}>
+            {filtered.length} article{filtered.length !== 1 ? "s" : ""}
+            {filter !== "all" ? ` · ${filter}` : ""}
+          </Text>
+        </View>
+      )}
+
       {error && articles.length === 0 ? (
         <View style={s.centre}>
-          <Ionicons name="wifi-outline" size={48} color="#444" />
+          <Ionicons name="wifi-outline" size={48} color="#333" />
           <Text style={s.errorText}>Could not load news</Text>
           <TouchableOpacity
             style={s.retryBtn}
@@ -399,7 +401,6 @@ export default function NewsScreen() {
         />
       )}
 
-      {/* In-app article reader */}
       {reading && (
         <ArticleReader
           url={reading.link}
@@ -421,8 +422,8 @@ const s = StyleSheet.create({
     gap: 12,
     padding: 24,
   },
-  loadingText: { color: "#8E8E93", fontSize: 14, marginTop: 8 },
-  errorText: { color: "#8E8E93", fontSize: 16, textAlign: "center" },
+  loadingText: { color: "#555", fontSize: 14, marginTop: 8 },
+  errorText: { color: "#555", fontSize: 16, textAlign: "center" },
   retryBtn: {
     marginTop: 8,
     paddingHorizontal: 24,
@@ -432,54 +433,81 @@ const s = StyleSheet.create({
   },
   retryText: { color: "#000", fontWeight: "700", fontSize: 14 },
 
-  filterRow: { paddingHorizontal: 12, paddingVertical: 10, gap: 8 },
+  filterRow: { paddingHorizontal: 12, paddingVertical: 8, gap: 7 },
   filterChip: {
-    paddingHorizontal: 14,
-    paddingVertical: 6,
-    borderRadius: 16,
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+    borderRadius: 14,
     borderWidth: 1,
-    borderColor: "#333",
+    borderColor: "#2A2A2A",
     backgroundColor: "#111",
   },
-  filterText: { color: "#8E8E93", fontSize: 13, fontWeight: "500" },
+  filterText: { color: "#555", fontSize: 12, fontWeight: "500" },
+
+  countRow: {
+    paddingHorizontal: 16,
+    paddingBottom: 6,
+  },
+  countText: { color: "#3A3A3A", fontSize: 11 },
 
   list: { paddingHorizontal: 12, paddingBottom: 120 },
 
   card: {
     flexDirection: "row",
     backgroundColor: "#111",
-    borderRadius: 14,
-    marginBottom: 12,
+    borderRadius: 12,
+    marginBottom: 10,
     overflow: "hidden",
-    borderWidth: 1,
+    borderWidth: StyleSheet.hairlineWidth,
     borderColor: "#1E1E1E",
   },
-  thumb: { width: 100, height: 110 },
+  thumb: { width: 96, height: 106 },
   thumbPlaceholder: {
-    backgroundColor: "#1A1A1A",
+    backgroundColor: "#161616",
     justifyContent: "center",
     alignItems: "center",
   },
-  cardBody: { flex: 1, padding: 10, justifyContent: "space-between" },
+  cardBody: {
+    flex: 1,
+    padding: 10,
+    justifyContent: "space-between",
+  },
   meta: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    marginBottom: 4,
+    marginBottom: 5,
   },
   badge: {
     flexDirection: "row",
     alignItems: "center",
     gap: 4,
-    paddingHorizontal: 8,
+    paddingHorizontal: 7,
     paddingVertical: 3,
-    borderRadius: 10,
+    borderRadius: 8,
+    maxWidth: 120,
   },
-  badgeDot: { width: 6, height: 6, borderRadius: 3 },
-  badgeText: { fontSize: 11, fontWeight: "700" },
-  time: { color: "#555", fontSize: 11 },
-  title: { color: "#FFFFFF", fontSize: 14, fontWeight: "600", lineHeight: 20 },
-  desc: { color: "#8E8E93", fontSize: 12, lineHeight: 17, marginTop: 4 },
-  readRow: { flexDirection: "row", alignItems: "center", gap: 3, marginTop: 6 },
-  readMore: { color: "#1DB954", fontSize: 12, fontWeight: "600" },
+  badgeDot: { width: 5, height: 5, borderRadius: 3, flexShrink: 0 },
+  badgeText: { fontSize: 10, fontWeight: "700", flexShrink: 1 },
+  time: { color: "#3A3A3A", fontSize: 10 },
+  title: {
+    color: "#E8E8E8",
+    fontSize: 13,
+    fontWeight: "600",
+    lineHeight: 18,
+    flex: 1,
+  },
+  desc: {
+    color: "#555",
+    fontSize: 11,
+    lineHeight: 16,
+    marginTop: 4,
+  },
+  readRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 3,
+    marginTop: 6,
+  },
+  readMore: { color: "#1DB954", fontSize: 11, fontWeight: "600" },
 });
