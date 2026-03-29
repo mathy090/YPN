@@ -434,4 +434,3 @@ router.get("/cache/status", async (_req, res) => {
 });
 
 module.exports = { router, initNewsArchive };
-s;
