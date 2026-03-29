@@ -58,5 +58,5 @@ export default function Index() {
 
   if (!hasAgreed) return <Redirect href="/welcome" />;
   if (!isLoggedIn) return <Redirect href="/auth/otp" />;
-  return <Redirect href="/tabs/chats" />;
+  return <Redirect href="/splash" />;
 }
