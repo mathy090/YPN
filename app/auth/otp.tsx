@@ -69,7 +69,7 @@ export default function OTP() {
 
       // 4. Backend accepted — commit auth state and navigate
       await login();
-      router.replace(hasProfile ? "/tabs/chats" : "/auth/device");
+      router.replace(hasProfile ? "/tabs/discord" : "/auth/device");
     } catch (e: any) {
       if (
         e.code === "auth/network-request-failed" ||

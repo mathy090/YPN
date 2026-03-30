@@ -40,7 +40,7 @@ export default function SplashScreen() {
       <Animated.View style={[s.content, { opacity, transform: [{ scale }] }]}>
         <Image source={require("../assets/images/YPN.png")} style={s.logo} />
         <Text style={s.title}>YPN</Text>
-        <Text style={s.sub}>Youth Positive Network</Text>
+        <Text style={s.sub}>Youth People's Network</Text>
       </Animated.View>
     </View>
   );

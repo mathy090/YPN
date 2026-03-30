@@ -43,7 +43,7 @@ export default function Device() {
       if (!user) throw new Error("No authenticated user found.");
       await updateProfile(user, { displayName: trimmedName });
       await saveProfile(trimmedName);
-      router.replace("/tabs/chats");
+      router.replace("/tabs/discord");
     } catch (error: any) {
       console.error("Finish setup error:", error);
       Alert.alert("Error", error.message || "Could not sync. Try again later.");
