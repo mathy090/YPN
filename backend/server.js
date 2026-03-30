@@ -18,6 +18,11 @@ const { init: initDiscordChannels } = require("./src/models/DiscordChannels");
 const videoRoutes = require("./src/routes/videoRoutes");
 const discordRoutes = require("./src/routes/discordRoutes");
 const {
+  router: driveVideoRoutes,
+  initDriveVideos,
+} = require("./src/routes/driveVideoRoutes");
+
+const {
   router: newsRoutes,
   initNewsArchive,
 } = require("./src/routes/newsRoutes");

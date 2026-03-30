@@ -1,645 +1,596 @@
 // src/screens/foryou.tsx
+//
+// TikTok-style full-screen video feed served from Google Drive.
+//
+// FRONTEND CACHE (two layers):
+//   L1 — MMKV manifest JSON   — instant reads, persists across JS reloads
+//   L2 — expo-file-system     — first 5 videos downloaded for offline playback
+//
+// UX:
+//   • Full-screen vertical FlatList, pagingEnabled (TikTok scroll)
+//   • Tap anywhere on video → pause / resume
+//   • Scrubable progress bar at bottom
+//   • Auto-play on enter viewport, pause + rewind on exit
+//   • No likes, comments, or share UI
+//   • Green cloud badge when a video is cached locally
+
 import { Ionicons } from "@expo/vector-icons";
+import { Audio, AVPlaybackStatus, ResizeMode, Video } from "expo-av";
+import * as FileSystem from "expo-file-system";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Dimensions,
   FlatList,
-  Image,
+  GestureResponderEvent,
   Platform,
+  Pressable,
   StatusBar as RNStatusBar,
-  Share,
   StyleSheet,
   Text,
-  TouchableOpacity,
   View,
 } from "react-native";
 import { MMKV } from "react-native-mmkv";
-import { WebView } from "react-native-webview";
 import { auth } from "../firebase/auth";
 
-let _mmkv: MMKV | null = null;
-function getMMKV(): MMKV {
-  if (!_mmkv) _mmkv = new MMKV({ id: "foryou-cache" });
-  return _mmkv;
-}
-
-const MMKV_KEY = "foryou_feed_v1";
-const MMKV_TS_KEY = "foryou_feed_ts_v1";
-const MMKV_TTL = 60 * 60 * 1000;
-
+// ── Config ─────────────────────────────────────────────────────────────────────
+const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
+const PREFETCH_COUNT = 5;
+const L1_TTL_MS = 60 * 60 * 1000; // 1 hour
 const { width: W, height: H } = Dimensions.get("window");
-const BOTTOM_TAB_H = 86 + 16;
-const TOP_NAV_H =
-  48 + (Platform.OS === "android" ? (RNStatusBar.currentHeight ?? 24) : 44);
-const API_URL = process.env.EXPO_PUBLIC_API_URL;
+const STATUS_H =
+  Platform.OS === "android" ? (RNStatusBar.currentHeight ?? 24) : 0;
 
-function readCache(): VideoItem[] | null {
+// ── MMKV store (L1) ────────────────────────────────────────────────────────────
+let _store: MMKV | null = null;
+const store = () => {
+  if (!_store) _store = new MMKV({ id: "ypn-drive-feed-v2" });
+  return _store;
+};
+const MK_DATA = "manifest_v2";
+const MK_TS = "manifest_ts_v2";
+const MK_LP = (id: string) => `lp_${id}`;
+
+// ── Types ──────────────────────────────────────────────────────────────────────
+type DriveVideo = {
+  fileId: string;
+  name: string;
+  mimeType: string;
+  size: number | null;
+  thumbnail: string | null;
+};
+
+// ── L1 MMKV helpers ────────────────────────────────────────────────────────────
+function l1Read(): DriveVideo[] | null {
   try {
-    const store = getMMKV();
-    const ts = store.getNumber(MMKV_TS_KEY);
-    if (!ts || Date.now() - ts > MMKV_TTL) return null;
-    const raw = store.getString(MMKV_KEY);
-    return raw ? (JSON.parse(raw) as VideoItem[]) : null;
+    const ts = store().getNumber(MK_TS);
+    if (!ts || Date.now() - ts > L1_TTL_MS) return null;
+    const raw = store().getString(MK_DATA);
+    return raw ? (JSON.parse(raw) as DriveVideo[]) : null;
   } catch {
     return null;
   }
 }
 
-function writeCache(videos: VideoItem[]) {
+function l1Write(data: DriveVideo[]) {
   try {
-    const store = getMMKV();
-    store.set(MMKV_KEY, JSON.stringify(videos));
-    store.set(MMKV_TS_KEY, Date.now());
+    store().set(MK_DATA, JSON.stringify(data));
+    store().set(MK_TS, Date.now());
   } catch {}
 }
 
-type VideoItem = {
-  videoId: string;
-  title: string;
-  channelTitle: string;
-  thumbnail: string;
-  url: string;
-  viewCount: number | null;
-  likeCount: number | null;
-  commentCount: number | null;
-};
+// ── L2 local file helpers ──────────────────────────────────────────────────────
+const LOCAL_DIR = FileSystem.cacheDirectory + "ypn_drive_v2/";
 
-const FALLBACK: VideoItem[] = [
-  {
-    videoId: "X6-jQFdQHUY",
-    title: "Youth Empowerment — Find Your Purpose",
-    channelTitle: "YPN Zimbabwe",
-    thumbnail: "https://img.youtube.com/vi/X6-jQFdQHUY/hqdefault.jpg",
-    url: "https://www.youtube.com/watch?v=X6-jQFdQHUY",
-    viewCount: null,
-    likeCount: null,
-    commentCount: null,
-  },
-  {
-    videoId: "ugcSDR_Z0sA",
-    title: "Mental Health Tips for Young People",
-    channelTitle: "Mental Health Africa",
-    thumbnail: "https://img.youtube.com/vi/ugcSDR_Z0sA/hqdefault.jpg",
-    url: "https://www.youtube.com/watch?v=ugcSDR_Z0sA",
-    viewCount: null,
-    likeCount: null,
-    commentCount: null,
-  },
-  {
-    videoId: "ZmWBrN7QV6Y",
-    title: "How to Build Skills for the Future",
-    channelTitle: "Education Hub",
-    thumbnail: "https://img.youtube.com/vi/ZmWBrN7QV6Y/hqdefault.jpg",
-    url: "https://www.youtube.com/watch?v=ZmWBrN7QV6Y",
-    viewCount: null,
-    likeCount: null,
-    commentCount: null,
-  },
-];
-
-function fmt(n: number | null | undefined): string {
-  if (n == null) return "—";
-  if (n >= 1_000_000)
-    return (n / 1_000_000).toFixed(1).replace(/\.0$/, "") + "M";
-  if (n >= 1_000) return (n / 1_000).toFixed(1).replace(/\.0$/, "") + "K";
-  return n.toString();
+async function ensureDir() {
+  if (!(await FileSystem.getInfoAsync(LOCAL_DIR)).exists)
+    await FileSystem.makeDirectoryAsync(LOCAL_DIR, { intermediates: true });
 }
 
-async function fetchWithRetry(
-  url: string,
-  options: RequestInit,
-  retries = 3,
-  delayMs = 3000,
-): Promise<Response> {
-  let lastErr: unknown;
-  for (let i = 0; i < retries; i++) {
-    try {
-      const res = await fetch(url, options);
-      if (res.status === 503 && i < retries - 1) {
-        await new Promise((r) => setTimeout(r, delayMs));
-        continue;
-      }
-      return res;
-    } catch (e) {
-      lastErr = e;
-      if (i < retries - 1) await new Promise((r) => setTimeout(r, delayMs));
-    }
+const filePath = (id: string) => LOCAL_DIR + id + ".mp4";
+
+function readLP(id: string): string | null {
+  return store().getString(MK_LP(id)) ?? null;
+}
+
+function saveLP(id: string, path: string) {
+  store().set(MK_LP(id), path);
+}
+
+async function isFileCached(id: string): Promise<boolean> {
+  const p = readLP(id);
+  if (!p) return false;
+  return (await FileSystem.getInfoAsync(p)).exists;
+}
+
+// ── Auth helpers ───────────────────────────────────────────────────────────────
+async function getHeaders(): Promise<Record<string, string>> {
+  try {
+    const t = await auth.currentUser?.getIdToken();
+    return t ? { Authorization: `Bearer ${t}` } : {};
+  } catch {
+    return {};
   }
-  throw lastErr;
 }
 
-// FIX 1: closing backtick was escaped as \` — now it's a plain `
-const buildEmbedHtml = (videoId: string) => {
-  const isAndroid = Platform.OS === "android";
-  const autoplayParam = isAndroid ? "0" : "1";
+const streamUrl = (id: string) => `${API_URL}/api/videos/drive/stream/${id}`;
 
-  return `<!DOCTYPE html>
-<html>
-  <head>
-    <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-    <style>
-      *{margin:0;padding:0;background:#000;box-sizing:border-box}
-      html,body{width:100%;height:100%;overflow:hidden}
-      iframe{width:100%;height:100%;border:none;display:block}
-    </style>
-  </head>
-  <body>
-    <iframe
-      id="player"
-      src="https://www.youtube.com/embed/${videoId}?autoplay=${autoplayParam}&playsinline=1&rel=0&modestbranding=1&enablejsapi=1&origin=https://ypn.app"
-      allow="accelerometer;autoplay;clipboard-write;encrypted-media;gyroscope;picture-in-picture;fullscreen"
-      allowfullscreen
-    ></iframe>
-    <script>
-      var player = document.getElementById('player');
-      var played = false;
-      function tryPlay() {
-        if (played) return;
-        played = true;
-        player.contentWindow.postMessage(
-          JSON.stringify({ event: 'command', func: 'playVideo', args: [] }), '*'
-        );
-      }
-      setTimeout(tryPlay, 800);
-      document.addEventListener('touchend', tryPlay, { once: true });
-      window.addEventListener('message', function(e) {
-        try {
-          var data = JSON.parse(e.data);
-          if (data.event === 'infoDelivery' && data.info) {
-            var err = data.info.error;
-            if (err) {
-              window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'YT_ERROR', code: err }));
-            }
-          }
-          if (data.event === 'onError') {
-            window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'YT_ERROR', code: data.info }));
-          }
-        } catch(_) {}
+// ── Prefetch first N videos ────────────────────────────────────────────────────
+async function prefetch(videos: DriveVideo[]) {
+  await ensureDir();
+  for (const v of videos.slice(0, PREFETCH_COUNT)) {
+    try {
+      if (await isFileCached(v.fileId)) continue;
+      const dest = filePath(v.fileId);
+      const h = await getHeaders();
+      const dl = await FileSystem.downloadAsync(streamUrl(v.fileId), dest, {
+        headers: h,
       });
-    </script>
-  </body>
-</html>`;
+      if (dl.status === 200) saveLP(v.fileId, dest);
+    } catch {}
+  }
+}
+
+// ── Time formatter ─────────────────────────────────────────────────────────────
+const fmt = (ms: number) => {
+  const s = Math.floor(ms / 1000);
+  return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, "0")}`;
 };
 
+// ── ProgressBar ────────────────────────────────────────────────────────────────
+const ProgressBar = React.memo(
+  ({
+    pos,
+    dur,
+    onSeek,
+  }: {
+    pos: number;
+    dur: number;
+    onSeek: (ms: number) => void;
+  }) => {
+    const barRef = useRef<View>(null);
+    const ratio = dur > 0 ? Math.min(pos / dur, 1) : 0;
+
+    function handlePress(e: GestureResponderEvent) {
+      if (!barRef.current) return;
+      (barRef.current as any).measure(
+        (_x: number, _y: number, width: number) => {
+          const r = Math.min(Math.max(e.nativeEvent.locationX / width, 0), 1);
+          onSeek(r * dur);
+        },
+      );
+    }
+
+    return (
+      <Pressable
+        ref={barRef as any}
+        onPress={handlePress}
+        hitSlop={{ top: 18, bottom: 18 }}
+        style={pb.track}
+      >
+        <View style={[pb.fill, { width: `${ratio * 100}%` }]} />
+        <View style={[pb.thumb, { left: `${ratio * 100}%` as any }]} />
+      </Pressable>
+    );
+  },
+);
+
+const pb = StyleSheet.create({
+  track: {
+    height: 3,
+    backgroundColor: "rgba(255,255,255,0.22)",
+    borderRadius: 2,
+    justifyContent: "center",
+  },
+  fill: { height: 3, backgroundColor: "#1DB954", borderRadius: 2 },
+  thumb: {
+    position: "absolute",
+    width: 13,
+    height: 13,
+    borderRadius: 6.5,
+    backgroundColor: "#fff",
+    top: -5,
+    marginLeft: -6.5,
+  },
+});
+
+// ── VideoCard ─────────────────────────────────────────────────────────────────
 const VideoCard = React.memo(
   ({
     item,
     isActive,
-    onWatched,
-    onSkip,
+    headers,
   }: {
-    item: VideoItem;
+    item: DriveVideo;
     isActive: boolean;
-    onWatched: (id: string) => void;
-    onSkip: (videoId: string) => void;
+    headers: Record<string, string>;
   }) => {
-    const [liked, setLiked] = useState(false);
-    const [playing, setPlaying] = useState(false);
-    const webViewRef = useRef<any>(null);
+    const ref = useRef<Video>(null);
+    const [paused, setPaused] = useState(false);
+    const [loading, setLoading] = useState(true);
+    const [hasError, setHasError] = useState(false);
+    const [pos, setPos] = useState(0);
+    const [dur, setDur] = useState(0);
+    const [localPath, setLocalPath] = useState<string | null>(null);
 
+    // Resolve local cache once
     useEffect(() => {
+      isFileCached(item.fileId).then((ok) => {
+        if (ok) setLocalPath(readLP(item.fileId));
+      });
+    }, [item.fileId]);
+
+    // Auto-play / pause based on visibility
+    useEffect(() => {
+      if (!ref.current) return;
       if (isActive) {
-        setPlaying(true);
-        onWatched(item.videoId);
+        setPaused(false);
+        ref.current.playAsync().catch(() => {});
       } else {
-        setPlaying(false);
+        setPaused(true);
+        ref.current.pauseAsync().catch(() => {});
+        ref.current.setPositionAsync(0).catch(() => {});
+        setPos(0);
       }
     }, [isActive]);
 
-    const handleShare = useCallback(async () => {
-      try {
-        await Share.share({ message: `${item.title}\n${item.url}` });
-      } catch {}
-    }, [item]);
+    const togglePlay = useCallback(() => {
+      if (!ref.current) return;
+      if (paused) {
+        ref.current.playAsync().catch(() => {});
+        setPaused(false);
+      } else {
+        ref.current.pauseAsync().catch(() => {});
+        setPaused(true);
+      }
+    }, [paused]);
+
+    const onStatus = useCallback((status: AVPlaybackStatus) => {
+      if (!status.isLoaded) return;
+      setLoading(false);
+      setPos(status.positionMillis ?? 0);
+      setDur(status.durationMillis ?? 0);
+    }, []);
+
+    const onSeek = useCallback((ms: number) => {
+      ref.current?.setPositionAsync(ms).catch(() => {});
+      setPos(ms);
+    }, []);
+
+    const source = localPath
+      ? { uri: localPath }
+      : { uri: streamUrl(item.fileId), headers };
+
+    const displayName = item.name.replace(/\.[^.]+$/, "");
 
     return (
       <View style={s.card}>
-        {playing ? (
-          <WebView
-            ref={webViewRef}
-            source={{ html: buildEmbedHtml(item.videoId) }}
-            style={StyleSheet.absoluteFill}
-            allowsInlineMediaPlayback
-            mediaPlaybackRequiresUserAction={false}
-            allowsFullscreenVideo
-            javaScriptEnabled
-            domStorageEnabled
-            originWhitelist={["*"]}
-            mixedContentMode="always"
-            onMessage={(e) => {
-              try {
-                const msg = JSON.parse(e.nativeEvent.data);
-                if (msg.type === "YT_ERROR") {
-                  const skipCodes = [2, 5, 100, 101, 150, 153];
-                  if (skipCodes.includes(msg.code)) {
-                    // FIX 2: removed escaped backticks \` → plain template literal
-                    console.warn(
-                      `[Player] Error ${msg.code} on ${item.videoId} — skipping`,
-                    );
-                    onSkip(item.videoId);
-                  }
-                }
-              } catch (_) {}
-            }}
-          />
-        ) : (
-          <TouchableOpacity
-            activeOpacity={0.95}
-            style={StyleSheet.absoluteFill}
-            onPress={() => {
-              setPlaying(true);
-              onWatched(item.videoId);
-            }}
-          >
-            <Image
-              source={{ uri: item.thumbnail }}
-              style={StyleSheet.absoluteFill}
-              resizeMode="cover"
-            />
-            <View style={s.scrimTop} />
-            <View style={s.scrimBottom} />
-            <View style={s.playWrap} pointerEvents="none">
-              <View style={s.playCircle}>
-                <Ionicons name="play" size={32} color="#fff" />
-              </View>
-            </View>
-          </TouchableOpacity>
-        )}
+        {/* Video */}
+        <Video
+          ref={ref}
+          source={source}
+          style={StyleSheet.absoluteFill}
+          resizeMode={ResizeMode.COVER}
+          shouldPlay={isActive && !paused}
+          isLooping
+          isMuted={false}
+          onPlaybackStatusUpdate={onStatus}
+          onError={() => {
+            setLoading(false);
+            setHasError(true);
+          }}
+          useNativeControls={false}
+        />
 
-        {playing && (
-          <>
-            <View style={s.scrimTop} pointerEvents="none" />
-            <View style={s.scrimBottom} pointerEvents="none" />
-          </>
-        )}
+        {/* Tap-to-pause — covers full screen above HUD */}
+        <Pressable style={s.tapZone} onPress={togglePlay} />
 
-        <View style={s.actions} pointerEvents="box-none">
-          <TouchableOpacity
-            onPress={() => setLiked((p) => !p)}
-            style={s.actionBtn}
-            activeOpacity={0.7}
-          >
-            <Ionicons
-              name={liked ? "heart" : "heart-outline"}
-              size={32}
-              color={liked ? "#FF3B57" : "#fff"}
-            />
-            <Text style={s.actionLabel}>
-              {fmt(liked ? (item.likeCount ?? 0) + 1 : item.likeCount)}
-            </Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            onPress={handleShare}
-            style={s.actionBtn}
-            activeOpacity={0.7}
-          >
-            <Ionicons name="share-social-outline" size={29} color="#fff" />
-            <Text style={s.actionLabel}>Share</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity style={s.actionBtn} activeOpacity={0.7}>
-            <Ionicons name="chatbubble-outline" size={29} color="#fff" />
-            <Text style={s.actionLabel}>{fmt(item.commentCount)}</Text>
-          </TouchableOpacity>
-        </View>
-
-        <View style={s.info} pointerEvents="none">
-          <View style={s.channelRow}>
-            <View style={s.channelDot} />
-            <Text style={s.channelText} numberOfLines={1}>
-              {item.channelTitle}
-            </Text>
+        {/* Buffering spinner */}
+        {loading && !hasError && (
+          <View style={s.centre} pointerEvents="none">
+            <ActivityIndicator size="large" color="#1DB954" />
           </View>
-          <Text style={s.titleText} numberOfLines={2}>
-            {item.title}
+        )}
+
+        {/* Error */}
+        {hasError && (
+          <View style={s.centre} pointerEvents="none">
+            <Ionicons name="alert-circle-outline" size={52} color="#FF453A" />
+            <Text style={s.errorLabel}>Could not load video</Text>
+          </View>
+        )}
+
+        {/* Pause icon */}
+        {paused && !loading && !hasError && (
+          <View style={s.pauseWrap} pointerEvents="none">
+            <View style={s.pauseCircle}>
+              <Ionicons name="pause" size={38} color="#fff" />
+            </View>
+          </View>
+        )}
+
+        {/* Bottom scrim + HUD */}
+        <View style={s.scrim} pointerEvents="none" />
+        <View style={s.hud} pointerEvents="box-none">
+          <Text style={s.title} numberOfLines={2}>
+            {displayName}
           </Text>
-          <View style={s.statsRow}>
-            <View style={s.statPill}>
-              <Ionicons name="eye-outline" size={13} color="#fff" />
-              <Text style={s.statText}>{fmt(item.viewCount)}</Text>
-            </View>
-            <View style={s.statPill}>
-              <Ionicons name="heart-outline" size={13} color="#FF3B57" />
-              <Text style={[s.statText, { color: "#FF3B57" }]}>
-                {fmt(item.likeCount)}
-              </Text>
-            </View>
+
+          <View style={s.timeRow} pointerEvents="none">
+            <Text style={s.timeText}>{fmt(pos)}</Text>
+            {dur > 0 && <Text style={s.timeText}>{fmt(dur)}</Text>}
           </View>
+
+          {/* Progress bar */}
+          <ProgressBar pos={pos} dur={dur} onSeek={onSeek} />
         </View>
+
+        {/* Offline badge */}
+        {localPath != null && (
+          <View style={s.badge} pointerEvents="none">
+            <Ionicons name="cloud-done-outline" size={12} color="#1DB954" />
+          </View>
+        )}
       </View>
     );
   },
 );
 
+// ── Main screen ────────────────────────────────────────────────────────────────
 export default function ForYouScreen() {
-  const [videos, setVideos] = useState<VideoItem[]>([]);
+  const [videos, setVideos] = useState<DriveVideo[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [cacheSource, setCacheSource] = useState<
-    "live" | "device" | "saved" | null
-  >(null);
-  const [activeIndex, setActiveIndex] = useState(0);
-
+  const [fetchErr, setFetchErr] = useState(false);
+  const [activeIdx, setActiveIdx] = useState(0);
+  const [headers, setHeaders] = useState<Record<string, string>>({});
   const flatRef = useRef<FlatList>(null);
 
+  // Init audio mode + auth headers once
   useEffect(() => {
-    bootFeed();
+    Audio.setAudioModeAsync({
+      playsInSilentModeIOS: true,
+      staysActiveInBackground: false,
+    }).catch(() => {});
+    getHeaders().then(setHeaders);
   }, []);
 
-  const bootFeed = async () => {
-    const cached = readCache();
+  useEffect(() => {
+    boot();
+  }, []);
+
+  async function boot() {
+    const cached = l1Read();
     if (cached && cached.length > 0) {
       setVideos(cached);
-      setCacheSource("device");
       setLoading(false);
-      const ts = getMMKV().getNumber(MMKV_TS_KEY) ?? 0;
-      if (Date.now() - ts > 30 * 60 * 1000) backgroundRefresh();
-    } else {
-      await fetchFeed(false);
+      // Background refresh
+      getHeaders().then((h) =>
+        fetch(`${API_URL}/api/videos/drive/feed`, { headers: h })
+          .then((r) => r.json())
+          .then((d: DriveVideo[]) => {
+            if (d.length) {
+              l1Write(d);
+              setVideos(d);
+              prefetch(d);
+            }
+          })
+          .catch(() => {}),
+      );
+      prefetch(cached);
+      return;
     }
-  };
+    await fetchManifest(false);
+  }
 
-  const backgroundRefresh = async () => {
+  async function fetchManifest(manual: boolean) {
+    if (manual) setRefreshing(true);
+    else if (!videos.length) setLoading(true);
+    setFetchErr(false);
     try {
-      const data = await fetchFromBackend();
-      if (data.length > 0) {
-        writeCache(data);
-        setVideos(data);
-        setCacheSource("live");
-      }
-    } catch {}
-  };
-
-  const fetchFeed = async (isManual = true) => {
-    if (isManual) setRefreshing(true);
-    else setLoading(true);
-    try {
-      const data = await fetchFromBackend();
-      if (data.length > 0) {
-        writeCache(data);
-        setVideos(data);
-        setCacheSource("live");
-      } else {
-        fallback();
-      }
+      const h = await getHeaders();
+      setHeaders(h);
+      const res = await fetch(`${API_URL}/api/videos/drive/feed`, {
+        headers: h,
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data: DriveVideo[] = await res.json();
+      if (!data.length) throw new Error("Empty manifest");
+      l1Write(data);
+      setVideos(data);
+      prefetch(data);
     } catch {
-      const cached = readCache();
-      if (cached && cached.length > 0) {
-        setVideos(cached);
-        setCacheSource("device");
-      } else {
-        fallback();
-      }
+      const fallback = l1Read();
+      fallback?.length ? setVideos(fallback) : setFetchErr(true);
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  };
+  }
 
-  const fallback = () => {
-    setVideos(FALLBACK);
-    setCacheSource("saved");
-  };
-
-  const fetchFromBackend = async (): Promise<VideoItem[]> => {
-    const uid = auth?.currentUser?.uid ?? "anonymous";
-    const res = await fetchWithRetry(
-      `${API_URL}/api/videos/foryou`,
-      { headers: { "x-user-uid": uid } },
-      3,
-      3000,
-    );
-    if (!res.ok) throw new Error(`status ${res.status}`);
-    return res.json();
-  };
-
-  const skipVideo = useCallback((videoId: string) => {
-    setVideos((prev) => prev.filter((v) => v.videoId !== videoId));
-  }, []);
-
-  const markWatched = useCallback(async (videoId: string) => {
-    try {
-      const uid = auth?.currentUser?.uid;
-      if (!uid) return;
-      await fetch(`${API_URL}/api/videos/watched`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-user-uid": uid },
-        body: JSON.stringify({ videoId }),
-      });
-    } catch {}
-  }, []);
-
-  const onViewableItemsChanged = useCallback(
+  const onViewable = useCallback(
     ({ viewableItems }: { viewableItems: any[] }) => {
-      if (viewableItems.length > 0) {
-        setActiveIndex(viewableItems[0].index ?? 0);
-      }
+      if (viewableItems.length > 0) setActiveIdx(viewableItems[0].index ?? 0);
     },
     [],
   );
 
-  const viewabilityConfig = useRef({ itemVisiblePercentThreshold: 80 });
+  const viewCfg = useRef({
+    itemVisiblePercentThreshold: 70,
+    minimumViewTime: 80,
+  });
+
+  const renderItem = useCallback(
+    ({ item, index }: { item: DriveVideo; index: number }) => (
+      <VideoCard item={item} isActive={index === activeIdx} headers={headers} />
+    ),
+    [activeIdx, headers],
+  );
 
   if (loading) {
     return (
-      <View style={s.centre}>
+      <View style={s.fullCentre}>
         <ActivityIndicator size="large" color="#1DB954" />
-        <Text style={s.loadingText}>Loading your feed…</Text>
+        <Text style={s.loadingText}>Loading videos…</Text>
       </View>
     );
   }
 
-  const bannerConfig = {
-    live: null,
-    device: {
-      icon: "flash-outline",
-      color: "#1DB954",
-      text: "Feed loaded from device",
-    },
-    saved: {
-      icon: "bookmark-outline",
-      color: "#FFD60A",
-      text: "Showing saved videos — pull to refresh",
-    },
-  } as const;
-  const banner =
-    cacheSource && cacheSource !== "live" ? bannerConfig[cacheSource] : null;
+  if (fetchErr && !videos.length) {
+    return (
+      <View style={s.fullCentre}>
+        <Ionicons name="wifi-outline" size={52} color="#333" />
+        <Text style={s.noVideoText}>No videos available</Text>
+        <Pressable style={s.retryBtn} onPress={() => fetchManifest(false)}>
+          <Text style={s.retryText}>Retry</Text>
+        </Pressable>
+      </View>
+    );
+  }
 
   return (
     <View style={s.root}>
-      {banner && (
-        <View
-          style={[
-            s.banner,
-            {
-              top: TOP_NAV_H + 4,
-              backgroundColor: `${banner.color}18`,
-              borderBottomColor: `${banner.color}33`,
-            },
-          ]}
-          pointerEvents="none"
-        >
-          <Ionicons name={banner.icon as any} size={13} color={banner.color} />
-          <Text style={[s.bannerText, { color: banner.color }]}>
-            {banner.text}
-          </Text>
-        </View>
-      )}
-
       <FlatList
         ref={flatRef}
         data={videos}
-        keyExtractor={(v) => v.videoId}
-        renderItem={({ item, index }) => (
-          <VideoCard
-            item={item}
-            isActive={index === activeIndex}
-            onWatched={markWatched}
-            onSkip={skipVideo}
-          />
-        )}
+        keyExtractor={(v) => v.fileId}
+        renderItem={renderItem}
         pagingEnabled
         snapToInterval={H}
         snapToAlignment="start"
         decelerationRate="fast"
         showsVerticalScrollIndicator={false}
-        onRefresh={() => fetchFeed(true)}
+        onRefresh={() => fetchManifest(true)}
         refreshing={refreshing}
-        onViewableItemsChanged={onViewableItemsChanged}
-        viewabilityConfig={viewabilityConfig.current}
+        onViewableItemsChanged={onViewable}
+        viewabilityConfig={viewCfg.current}
         windowSize={3}
         maxToRenderPerBatch={2}
-        initialNumToRender={2}
+        initialNumToRender={1}
+        removeClippedSubviews
+        getItemLayout={(_, i) => ({ length: H, offset: H * i, index: i })}
       />
     </View>
   );
 }
 
+// ── Styles ─────────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#000" },
-  centre: {
-    flex: 1,
-    justifyContent: "center",
-    alignItems: "center",
-    backgroundColor: "#000",
-    gap: 12,
-  },
-  loadingText: { color: "#8E8E93", fontSize: 14 },
+
   card: {
     width: W,
     height: H,
-    backgroundColor: "#111",
+    backgroundColor: "#0a0a0a",
     overflow: "hidden",
   },
-  scrimTop: {
+
+  // Tap zone — sits above the video, below the HUD
+  tapZone: {
     position: "absolute",
     top: 0,
     left: 0,
     right: 0,
-    height: H * 0.25,
-    backgroundColor: "rgba(0,0,0,0.35)",
+    bottom: 88, // height of HUD
   },
-  scrimBottom: {
-    position: "absolute",
-    bottom: 0,
-    left: 0,
-    right: 0,
-    height: H * 0.5,
-    backgroundColor: "rgba(0,0,0,0.55)",
+
+  centre: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: "rgba(0,0,0,0.4)",
   },
-  playWrap: {
+
+  fullCentre: {
+    flex: 1,
+    backgroundColor: "#000",
+    justifyContent: "center",
+    alignItems: "center",
+    gap: 14,
+  },
+
+  loadingText: { color: "#555", fontSize: 14 },
+  noVideoText: { color: "#888", fontSize: 16, textAlign: "center" },
+  errorLabel: { color: "#FF453A", fontSize: 14, marginTop: 8 },
+
+  retryBtn: {
+    backgroundColor: "#1DB954",
+    paddingHorizontal: 28,
+    paddingVertical: 12,
+    borderRadius: 24,
+    marginTop: 4,
+  },
+  retryText: { color: "#000", fontWeight: "700", fontSize: 14 },
+
+  pauseWrap: {
     ...StyleSheet.absoluteFillObject,
     justifyContent: "center",
     alignItems: "center",
   },
-  playCircle: {
-    width: 74,
-    height: 74,
-    borderRadius: 37,
-    backgroundColor: "rgba(0,0,0,0.5)",
+  pauseCircle: {
+    width: 84,
+    height: 84,
+    borderRadius: 42,
+    backgroundColor: "rgba(0,0,0,0.55)",
     borderWidth: 2,
-    borderColor: "rgba(255,255,255,0.6)",
+    borderColor: "rgba(255,255,255,0.3)",
     justifyContent: "center",
     alignItems: "center",
-    paddingLeft: 4,
   },
-  actions: {
+
+  // Dark gradient-like scrim behind HUD
+  scrim: {
     position: "absolute",
-    right: 12,
-    bottom: BOTTOM_TAB_H + 80,
-    alignItems: "center",
-    gap: 22,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    height: 160,
+    backgroundColor: "rgba(0,0,0,0.55)",
   },
-  actionBtn: { alignItems: "center", gap: 3 },
-  actionLabel: {
-    color: "#fff",
-    fontSize: 11,
-    fontWeight: "600",
-    textShadowColor: "rgba(0,0,0,0.9)",
-    textShadowOffset: { width: 0, height: 1 },
-    textShadowRadius: 3,
-  },
-  info: {
+
+  // HUD: title + time + progress bar
+  hud: {
     position: "absolute",
-    left: 14,
-    right: 70,
-    bottom: BOTTOM_TAB_H + 20,
-    gap: 5,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    paddingHorizontal: 16,
+    paddingBottom: 22,
   },
-  channelRow: { flexDirection: "row", alignItems: "center", gap: 6 },
-  channelDot: {
-    width: 7,
-    height: 7,
-    borderRadius: 4,
-    backgroundColor: "#1DB954",
-    flexShrink: 0,
-  },
-  channelText: {
-    color: "#1DB954",
-    fontSize: 13,
-    fontWeight: "700",
-    flexShrink: 1,
-    textShadowColor: "rgba(0,0,0,0.9)",
-    textShadowOffset: { width: 0, height: 1 },
-    textShadowRadius: 4,
-  },
-  titleText: {
+
+  title: {
     color: "#fff",
     fontSize: 15,
     fontWeight: "700",
-    lineHeight: 21,
+    lineHeight: 22,
+    marginBottom: 10,
     textShadowColor: "rgba(0,0,0,0.9)",
     textShadowOffset: { width: 0, height: 1 },
     textShadowRadius: 6,
   },
-  statsRow: {
+
+  timeRow: {
     flexDirection: "row",
-    alignItems: "center",
-    gap: 12,
-    marginTop: 2,
+    justifyContent: "space-between",
+    marginBottom: 6,
   },
-  statPill: { flexDirection: "row", alignItems: "center", gap: 4 },
-  statText: {
-    color: "#fff",
-    fontSize: 12,
-    fontWeight: "600",
-    textShadowColor: "rgba(0,0,0,0.9)",
-    textShadowOffset: { width: 0, height: 1 },
-    textShadowRadius: 3,
+  timeText: {
+    color: "rgba(255,255,255,0.6)",
+    fontSize: 11,
+    fontVariant: ["tabular-nums"],
   },
-  banner: {
+
+  badge: {
     position: "absolute",
-    left: 0,
-    right: 0,
-    zIndex: 10,
-    flexDirection: "row",
+    top: STATUS_H + 14,
+    right: 14,
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: "rgba(0,0,0,0.6)",
+    borderWidth: 1,
+    borderColor: "rgba(29,185,84,0.4)",
+    justifyContent: "center",
     alignItems: "center",
-    gap: 6,
-    borderBottomWidth: 1,
-    paddingHorizontal: 14,
-    paddingVertical: 7,
   },
-  bannerText: { fontSize: 12 },
 });
