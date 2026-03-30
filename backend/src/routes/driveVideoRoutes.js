@@ -1,17 +1,4 @@
 // backend/src/routes/driveVideoRoutes.js
-//
-// Google Drive video feed — private videos served via service-account proxy.
-//
-// CACHE LAYERS:
-//   L1 — in-memory manifest (1-hour TTL, zero-latency hot path)
-//   L2 — MongoDB TTL collection (1-hour, survives server restart/cold start)
-//
-// ENDPOINTS:
-//   GET    /api/videos/drive/feed           — shuffled manifest array
-//   GET    /api/videos/drive/stream/:id     — Range-aware video byte proxy
-//   DELETE /api/videos/drive/cache          — bust both layers (admin)
-//   GET    /api/videos/drive/cache/status   — debug
-
 "use strict";
 
 const express = require("express");
@@ -93,7 +80,7 @@ function shuffle(arr) {
   return a;
 }
 
-// ── List all videos from the flat Drive folder ────────────────────────────────
+// ── List all mp4 videos from the Drive folder ─────────────────────────────────
 async function listDriveVideos() {
   const drive = getDrive();
   const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
@@ -113,6 +100,8 @@ async function listDriveVideos() {
     pageToken = res.data.nextPageToken;
   } while (pageToken);
 
+  if (!files.length) throw new Error("No videos found in Drive folder");
+
   return files.map((f) => ({
     fileId: f.id,
     name: f.name,
@@ -125,14 +114,15 @@ async function listDriveVideos() {
 
 // ── getManifest: L1 → L2 → Drive API ─────────────────────────────────────────
 async function getManifest() {
+  // L1 hit
   if (_l1 && Date.now() - _l1At < L1_TTL) return _l1;
 
+  // L2 hit — serve stale, refresh in background
   const l2 = await loadMongo();
   if (l2 && l2.length > 0) {
     console.log(`📦 Drive manifest from MongoDB (${l2.length} videos)`);
     _l1 = l2;
     _l1At = Date.now();
-    // Background refresh so data stays warm
     buildManifest().catch((e) =>
       console.warn("[DriveVideos] bg refresh:", e.message),
     );
@@ -152,7 +142,6 @@ async function buildManifest() {
   try {
     console.log("🎬 Building Drive manifest…");
     const files = await listDriveVideos();
-    if (!files.length) throw new Error("No videos in Drive folder");
     const manifest = shuffle(files);
     _l1 = manifest;
     _l1At = Date.now();
@@ -165,52 +154,69 @@ async function buildManifest() {
 }
 
 // ── GET /api/videos/drive/feed ────────────────────────────────────────────────
+// Returns shuffled manifest. Auth already verified by middleware in server.js.
 router.get("/feed", async (_req, res) => {
   try {
     const manifest = await getManifest();
-    res.json(shuffle(manifest)); // fresh shuffle each request for variety
+    res.json(shuffle(manifest)); // fresh shuffle each request
   } catch (e) {
     console.error("[DriveVideos] /feed:", e.message);
     res.status(500).json({ message: e.message });
   }
 });
 
-// ── GET /api/videos/drive/stream/:fileId ─────────────────────────────────────
-// Proxies video bytes with Range support (required for seek + iOS background dl).
+// ── GET /api/videos/drive/stream/:fileId ──────────────────────────────────────
+// Proxies raw video bytes with Range support for seeking + iOS.
+// Auth already verified by middleware — only authenticated users reach this.
 router.get("/stream/:fileId", async (req, res) => {
   const { fileId } = req.params;
   try {
     const drive = getDrive();
 
-    const meta = await drive.files.get({ fileId, fields: "id,mimeType,size" });
+    // Fetch file metadata
+    const meta = await drive.files.get({
+      fileId,
+      fields: "id,mimeType,size",
+    });
+
     const mimeType = meta.data.mimeType || "video/mp4";
     const fileSize = meta.data.size ? parseInt(meta.data.size, 10) : null;
     const rangeHeader = req.headers.range;
 
     if (rangeHeader && fileSize) {
-      const [s, e] = rangeHeader.replace(/bytes=/, "").split("-");
-      const start = parseInt(s, 10);
-      const end = e ? parseInt(e, 10) : fileSize - 1;
+      // Partial content — needed for seeking
+      const parts = rangeHeader.replace(/bytes=/, "").split("-");
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      const chunkSize = end - start + 1;
+
       res.writeHead(206, {
         "Content-Range": `bytes ${start}-${end}/${fileSize}`,
         "Accept-Ranges": "bytes",
-        "Content-Length": end - start + 1,
+        "Content-Length": chunkSize,
         "Content-Type": mimeType,
         "Cache-Control": "private, max-age=3600",
       });
+
       const stream = await drive.files.get(
         { fileId, alt: "media" },
-        { responseType: "stream", headers: { Range: `bytes=${start}-${end}` } },
+        {
+          responseType: "stream",
+          headers: { Range: `bytes=${start}-${end}` },
+        },
       );
       stream.data.pipe(res);
     } else {
-      const hdrs = {
+      // Full file
+      const headers = {
         "Content-Type": mimeType,
         "Accept-Ranges": "bytes",
         "Cache-Control": "private, max-age=3600",
       };
-      if (fileSize) hdrs["Content-Length"] = fileSize;
-      res.writeHead(200, hdrs);
+      if (fileSize) headers["Content-Length"] = fileSize;
+
+      res.writeHead(200, headers);
+
       const stream = await drive.files.get(
         { fileId, alt: "media" },
         { responseType: "stream" },
@@ -219,8 +225,10 @@ router.get("/stream/:fileId", async (req, res) => {
     }
   } catch (e) {
     console.error(`[DriveVideos] /stream/${fileId}:`, e.message);
-    if (!res.headersSent)
-      res.status(e.status === 404 ? 404 : 500).json({ message: e.message });
+    if (!res.headersSent) {
+      const status = e.status === 404 ? 404 : 500;
+      res.status(status).json({ message: e.message });
+    }
   }
 });
 

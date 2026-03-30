@@ -1,19 +1,4 @@
 // src/screens/foryou.tsx
-//
-// TikTok-style full-screen video feed served from Google Drive.
-//
-// FRONTEND CACHE (two layers):
-//   L1 — MMKV manifest JSON   — instant reads, persists across JS reloads
-//   L2 — expo-file-system     — first 5 videos downloaded for offline playback
-//
-// UX:
-//   • Full-screen vertical FlatList, pagingEnabled (TikTok scroll)
-//   • Tap anywhere on video → pause / resume
-//   • Scrubable progress bar at bottom
-//   • Auto-play on enter viewport, pause + rewind on exit
-//   • No likes, comments, or share UI
-//   • Green cloud badge when a video is cached locally
-
 import { Ionicons } from "@expo/vector-icons";
 import { Audio, AVPlaybackStatus, ResizeMode, Video } from "expo-av";
 import * as FileSystem from "expo-file-system";
@@ -35,23 +20,23 @@ import { auth } from "../firebase/auth";
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
-const PREFETCH_COUNT = 5;
+const PREFETCH_COUNT = 3;
 const L1_TTL_MS = 60 * 60 * 1000; // 1 hour
 const { width: W, height: H } = Dimensions.get("window");
 const STATUS_H =
   Platform.OS === "android" ? (RNStatusBar.currentHeight ?? 24) : 0;
 
-// ── MMKV store (L1) ────────────────────────────────────────────────────────────
+// ── MMKV store ────────────────────────────────────────────────────────────────
 let _store: MMKV | null = null;
 const store = () => {
-  if (!_store) _store = new MMKV({ id: "ypn-drive-feed-v2" });
+  if (!_store) _store = new MMKV({ id: "ypn-drive-feed-v3" });
   return _store;
 };
-const MK_DATA = "manifest_v2";
-const MK_TS = "manifest_ts_v2";
+const MK_DATA = "manifest_v3";
+const MK_TS = "manifest_ts_v3";
 const MK_LP = (id: string) => `lp_${id}`;
 
-// ── Types ──────────────────────────────────────────────────────────────────────
+// ── Types ─────────────────────────────────────────────────────────────────────
 type DriveVideo = {
   fileId: string;
   name: string;
@@ -60,7 +45,7 @@ type DriveVideo = {
   thumbnail: string | null;
 };
 
-// ── L1 MMKV helpers ────────────────────────────────────────────────────────────
+// ── MMKV helpers ──────────────────────────────────────────────────────────────
 function l1Read(): DriveVideo[] | null {
   try {
     const ts = store().getNumber(MK_TS);
@@ -79,11 +64,12 @@ function l1Write(data: DriveVideo[]) {
   } catch {}
 }
 
-// ── L2 local file helpers ──────────────────────────────────────────────────────
-const LOCAL_DIR = FileSystem.cacheDirectory + "ypn_drive_v2/";
+// ── Local file cache ──────────────────────────────────────────────────────────
+const LOCAL_DIR = FileSystem.cacheDirectory + "ypn_drive_v3/";
 
 async function ensureDir() {
-  if (!(await FileSystem.getInfoAsync(LOCAL_DIR)).exists)
+  const info = await FileSystem.getInfoAsync(LOCAL_DIR);
+  if (!info.exists)
     await FileSystem.makeDirectoryAsync(LOCAL_DIR, { intermediates: true });
 }
 
@@ -103,11 +89,13 @@ async function isFileCached(id: string): Promise<boolean> {
   return (await FileSystem.getInfoAsync(p)).exists;
 }
 
-// ── Auth helpers ───────────────────────────────────────────────────────────────
-async function getHeaders(): Promise<Record<string, string>> {
+// ── Auth helpers ──────────────────────────────────────────────────────────────
+async function getAuthHeaders(): Promise<Record<string, string>> {
   try {
-    const t = await auth.currentUser?.getIdToken();
-    return t ? { Authorization: `Bearer ${t}` } : {};
+    const user = auth.currentUser;
+    if (!user) return {};
+    const token = await user.getIdToken();
+    return { Authorization: `Bearer ${token}` };
   } catch {
     return {};
   }
@@ -115,29 +103,29 @@ async function getHeaders(): Promise<Record<string, string>> {
 
 const streamUrl = (id: string) => `${API_URL}/api/videos/drive/stream/${id}`;
 
-// ── Prefetch first N videos ────────────────────────────────────────────────────
+// ── Prefetch first N videos to local cache ────────────────────────────────────
 async function prefetch(videos: DriveVideo[]) {
   await ensureDir();
   for (const v of videos.slice(0, PREFETCH_COUNT)) {
     try {
       if (await isFileCached(v.fileId)) continue;
       const dest = filePath(v.fileId);
-      const h = await getHeaders();
+      const headers = await getAuthHeaders();
       const dl = await FileSystem.downloadAsync(streamUrl(v.fileId), dest, {
-        headers: h,
+        headers,
       });
       if (dl.status === 200) saveLP(v.fileId, dest);
     } catch {}
   }
 }
 
-// ── Time formatter ─────────────────────────────────────────────────────────────
+// ── Time formatter ────────────────────────────────────────────────────────────
 const fmt = (ms: number) => {
   const s = Math.floor(ms / 1000);
   return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, "0")}`;
 };
 
-// ── ProgressBar ────────────────────────────────────────────────────────────────
+// ── ProgressBar ───────────────────────────────────────────────────────────────
 const ProgressBar = React.memo(
   ({
     pos,
@@ -199,11 +187,11 @@ const VideoCard = React.memo(
   ({
     item,
     isActive,
-    headers,
+    authHeaders,
   }: {
     item: DriveVideo;
     isActive: boolean;
-    headers: Record<string, string>;
+    authHeaders: Record<string, string>;
   }) => {
     const ref = useRef<Video>(null);
     const [paused, setPaused] = useState(false);
@@ -213,14 +201,14 @@ const VideoCard = React.memo(
     const [dur, setDur] = useState(0);
     const [localPath, setLocalPath] = useState<string | null>(null);
 
-    // Resolve local cache once
+    // Check local cache once on mount
     useEffect(() => {
       isFileCached(item.fileId).then((ok) => {
         if (ok) setLocalPath(readLP(item.fileId));
       });
     }, [item.fileId]);
 
-    // Auto-play / pause based on visibility
+    // Auto-play / pause / rewind based on visibility
     useEffect(() => {
       if (!ref.current) return;
       if (isActive) {
@@ -231,6 +219,8 @@ const VideoCard = React.memo(
         ref.current.pauseAsync().catch(() => {});
         ref.current.setPositionAsync(0).catch(() => {});
         setPos(0);
+        setLoading(true);
+        setHasError(false);
       }
     }, [isActive]);
 
@@ -257,15 +247,15 @@ const VideoCard = React.memo(
       setPos(ms);
     }, []);
 
+    // Use local file if cached, otherwise stream via authenticated backend
     const source = localPath
       ? { uri: localPath }
-      : { uri: streamUrl(item.fileId), headers };
+      : { uri: streamUrl(item.fileId), headers: authHeaders };
 
     const displayName = item.name.replace(/\.[^.]+$/, "");
 
     return (
       <View style={s.card}>
-        {/* Video */}
         <Video
           ref={ref}
           source={source}
@@ -282,17 +272,17 @@ const VideoCard = React.memo(
           useNativeControls={false}
         />
 
-        {/* Tap-to-pause — covers full screen above HUD */}
+        {/* Full-screen tap to pause/play */}
         <Pressable style={s.tapZone} onPress={togglePlay} />
 
-        {/* Buffering spinner */}
+        {/* Buffering */}
         {loading && !hasError && (
           <View style={s.centre} pointerEvents="none">
             <ActivityIndicator size="large" color="#1DB954" />
           </View>
         )}
 
-        {/* Error */}
+        {/* Error state */}
         {hasError && (
           <View style={s.centre} pointerEvents="none">
             <Ionicons name="alert-circle-outline" size={52} color="#FF453A" />
@@ -309,19 +299,16 @@ const VideoCard = React.memo(
           </View>
         )}
 
-        {/* Bottom scrim + HUD */}
+        {/* Scrim + HUD */}
         <View style={s.scrim} pointerEvents="none" />
         <View style={s.hud} pointerEvents="box-none">
           <Text style={s.title} numberOfLines={2}>
             {displayName}
           </Text>
-
           <View style={s.timeRow} pointerEvents="none">
             <Text style={s.timeText}>{fmt(pos)}</Text>
             {dur > 0 && <Text style={s.timeText}>{fmt(dur)}</Text>}
           </View>
-
-          {/* Progress bar */}
           <ProgressBar pos={pos} dur={dur} onSeek={onSeek} />
         </View>
 
@@ -336,23 +323,23 @@ const VideoCard = React.memo(
   },
 );
 
-// ── Main screen ────────────────────────────────────────────────────────────────
+// ── Main screen ───────────────────────────────────────────────────────────────
 export default function ForYouScreen() {
   const [videos, setVideos] = useState<DriveVideo[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [fetchErr, setFetchErr] = useState(false);
   const [activeIdx, setActiveIdx] = useState(0);
-  const [headers, setHeaders] = useState<Record<string, string>>({});
+  const [authHeaders, setAuthHeaders] = useState<Record<string, string>>({});
   const flatRef = useRef<FlatList>(null);
 
-  // Init audio mode + auth headers once
+  // Init audio + get auth headers once
   useEffect(() => {
     Audio.setAudioModeAsync({
       playsInSilentModeIOS: true,
       staysActiveInBackground: false,
     }).catch(() => {});
-    getHeaders().then(setHeaders);
+    getAuthHeaders().then(setAuthHeaders);
   }, []);
 
   useEffect(() => {
@@ -360,48 +347,50 @@ export default function ForYouScreen() {
   }, []);
 
   async function boot() {
+    // Serve from L1 cache immediately if fresh
     const cached = l1Read();
     if (cached && cached.length > 0) {
       setVideos(cached);
       setLoading(false);
-      // Background refresh
-      getHeaders().then((h) =>
-        fetch(`${API_URL}/api/videos/drive/feed`, { headers: h })
-          .then((r) => r.json())
-          .then((d: DriveVideo[]) => {
-            if (d.length) {
-              l1Write(d);
-              setVideos(d);
-              prefetch(d);
-            }
-          })
-          .catch(() => {}),
-      );
       prefetch(cached);
+      // Background refresh
+      refreshManifest(false);
       return;
     }
-    await fetchManifest(false);
+    // Cold start — fetch from backend
+    await refreshManifest(false);
   }
 
-  async function fetchManifest(manual: boolean) {
+  async function refreshManifest(manual: boolean) {
     if (manual) setRefreshing(true);
     else if (!videos.length) setLoading(true);
     setFetchErr(false);
+
     try {
-      const h = await getHeaders();
-      setHeaders(h);
+      const headers = await getAuthHeaders();
+      setAuthHeaders(headers);
+
       const res = await fetch(`${API_URL}/api/videos/drive/feed`, {
-        headers: h,
+        headers,
       });
+
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
       const data: DriveVideo[] = await res.json();
-      if (!data.length) throw new Error("Empty manifest");
+      if (!data.length) throw new Error("Empty manifest from server");
+
       l1Write(data);
       setVideos(data);
       prefetch(data);
-    } catch {
-      const fallback = l1Read();
-      fallback?.length ? setVideos(fallback) : setFetchErr(true);
+    } catch (e) {
+      console.warn("[ForYou] fetch error:", e);
+      // Fall back to stale cache if available
+      const stale = l1Read();
+      if (stale && stale.length > 0) {
+        setVideos(stale);
+      } else {
+        setFetchErr(true);
+      }
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -410,7 +399,9 @@ export default function ForYouScreen() {
 
   const onViewable = useCallback(
     ({ viewableItems }: { viewableItems: any[] }) => {
-      if (viewableItems.length > 0) setActiveIdx(viewableItems[0].index ?? 0);
+      if (viewableItems.length > 0) {
+        setActiveIdx(viewableItems[0].index ?? 0);
+      }
     },
     [],
   );
@@ -422,11 +413,16 @@ export default function ForYouScreen() {
 
   const renderItem = useCallback(
     ({ item, index }: { item: DriveVideo; index: number }) => (
-      <VideoCard item={item} isActive={index === activeIdx} headers={headers} />
+      <VideoCard
+        item={item}
+        isActive={index === activeIdx}
+        authHeaders={authHeaders}
+      />
     ),
-    [activeIdx, headers],
+    [activeIdx, authHeaders],
   );
 
+  // ── Loading state ─────────────────────────────────────────────────────────
   if (loading) {
     return (
       <View style={s.fullCentre}>
@@ -436,18 +432,20 @@ export default function ForYouScreen() {
     );
   }
 
+  // ── Error state ───────────────────────────────────────────────────────────
   if (fetchErr && !videos.length) {
     return (
       <View style={s.fullCentre}>
         <Ionicons name="wifi-outline" size={52} color="#333" />
-        <Text style={s.noVideoText}>No videos available</Text>
-        <Pressable style={s.retryBtn} onPress={() => fetchManifest(false)}>
+        <Text style={s.noVideoText}>Could not load videos</Text>
+        <Pressable style={s.retryBtn} onPress={() => refreshManifest(false)}>
           <Text style={s.retryText}>Retry</Text>
         </Pressable>
       </View>
     );
   }
 
+  // ── Main feed ─────────────────────────────────────────────────────────────
   return (
     <View style={s.root}>
       <FlatList
@@ -460,7 +458,7 @@ export default function ForYouScreen() {
         snapToAlignment="start"
         decelerationRate="fast"
         showsVerticalScrollIndicator={false}
-        onRefresh={() => fetchManifest(true)}
+        onRefresh={() => refreshManifest(true)}
         refreshing={refreshing}
         onViewableItemsChanged={onViewable}
         viewabilityConfig={viewCfg.current}
@@ -474,7 +472,7 @@ export default function ForYouScreen() {
   );
 }
 
-// ── Styles ─────────────────────────────────────────────────────────────────────
+// ── Styles ────────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#000" },
 
@@ -485,13 +483,12 @@ const s = StyleSheet.create({
     overflow: "hidden",
   },
 
-  // Tap zone — sits above the video, below the HUD
   tapZone: {
     position: "absolute",
     top: 0,
     left: 0,
     right: 0,
-    bottom: 88, // height of HUD
+    bottom: 88,
   },
 
   centre: {
@@ -538,7 +535,6 @@ const s = StyleSheet.create({
     alignItems: "center",
   },
 
-  // Dark gradient-like scrim behind HUD
   scrim: {
     position: "absolute",
     left: 0,
@@ -548,7 +544,6 @@ const s = StyleSheet.create({
     backgroundColor: "rgba(0,0,0,0.55)",
   },
 
-  // HUD: title + time + progress bar
   hud: {
     position: "absolute",
     left: 0,
@@ -577,7 +572,6 @@ const s = StyleSheet.create({
   timeText: {
     color: "rgba(255,255,255,0.6)",
     fontSize: 11,
-    fontVariant: ["tabular-nums"],
   },
 
   badge: {
