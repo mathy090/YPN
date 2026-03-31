@@ -1,58 +1,28 @@
+// app/tabs/settings.tsx
 import { Ionicons } from "@expo/vector-icons";
-import { useNavigation } from "@react-navigation/native";
+import { useRouter } from "expo-router";
 import {
-  Alert,
   Platform,
   StatusBar as RNStatusBar,
   StyleSheet,
   Text,
   TouchableOpacity,
-  View,
+  View
 } from "react-native";
 import { useAuth } from "../../src/store/authStore";
 
-type RootStackParamList = {
-  Login: undefined;
-  OTP: { email?: string }; // adjust params as needed
-  // ... other routes
-};
-
 export default function SettingsScreen() {
   const { logout, user } = useAuth();
-  const navigation =
-    useNavigation<
-      typeof import("@react-navigation/native").NavigationProp<RootStackParamList>
-    >();
+  const router = useRouter();
 
   const handleSignOut = async () => {
     try {
       await logout();
-
-      // Reset navigation stack to prevent back-navigation to protected screens
-      navigation.reset({
-        index: 0,
-        routes: [{ name: "Login" }],
-      });
-
-      // Optional: Navigate to OTP after login if your flow requires it
-      // Uncomment and adjust based on your auth flow:
-      // navigation.navigate("OTP", { email: user?.email });
     } catch (error) {
-      console.error("Sign out failed:", error);
-
-      // Fallback: Always navigate to login even if logout fails locally
-      // This prevents UI being stuck in authenticated state
-      navigation.reset({
-        index: 0,
-        routes: [{ name: "Login" }],
-      });
-
-      // Inform user of issue (non-blocking)
-      Alert.alert(
-        "Sign Out Issue",
-        "You may still be signed in on this device. Please try again or contact support.",
-        [{ text: "OK", style: "cancel" }],
-      );
+      console.error("Sign out error:", error);
+    } finally {
+      // Always navigate to welcome, even if logout threw
+      router.replace("/welcome");
     }
   };
 
@@ -86,12 +56,11 @@ export default function SettingsScreen() {
 
       <View style={s.divider} />
 
-      {/* Logout */}
+      {/* Sign out */}
       <TouchableOpacity
         style={s.logoutBtn}
         onPress={handleSignOut}
         activeOpacity={0.8}
-        disabled={false} // explicitly allow press; error handled internally
       >
         <Ionicons name="log-out-outline" size={20} color="#FF453A" />
         <Text style={s.logoutText}>Sign Out</Text>

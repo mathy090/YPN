@@ -208,10 +208,23 @@ export default function Phone() {
                 <Text style={s.btnText}>Create Account</Text>
               )}
             </TouchableOpacity>
+
+            <TouchableOpacity
+              style={s.link}
+              onPress={() => router.replace("/auth/otp")}
+            >
+              <Text style={s.linkText}>
+                Already have an account?{" "}
+                <Text style={{ color: "#1DB954", fontWeight: "600" }}>
+                  Sign in
+                </Text>
+              </Text>
+            </TouchableOpacity>
           </ScrollView>
         </KeyboardAvoidingView>
       </SafeAreaView>
 
+      {/* Verification sent modal */}
       {done && (
         <BlurView intensity={40} tint="dark" style={StyleSheet.absoluteFill}>
           <View style={s.modal}>
@@ -250,6 +263,7 @@ const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#000" },
   safe: { flex: 1 },
   scroll: { paddingHorizontal: 24, paddingTop: 72, paddingBottom: 40 },
+
   orb: { position: "absolute", borderRadius: 999 },
   orb1: {
     width: 300,
@@ -265,6 +279,7 @@ const s = StyleSheet.create({
     right: -60,
     backgroundColor: "rgba(29,185,84,0.05)",
   },
+
   back: {
     position: "absolute",
     top: 52,
@@ -274,8 +289,10 @@ const s = StyleSheet.create({
     borderRadius: 20,
     backgroundColor: "rgba(255,255,255,0.08)",
   },
+
   logoWrap: { alignItems: "center", marginBottom: 24 },
   logo: { width: 72, height: 72, borderRadius: 36 },
+
   title: {
     color: "#fff",
     fontSize: 28,
@@ -289,6 +306,7 @@ const s = StyleSheet.create({
     textAlign: "center",
     marginBottom: 28,
   },
+
   card: {
     backgroundColor: "rgba(255,255,255,0.04)",
     borderRadius: 20,
@@ -306,6 +324,7 @@ const s = StyleSheet.create({
     height: 1,
     backgroundColor: "rgba(255,255,255,0.12)",
   },
+
   label: {
     color: "rgba(255,255,255,0.35)",
     fontSize: 11,
@@ -328,6 +347,7 @@ const s = StyleSheet.create({
   icon: { marginRight: 10 },
   input: { flex: 1, color: "#fff", fontSize: 15 },
   err: { color: "#E91429", fontSize: 12, marginTop: 10 },
+
   btn: {
     backgroundColor: "#1DB954",
     borderRadius: 30,
@@ -336,6 +356,11 @@ const s = StyleSheet.create({
   },
   btnOff: { backgroundColor: "#1a3d26", opacity: 0.6 },
   btnText: { color: "#000", fontWeight: "700", fontSize: 16 },
+
+  link: { alignItems: "center", marginTop: 20 },
+  linkText: { color: "#B3B3B3", fontSize: 14 },
+
+  // Modal
   modal: {
     flex: 1,
     justifyContent: "center",

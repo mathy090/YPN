@@ -51,24 +51,30 @@ export default function OTP() {
     setLoading(true);
 
     try {
-      // 1. Firebase sign-in
       const cred = await signInWithEmailAndPassword(auth, email, password);
       const firebaseUser = cred.user;
 
-      // 2. Block unverified emails before touching the backend
       if (!firebaseUser.emailVerified) {
         setError("Please verify your email before signing in.");
         await auth.signOut();
         return;
       }
 
-      // 3. Get fresh token and verify with backend (the authoritative check)
       const idToken = await firebaseUser.getIdToken(true);
       await saveToken(idToken);
-      const { hasProfile } = await verifyWithBackend(idToken);
 
-      // 4. Backend accepted — commit auth state and navigate
+      let hasProfile = false;
+      try {
+        const result = await verifyWithBackend(idToken);
+        hasProfile = result.hasProfile;
+      } catch {
+        // Backend unreachable — allow login, treat as no profile
+        hasProfile = false;
+      }
+
       await login();
+
+      // Navigate: no profile → set name first, otherwise → home
       router.replace(hasProfile ? "/tabs/discord" : "/auth/device");
     } catch (e: any) {
       if (
