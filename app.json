@@ -47,10 +47,10 @@
       "expo-font",
       "expo-secure-store",
       "expo-sqlite",
-      
       "@react-native-google-signin/google-signin",
       "react-native-localize",
-      "@react-native-community/datetimepicker"
+      "@react-native-community/datetimepicker",
+      "expo-video"
     ],
     "experiments": {
       "typedRoutes": true,

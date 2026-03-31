@@ -1,7 +1,8 @@
 // src/screens/foryou.tsx
 import { Ionicons } from "@expo/vector-icons";
-import { Audio, AVPlaybackStatus, ResizeMode, Video } from "expo-av";
+import { Audio, AVPlaybackStatus } from "expo-av";
 import * as FileSystem from "expo-file-system";
+import { Video } from "expo-video";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -213,11 +214,11 @@ const VideoCard = React.memo(
       if (!ref.current) return;
       if (isActive) {
         setPaused(false);
-        ref.current.playAsync().catch(() => {});
+        ref.current.playAsync?.().catch(() => {});
       } else {
         setPaused(true);
-        ref.current.pauseAsync().catch(() => {});
-        ref.current.setPositionAsync(0).catch(() => {});
+        ref.current.pauseAsync?.().catch(() => {});
+        ref.current.setPositionAsync?.(0).catch(() => {});
         setPos(0);
         setLoading(true);
         setHasError(false);
@@ -227,10 +228,10 @@ const VideoCard = React.memo(
     const togglePlay = useCallback(() => {
       if (!ref.current) return;
       if (paused) {
-        ref.current.playAsync().catch(() => {});
+        ref.current.playAsync?.().catch(() => {});
         setPaused(false);
       } else {
-        ref.current.pauseAsync().catch(() => {});
+        ref.current.pauseAsync?.().catch(() => {});
         setPaused(true);
       }
     }, [paused]);
@@ -243,11 +244,10 @@ const VideoCard = React.memo(
     }, []);
 
     const onSeek = useCallback((ms: number) => {
-      ref.current?.setPositionAsync(ms).catch(() => {});
+      ref.current?.setPositionAsync?.(ms).catch(() => {});
       setPos(ms);
     }, []);
 
-    // Use local file if cached, otherwise stream via authenticated backend
     const source = localPath
       ? { uri: localPath }
       : { uri: streamUrl(item.fileId), headers: authHeaders };
@@ -260,7 +260,7 @@ const VideoCard = React.memo(
           ref={ref}
           source={source}
           style={StyleSheet.absoluteFill}
-          resizeMode={ResizeMode.COVER}
+          contentFit="cover"
           shouldPlay={isActive && !paused}
           isLooping
           isMuted={false}
@@ -269,7 +269,6 @@ const VideoCard = React.memo(
             setLoading(false);
             setHasError(true);
           }}
-          useNativeControls={false}
         />
 
         {/* Full-screen tap to pause/play */}
@@ -347,17 +346,14 @@ export default function ForYouScreen() {
   }, []);
 
   async function boot() {
-    // Serve from L1 cache immediately if fresh
     const cached = l1Read();
     if (cached && cached.length > 0) {
       setVideos(cached);
       setLoading(false);
       prefetch(cached);
-      // Background refresh
       refreshManifest(false);
       return;
     }
-    // Cold start — fetch from backend
     await refreshManifest(false);
   }
 
@@ -384,7 +380,6 @@ export default function ForYouScreen() {
       prefetch(data);
     } catch (e) {
       console.warn("[ForYou] fetch error:", e);
-      // Fall back to stale cache if available
       const stale = l1Read();
       if (stale && stale.length > 0) {
         setVideos(stale);
@@ -422,7 +417,6 @@ export default function ForYouScreen() {
     [activeIdx, authHeaders],
   );
 
-  // ── Loading state ─────────────────────────────────────────────────────────
   if (loading) {
     return (
       <View style={s.fullCentre}>
@@ -432,7 +426,6 @@ export default function ForYouScreen() {
     );
   }
 
-  // ── Error state ───────────────────────────────────────────────────────────
   if (fetchErr && !videos.length) {
     return (
       <View style={s.fullCentre}>
@@ -445,7 +438,6 @@ export default function ForYouScreen() {
     );
   }
 
-  // ── Main feed ─────────────────────────────────────────────────────────────
   return (
     <View style={s.root}>
       <FlatList
@@ -569,21 +561,15 @@ const s = StyleSheet.create({
     justifyContent: "space-between",
     marginBottom: 6,
   },
-  timeText: {
-    color: "rgba(255,255,255,0.6)",
-    fontSize: 11,
-  },
+  timeText: { color: "#fff", fontSize: 11, fontWeight: "600" },
 
   badge: {
     position: "absolute",
-    top: STATUS_H + 14,
-    right: 14,
-    width: 28,
-    height: 28,
+    top: 12 + STATUS_H,
+    right: 12,
+    padding: 6,
     borderRadius: 14,
-    backgroundColor: "rgba(0,0,0,0.6)",
-    borderWidth: 1,
-    borderColor: "rgba(29,185,84,0.4)",
+    backgroundColor: "rgba(0,0,0,0.5)",
     justifyContent: "center",
     alignItems: "center",
   },

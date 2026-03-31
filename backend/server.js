@@ -256,11 +256,11 @@ function registerRoutes() {
     }
   });
 
-  // ── YouTube RSS video feed (no API key) ──────────────────────────────────
-  app.use("/api/videos", videoRoutes);
-
   // ── Google Drive video feed (authenticated) ──────────────────────────────
   app.use("/api/videos/drive", verifyFirebaseToken, driveVideoRoutes);
+
+  // ── YouTube RSS video feed (no API key) ──────────────────────────────────
+  app.use("/api/videos", videoRoutes);
 
   // ── Discord community channels ───────────────────────────────────────────
   app.use("/api/discord", discordRoutes);
