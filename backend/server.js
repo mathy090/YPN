@@ -23,7 +23,7 @@ const {
 } = require("./src/routes/driveVideoRoutes");
 const {
   router: newsRoutes,
-  initNewsArchive,
+  init: initNewsArchive,
 } = require("./src/routes/newsRoutes");
 const mediaRoutes = require("./src/routes/mediaRoutes");
 
@@ -154,41 +154,83 @@ function registerRoutes() {
   );
 
   // ── POST /api/users/profile ──────────────────────────────────────────────
-  app.post("/api/users/profile", verifyFirebaseToken, (req, res) => {
-    if (!upload) {
-      return res.status(503).json({
-        message: "Server still starting, try again shortly.",
-      });
-    }
-    upload.single("photo")(req, res, async (err) => {
-      if (err) return res.status(500).json({ message: err.message });
-      try {
-        const { uid } = req.user;
-        const { name } = req.body;
-        if (!name?.trim()) {
-          return res.status(400).json({ message: "name is required" });
-        }
-        await db.collection("users").updateOne(
-          { uid },
-          {
-            $set: {
-              name: name.trim(),
-              hasProfile: true,
-              updatedAt: new Date(),
-              ...(req.file
-                ? { photoPath: `/photos/${req.file.filename}` }
-                : {}),
-            },
-          },
-          { upsert: true },
-        );
-        res.json({ success: true });
-      } catch (e) {
-        console.error("/api/users/profile POST error:", e);
-        res.status(500).json({ message: e.message });
+  app.post(
+    "/api/users/profile",
+    jsonBody, // ✅ FIX ADDED HERE
+    verifyFirebaseToken,
+    (req, res) => {
+      if (!upload) {
+        return res.status(503).json({
+          message: "Server still starting, try again shortly.",
+        });
       }
-    });
-  });
+
+      if (req.headers["content-type"]?.includes("application/json")) {
+        // ✅ HANDLE JSON (React Native)
+        (async () => {
+          try {
+            const { uid } = req.user;
+            const { name } = req.body || {};
+
+            if (!name?.trim()) {
+              return res.status(400).json({ message: "name is required" });
+            }
+
+            await db.collection("users").updateOne(
+              { uid },
+              {
+                $set: {
+                  name: name.trim(),
+                  hasProfile: true,
+                  updatedAt: new Date(),
+                },
+              },
+              { upsert: true },
+            );
+
+            res.json({ success: true });
+          } catch (e) {
+            console.error("/api/users/profile JSON error:", e);
+            res.status(500).json({ message: e.message });
+          }
+        })();
+      } else {
+        // ✅ HANDLE MULTER (form-data)
+        upload.single("photo")(req, res, async (err) => {
+          if (err) return res.status(500).json({ message: err.message });
+
+          try {
+            const { uid } = req.user;
+            const { name } = req.body || {};
+
+            if (!name?.trim()) {
+              return res.status(400).json({ message: "name is required" });
+            }
+
+            await db.collection("users").updateOne(
+              { uid },
+              {
+                $set: {
+                  name: name.trim(),
+                  hasProfile: true,
+                  updatedAt: new Date(),
+                  ...(req.file
+                    ? { photoPath: `/photos/${req.file.filename}` }
+                    : {}),
+                },
+              },
+              { upsert: true },
+            );
+
+            res.json({ success: true });
+          } catch (e) {
+            console.error("/api/users/profile POST error:", e);
+            res.status(500).json({ message: e.message });
+          }
+        });
+      }
+    },
+  );
 
   // ── GET /api/users/profile ───────────────────────────────────────────────
   app.get("/api/users/profile", verifyFirebaseToken, async (req, res) => {
@@ -216,7 +258,6 @@ function registerRoutes() {
   });
 
   // ── GET /api/users/search?q=name ────────────────────────────────────────
-  // Search users by display name for starting new chats
   app.get("/api/users/search", verifyFirebaseToken, async (req, res) => {
     try {
       const q = (req.query.q ?? "").toString().trim();
@@ -228,7 +269,7 @@ function registerRoutes() {
         .find(
           {
             name: { $regex: q, $options: "i" },
-            uid: { $ne: req.user.uid }, // exclude self
+            uid: { $ne: req.user.uid },
           },
           {
             projection: { _id: 0, uid: 1, name: 1, photoPath: 1 },
@@ -256,25 +297,13 @@ function registerRoutes() {
     }
   });
 
-  // ── Google Drive video feed (authenticated) ──────────────────────────────
   app.use("/api/videos/drive", verifyFirebaseToken, driveVideoRoutes);
-
-  // ── YouTube RSS video feed (no API key) ──────────────────────────────────
   app.use("/api/videos", videoRoutes);
-
-  // ── Discord community channels ───────────────────────────────────────────
   app.use("/api/discord", discordRoutes);
-
-  // ── News feed ────────────────────────────────────────────────────────────
   app.use("/api/news", newsRoutes);
-
-  // ── E2E public key server ────────────────────────────────────────────────
   app.use("/api/keys", verifyFirebaseToken, keyRoutes);
-
-  // ── Google Drive encrypted media proxy ──────────────────────────────────
   app.use("/api/media", verifyFirebaseToken, mediaRoutes);
 
-  // ── 404 catch-all ────────────────────────────────────────────────────────
   app.use((_req, res) => res.status(404).json({ message: "Not found" }));
 }
 

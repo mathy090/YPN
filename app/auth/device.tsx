@@ -14,12 +14,12 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
-  View
+  View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { authHeaders } from "../../src/utils/tokenManager";
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL;
+const API_URL = process.env.EXPO_PUBLIC_API_URL || "http://10.0.2.2:3000"; // ✅ fallback added
 
 export default function Device() {
   const router = useRouter();
@@ -31,11 +31,18 @@ export default function Device() {
 
   const saveProfile = async (trimmedName: string) => {
     const headers = await authHeaders();
+
     const res = await fetch(`${API_URL}/api/users/profile`, {
       method: "POST",
-      headers: { ...headers, "Content-Type": "application/json" },
-      body: JSON.stringify({ name: trimmedName }),
+      headers: {
+        ...headers,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        name: trimmedName || "", // ✅ ensures body is NEVER undefined
+      }),
     });
+
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       throw new Error(body.message ?? "Could not save profile.");
@@ -45,14 +52,19 @@ export default function Device() {
   const finishSetup = async () => {
     const trimmedName = name.trim();
     if (!trimmedName || loading) return;
+
     setError("");
     setLoading(true);
+
     try {
       const user = getAuth().currentUser;
       if (!user) throw new Error("No authenticated user found.");
+
       await updateProfile(user, { displayName: trimmedName });
+
+      // ✅ ensure valid payload sent
       await saveProfile(trimmedName);
-      // Home is always discord
+
       router.replace("/tabs/discord");
     } catch (e: any) {
       console.error("Finish setup error:", e);
@@ -82,7 +94,6 @@ export default function Device() {
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator={false}
           >
-            {/* Icon */}
             <View style={s.iconWrap}>
               <View style={s.iconCircle}>
                 <Ionicons name="person-outline" size={36} color="#1DB954" />
