@@ -21,9 +21,7 @@
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
-      "permissions": [
-        "android.permission.CAMERA"
-      ],
+      "permissions": ["android.permission.CAMERA"],
       "package": "com.anonymous.YPN"
     },
     "web": {
@@ -49,8 +47,7 @@
       "expo-sqlite",
       "@react-native-google-signin/google-signin",
       "react-native-localize",
-      "@react-native-community/datetimepicker",
-      "expo-video"
+      "@react-native-community/datetimepicker"
     ],
     "experiments": {
       "typedRoutes": true,
