@@ -14,12 +14,20 @@ if not COHERE_API_KEY:
 
 co = cohere.ClientV2(api_key=COHERE_API_KEY)
 
-SYSTEM_PROMPT = """You are YPN AI, a warm, helpful assistant for Team YPN — 
-a youth empowerment network in Zimbabwe. You help young people with questions 
-about careers, mental health, education, and general knowledge. 
-Always be kind, accurate, and encouraging. If you don't know something, say so honestly."""
+# Current working model as of 2025
+MODEL = "command-r-08-2024"
 
-# Simple in-memory session store: { session_id: [messages] }
+SYSTEM_PROMPT = (
+    "You are YPN AI, a warm and helpful assistant for Team YPN — "
+    "a youth empowerment network based in Zimbabwe. "
+    "You help young people with questions about careers, education, "
+    "mental health, general knowledge, and life advice. "
+    "Always be kind, accurate, and encouraging. "
+    "Answer questions directly and concisely. "
+    "Do not use excessive markdown or bullet points unless asked."
+)
+
+# In-memory sessions: { session_id: [ {role, content} ] }
 sessions: dict = {}
 
 app = FastAPI()
@@ -37,11 +45,6 @@ class ChatRequest(BaseModel):
     session_id: str = "default"
 
 
-class ChatResponse(BaseModel):
-    reply: str
-    session_id: str
-
-
 @app.get("/")
 async def root_get():
     return {"status": "YPN AI service alive"}
@@ -52,7 +55,16 @@ async def root_head():
     return Response(status_code=200)
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "model": MODEL,
+        "active_sessions": len(sessions),
+    }
+
+
+@app.post("/chat")
 async def chat(req: ChatRequest):
     message = req.message.strip()
     session_id = req.session_id.strip() or "default"
@@ -60,34 +72,31 @@ async def chat(req: ChatRequest):
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
-    # Get or create session history
+    # Build message history for this session
     if session_id not in sessions:
         sessions[session_id] = []
 
     history = sessions[session_id]
 
-    # Build messages list for Cohere
+    # Cohere v2 messages format
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-    for h in history:
-        messages.append({"role": h["role"], "content": h["content"]})
-
+    messages.extend(history)
     messages.append({"role": "user", "content": message})
 
     try:
         response = co.chat(
-            model="command-r-plus",
+            model=MODEL,
             messages=messages,
             temperature=0.7,
-            max_tokens=300,
+            max_tokens=500,
         )
 
         reply = response.message.content[0].text.strip()
 
-        # Save to session history (keep last 20 exchanges to avoid token bloat)
+        # Save exchange, keep last 20 turns (40 messages) to avoid bloat
         history.append({"role": "user", "content": message})
         history.append({"role": "assistant", "content": reply})
-        sessions[session_id] = history[-40:]  # 20 exchanges
+        sessions[session_id] = history[-40:]
 
         return {"reply": reply, "session_id": session_id}
 
@@ -101,14 +110,6 @@ async def chat(req: ChatRequest):
 async def clear_session(session_id: str):
     sessions.pop(session_id, None)
     return {"cleared": session_id}
-
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "active_sessions": len(sessions),
-    }
 
 
 if __name__ == "__main__":
