@@ -1,16 +1,10 @@
-from fastapi import FastAPI, HTTPException, Request, Response
+# ypn-ai-service/main.py
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
 import cohere
-import memory
-from prompts import SYSTEM_PROMPT
-import asyncio
-import time
-from collections import defaultdict, deque
-import json
 
 load_dotenv()
 
@@ -20,9 +14,16 @@ if not COHERE_API_KEY:
 
 co = cohere.ClientV2(api_key=COHERE_API_KEY)
 
-app = FastAPI(title="YPN AI Chat Backend")
+SYSTEM_PROMPT = """You are YPN AI, a warm, helpful assistant for Team YPN — 
+a youth empowerment network in Zimbabwe. You help young people with questions 
+about careers, mental health, education, and general knowledge. 
+Always be kind, accurate, and encouraging. If you don't know something, say so honestly."""
 
-# ------------------ CORS ------------------
+# Simple in-memory session store: { session_id: [messages] }
+sessions: dict = {}
+
+app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,171 +31,86 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------ RATE LIMITING ------------------
-# OpenAI-style: burst + sustained
-RATE_LIMIT = 10         # max requests
-RATE_WINDOW = 10        # per seconds
 
-rate_store = defaultdict(lambda: deque())
-
-def check_rate_limit(key: str):
-    now = time.time()
-    queue = rate_store[key]
-
-    # Remove old requests
-    while queue and queue[0] < now - RATE_WINDOW:
-        queue.popleft()
-
-    if len(queue) >= RATE_LIMIT:
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded. Slow down."
-        )
-
-    queue.append(now)
-
-# ------------------ MODELS ------------------
 class ChatRequest(BaseModel):
     message: str
     session_id: str = "default"
 
-# ------------------ BASIC ROUTES ------------------
+
+class ChatResponse(BaseModel):
+    reply: str
+    session_id: str
+
+
 @app.get("/")
-async def root():
+async def root_get():
     return {"status": "YPN AI service alive"}
+
 
 @app.head("/")
 async def root_head():
     return Response(status_code=200)
 
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "ai": "online",
-        "model": "command-r"
-    }
 
-# ------------------ STREAM CHAT (REAL DOUBLE TICK) ------------------
-@app.post("/chat/stream")
-async def chat_stream(req: ChatRequest, request: Request):
-    user_message = req.message.strip()
+@app.post("/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest):
+    message = req.message.strip()
     session_id = req.session_id.strip() or "default"
 
-    if not user_message:
+    if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
-    # Rate limit (IP + session)
-    client_ip = request.client.host
-    rate_key = f"{client_ip}:{session_id}"
-    check_rate_limit(rate_key)
+    # Get or create session history
+    if session_id not in sessions:
+        sessions[session_id] = []
 
-    # Prepare history
-    raw_history = memory.get_history(session_id)
-    chat_history = [
-        {"role": h["role"], "message": h["message"]}
-        for h in raw_history
-        if h["role"] in ("USER", "CHATBOT")
-    ]
+    history = sessions[session_id]
 
-    async def event_generator():
-        try:
-            # ------------------ TICK 1 ------------------
-            # Message received & stored
-            memory.append(session_id, "USER", user_message)
+    # Build messages list for Cohere
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-            yield f"data: {json.dumps({'type': 'status', 'status': 'received'})}\n\n"
+    for h in history:
+        messages.append({"role": h["role"], "content": h["content"]})
 
-            await asyncio.sleep(0.1)
-
-            # ------------------ AI RESPONSE ------------------
-            response = co.chat(
-                model="command-r",
-                preamble=SYSTEM_PROMPT,
-                chat_history=chat_history,
-                message=user_message,
-                temperature=0.7,
-                max_tokens=200,
-            )
-
-            reply = response.message.content[0].text.strip()
-
-            # Simulate streaming tokens (since Cohere full streaming may vary)
-            words = reply.split()
-
-            built = ""
-            for word in words:
-                built += word + " "
-                yield f"data: {json.dumps({'type': 'chunk', 'content': built.strip()})}\n\n"
-                await asyncio.sleep(0.03)  # typing effect
-
-            # Save final response
-            memory.append(session_id, "CHATBOT", reply)
-
-            # ------------------ TICK 2 ------------------
-            yield f"data: {json.dumps({'type': 'status', 'status': 'delivered'})}\n\n"
-
-            # Final message
-            yield f"data: {json.dumps({'type': 'done', 'reply': reply})}\n\n"
-
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-# ------------------ FALLBACK NORMAL CHAT ------------------
-@app.post("/chat")
-async def chat(req: ChatRequest, request: Request):
-    user_message = req.message.strip()
-    session_id = req.session_id.strip() or "default"
-
-    if not user_message:
-        raise HTTPException(status_code=400, detail="Message cannot be empty")
-
-    client_ip = request.client.host
-    rate_key = f"{client_ip}:{session_id}"
-    check_rate_limit(rate_key)
-
-    raw_history = memory.get_history(session_id)
-    chat_history = [
-        {"role": h["role"], "message": h["message"]}
-        for h in raw_history
-        if h["role"] in ("USER", "CHATBOT")
-    ]
+    messages.append({"role": "user", "content": message})
 
     try:
-        memory.append(session_id, "USER", user_message)
-
         response = co.chat(
-            model="command-r",
-            preamble=SYSTEM_PROMPT,
-            chat_history=chat_history,
-            message=user_message,
+            model="command-r-plus",
+            messages=messages,
             temperature=0.7,
-            max_tokens=200,
+            max_tokens=300,
         )
 
         reply = response.message.content[0].text.strip()
 
-        memory.append(session_id, "CHATBOT", reply)
+        # Save to session history (keep last 20 exchanges to avoid token bloat)
+        history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": reply})
+        sessions[session_id] = history[-40:]  # 20 exchanges
 
-        return {
-            "reply": reply,
-            "status": "delivered"
-        }
+        return {"reply": reply, "session_id": session_id}
 
     except cohere.errors.UnauthorizedError:
         raise HTTPException(status_code=500, detail="Invalid Cohere API key")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ------------------ CLEAR SESSION ------------------
+
 @app.delete("/chat/{session_id}")
 async def clear_session(session_id: str):
-    memory.clear(session_id)
+    sessions.pop(session_id, None)
     return {"cleared": session_id}
 
-# ------------------ RUN ------------------
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "active_sessions": len(sessions),
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 10000))
