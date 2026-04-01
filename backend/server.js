@@ -9,12 +9,15 @@ const multer = require("multer");
 const { GridFsStorage } = require("multer-gridfs-storage");
 const admin = require("firebase-admin");
 
+// ── keyRoutes exports { router, init } so MUST be destructured ──
 const {
   router: keyRoutes,
   init: initKeyStore,
 } = require("./src/routes/keyRoutes");
+
 const { init: initUserVideos } = require("./src/models/UserVideos");
 const { init: initDiscordChannels } = require("./src/models/DiscordChannels");
+
 const videoRoutes = require("./src/routes/videoRoutes");
 const discordRoutes = require("./src/routes/discordRoutes");
 const newsRoutes = require("./src/routes/newsRoutes");
@@ -90,7 +93,7 @@ async function connectDB() {
   initUserVideos(db);
   initDiscordChannels(db);
   initKeyStore(db);
-  // NOTE: NewsCache manages its own MongoDB connection — no init needed here
+  // NewsCache manages its own connection — no init needed
 
   bucket = new GridFSBucket(db, { bucketName: "photos" });
   console.log("✅ Connected to MongoDB");
@@ -214,14 +217,18 @@ function registerRoutes() {
     }
   });
 
-  // ── Feature route groups ───────────────────────────────────────
+  // ── Feature routes ─────────────────────────────────────────────
   app.use("/api/videos", videoRoutes);
   app.use("/api/discord", discordRoutes);
   app.use("/api/news", newsRoutes);
+
+  // keyRoutes is already the Express router (destructured above)
   app.use("/api/keys", verifyFirebaseToken, keyRoutes);
+
+  // mediaRoutes exports module.exports = router directly
   app.use("/api/media", verifyFirebaseToken, mediaRoutes);
 
-  // 404 catch-all
+  // 404
   app.use((_req, res) => res.status(404).json({ message: "Not found" }));
 }
 
