@@ -9,21 +9,25 @@ const multer = require("multer");
 const { GridFsStorage } = require("multer-gridfs-storage");
 const admin = require("firebase-admin");
 
-// ── keyRoutes exports { router, init } so MUST be destructured ──
 const {
   router: keyRoutes,
   init: initKeyStore,
 } = require("./src/routes/keyRoutes");
-
 const { init: initUserVideos } = require("./src/models/UserVideos");
 const { init: initDiscordChannels } = require("./src/models/DiscordChannels");
-
 const videoRoutes = require("./src/routes/videoRoutes");
 const discordRoutes = require("./src/routes/discordRoutes");
-const newsRoutes = require("./src/routes/newsRoutes");
+const {
+  router: driveVideoRoutes,
+  initDriveVideos,
+} = require("./src/routes/driveVideoRoutes");
+const {
+  router: newsRoutes,
+  initNewsArchive,
+} = require("./src/routes/newsRoutes");
 const mediaRoutes = require("./src/routes/mediaRoutes");
 
-// ── Firebase Admin ──────────────────────────────────────────────
+// ── Firebase Admin ──────────────────────────────────────────────────────────
 if (!process.env.FIREBASE_ADMIN_KEY) {
   console.error("❌  FIREBASE_ADMIN_KEY env var is not set. Exiting.");
   process.exit(1);
@@ -39,18 +43,19 @@ try {
 
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
-// ── Express ─────────────────────────────────────────────────────
+// ── Express ─────────────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
 const jsonBody = express.json();
 
-// ── Firebase token middleware ────────────────────────────────────
+// ── Firebase token middleware ────────────────────────────────────────────────
 async function verifyFirebaseToken(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer ")) {
-    return res
-      .status(401)
-      .json({ message: "Unauthorized: No token provided", code: "NO_TOKEN" });
+    return res.status(401).json({
+      message: "Unauthorized: No token provided",
+      code: "NO_TOKEN",
+    });
   }
   const idToken = authHeader.split("Bearer ")[1];
   try {
@@ -64,13 +69,14 @@ async function verifyFirebaseToken(req, res, next) {
         code: "TOKEN_EXPIRED",
       });
     }
-    return res
-      .status(401)
-      .json({ message: "Unauthorized: Invalid token", code: "INVALID_TOKEN" });
+    return res.status(401).json({
+      message: "Unauthorized: Invalid token",
+      code: "INVALID_TOKEN",
+    });
   }
 }
 
-// ── Health check ─────────────────────────────────────────────────
+// ── Health check ─────────────────────────────────────────────────────────────
 app.get("/", (_req, res) =>
   res.status(200).json({
     status: "ok",
@@ -80,7 +86,7 @@ app.get("/", (_req, res) =>
 );
 app.head("/", (_req, res) => res.status(200).end());
 
-// ── MongoDB ──────────────────────────────────────────────────────
+// ── MongoDB ──────────────────────────────────────────────────────────────────
 const client = new MongoClient(process.env.MONGO_URI);
 let db;
 let bucket;
@@ -93,7 +99,8 @@ async function connectDB() {
   initUserVideos(db);
   initDiscordChannels(db);
   initKeyStore(db);
-  // NewsCache manages its own connection — no init needed
+  initNewsArchive(db);
+  initDriveVideos(db);
 
   bucket = new GridFSBucket(db, { bucketName: "photos" });
   console.log("✅ Connected to MongoDB");
@@ -111,7 +118,7 @@ async function connectDB() {
 }
 
 function registerRoutes() {
-  // ── POST /api/auth/verify ──────────────────────────────────────
+  // ── POST /api/auth/verify ────────────────────────────────────────────────
   app.post(
     "/api/auth/verify",
     jsonBody,
@@ -145,42 +152,77 @@ function registerRoutes() {
     },
   );
 
-  // ── POST /api/users/profile ────────────────────────────────────
+  // ── POST /api/users/profile ──────────────────────────────────────────────
+  // Handles both JSON (name only, from device.tsx) and
+  // multipart/form-data (name + photo upload)
   app.post("/api/users/profile", verifyFirebaseToken, (req, res) => {
-    if (!upload)
-      return res
-        .status(503)
-        .json({ message: "Server still starting, try again shortly." });
-    upload.single("photo")(req, res, async (err) => {
-      if (err) return res.status(500).json({ message: err.message });
-      try {
-        const { uid } = req.user;
-        const { name } = req.body;
-        if (!name?.trim())
-          return res.status(400).json({ message: "name is required" });
-        await db.collection("users").updateOne(
-          { uid },
-          {
-            $set: {
-              name: name.trim(),
-              hasProfile: true,
-              updatedAt: new Date(),
-              ...(req.file
-                ? { photoPath: `/photos/${req.file.filename}` }
-                : {}),
+    const contentType = req.headers["content-type"] ?? "";
+
+    if (contentType.includes("application/json")) {
+      // JSON path — device.tsx sends name as JSON, no file
+      jsonBody(req, res, async () => {
+        try {
+          const { uid } = req.user;
+          const { name } = req.body ?? {};
+          if (!name?.trim()) {
+            return res.status(400).json({ message: "name is required" });
+          }
+          await db.collection("users").updateOne(
+            { uid },
+            {
+              $set: {
+                name: name.trim(),
+                hasProfile: true,
+                updatedAt: new Date(),
+              },
             },
-          },
-          { upsert: true },
-        );
-        res.json({ success: true });
-      } catch (e) {
-        console.error("/api/users/profile POST error:", e);
-        res.status(500).json({ message: e.message });
+            { upsert: true },
+          );
+          res.json({ success: true });
+        } catch (e) {
+          console.error("/api/users/profile JSON error:", e);
+          res.status(500).json({ message: e.message });
+        }
+      });
+    } else {
+      // Multipart path — photo upload included
+      if (!upload) {
+        return res.status(503).json({
+          message: "Server still starting, try again shortly.",
+        });
       }
-    });
+      upload.single("photo")(req, res, async (err) => {
+        if (err) return res.status(500).json({ message: err.message });
+        try {
+          const { uid } = req.user;
+          const { name } = req.body ?? {};
+          if (!name?.trim()) {
+            return res.status(400).json({ message: "name is required" });
+          }
+          await db.collection("users").updateOne(
+            { uid },
+            {
+              $set: {
+                name: name.trim(),
+                hasProfile: true,
+                updatedAt: new Date(),
+                ...(req.file
+                  ? { photoPath: `/photos/${req.file.filename}` }
+                  : {}),
+              },
+            },
+            { upsert: true },
+          );
+          res.json({ success: true });
+        } catch (e) {
+          console.error("/api/users/profile multipart error:", e);
+          res.status(500).json({ message: e.message });
+        }
+      });
+    }
   });
 
-  // ── GET /api/users/profile ─────────────────────────────────────
+  // ── GET /api/users/profile ───────────────────────────────────────────────
   app.get("/api/users/profile", verifyFirebaseToken, async (req, res) => {
     try {
       const user = await db.collection("users").findOne(
@@ -196,14 +238,42 @@ function registerRoutes() {
           },
         },
       );
-      if (!user) return res.status(404).json({ message: "Profile not found" });
+      if (!user) {
+        return res.status(404).json({ message: "Profile not found" });
+      }
       res.json(user);
     } catch (e) {
       res.status(500).json({ message: e.message });
     }
   });
 
-  // ── GET /photos/:filename ──────────────────────────────────────
+  // ── GET /api/users/search?q=name ────────────────────────────────────────
+  app.get("/api/users/search", verifyFirebaseToken, async (req, res) => {
+    try {
+      const q = (req.query.q ?? "").toString().trim();
+      if (!q || q.length < 2) {
+        return res.status(400).json({ message: "Query too short" });
+      }
+      const users = await db
+        .collection("users")
+        .find(
+          {
+            name: { $regex: q, $options: "i" },
+            uid: { $ne: req.user.uid },
+          },
+          {
+            projection: { _id: 0, uid: 1, name: 1, photoPath: 1 },
+            limit: 20,
+          },
+        )
+        .toArray();
+      res.json(users);
+    } catch (e) {
+      res.status(500).json({ message: e.message });
+    }
+  });
+
+  // ── GET /photos/:filename ────────────────────────────────────────────────
   app.get("/photos/:filename", async (req, res) => {
     try {
       const files = await db
@@ -217,21 +287,29 @@ function registerRoutes() {
     }
   });
 
-  // ── Feature routes ─────────────────────────────────────────────
+  // ── Google Drive video feed ──────────────────────────────────────────────
+  app.use("/api/videos/drive", verifyFirebaseToken, driveVideoRoutes);
+
+  // ── YouTube RSS video feed ───────────────────────────────────────────────
   app.use("/api/videos", videoRoutes);
+
+  // ── Discord community channels ───────────────────────────────────────────
   app.use("/api/discord", discordRoutes);
+
+  // ── News feed ────────────────────────────────────────────────────────────
   app.use("/api/news", newsRoutes);
 
-  // keyRoutes is already the Express router (destructured above)
+  // ── E2E public key server ────────────────────────────────────────────────
   app.use("/api/keys", verifyFirebaseToken, keyRoutes);
 
-  // mediaRoutes exports module.exports = router directly
+  // ── Google Drive encrypted media proxy ──────────────────────────────────
   app.use("/api/media", verifyFirebaseToken, mediaRoutes);
 
-  // 404
+  // ── 404 catch-all ────────────────────────────────────────────────────────
   app.use((_req, res) => res.status(404).json({ message: "Not found" }));
 }
 
+// ── Boot ─────────────────────────────────────────────────────────────────────
 connectDB().catch((err) => {
   console.error("❌ MongoDB connection failed:", err.message);
   process.exit(1);
