@@ -10,17 +10,20 @@ import asyncio
 import hashlib
 import json
 
+# Load environment variables
 load_dotenv()
 
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 if not COHERE_API_KEY:
     raise RuntimeError("COHERE_API_KEY is not set")
 
+# Initialize Cohere V2 client
 co = cohere.ClientV2(api_key=COHERE_API_KEY)
 
-# ⚡ Faster model
-MODEL = "command-r"
+# Use latest supported model
+MODEL = "command-r-plus-08-2024"
 
+# System prompt for AI
 SYSTEM_PROMPT = (
     "You are YPN AI, a warm and helpful assistant for Team YPN — "
     "a youth empowerment network based in Zimbabwe. "
@@ -28,14 +31,16 @@ SYSTEM_PROMPT = (
     "Avoid long explanations unless asked."
 )
 
-# 🧠 Sessions memory
+# In-memory sessions: { session_id: [ {role, content} ] }
 sessions: dict = {}
 
-# ⚡ Simple cache
+# Simple in-memory cache for repeated questions
 cache: dict = {}
 
+# FastAPI app
 app = FastAPI()
 
+# Allow all CORS (for frontend)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -44,16 +49,18 @@ app.add_middleware(
 )
 
 
+# Request model
 class ChatRequest(BaseModel):
     message: str
     session_id: str = "default"
 
 
-# 🔥 Helpers
+# Helper: trim history to last n turns
 def trim_history(history, limit=6):
     return history[-limit:]
 
 
+# Helper: build messages for Cohere
 def build_messages(history, message):
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     msgs.extend(history)
@@ -61,27 +68,30 @@ def build_messages(history, message):
     return msgs
 
 
+# Helper: cache key generator
 def cache_key(session_id, message, history):
     raw = session_id + message + json.dumps(history)
     return hashlib.md5(raw.encode()).hexdigest()
 
 
-# 🚀 Health
+# ------------------- Endpoints -------------------
+
 @app.get("/")
 async def root():
     return {"status": "⚡ YPN AI FAST MODE"}
+
 
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
         "model": MODEL,
-        "sessions": len(sessions),
+        "active_sessions": len(sessions),
         "cache_size": len(cache),
     }
 
 
-# ⚡ NORMAL CHAT (optimized)
+# Normal chat endpoint (JSON)
 @app.post("/chat")
 async def chat(req: ChatRequest):
     message = req.message.strip()
@@ -97,7 +107,7 @@ async def chat(req: ChatRequest):
 
     key = cache_key(session_id, message, history)
 
-    # ⚡ cache hit
+    # Return cached reply if available
     if key in cache:
         return {"reply": cache[key], "cached": True}
 
@@ -106,18 +116,17 @@ async def chat(req: ChatRequest):
             model=MODEL,
             messages=build_messages(history, message),
             temperature=0.7,
-            max_tokens=200,  # ⚡ reduced
+            max_tokens=200,  # limit for faster responses
         )
 
         reply = response.message.content[0].text.strip()
 
-        # save
+        # Save session
         sessions[session_id].append({"role": "user", "content": message})
         sessions[session_id].append({"role": "assistant", "content": reply})
+        sessions[session_id] = sessions[session_id][-20:]  # keep last 20 turns
 
-        # trim session
-        sessions[session_id] = sessions[session_id][-20:]
-
+        # Cache result
         cache[key] = reply
 
         return {"reply": reply, "cached": False}
@@ -126,7 +135,7 @@ async def chat(req: ChatRequest):
         raise HTTPException(500, str(e))
 
 
-# 🚀🔥 STREAMING CHAT (ChatGPT-like)
+# Streaming chat endpoint (ChatGPT-like)
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
     message = req.message.strip()
@@ -152,16 +161,15 @@ async def chat_stream(req: ChatRequest):
             )
 
             for event in stream:
+                # Cohere V2 streaming event
                 if event.type == "content-delta":
                     chunk = event.delta.message.content.text
                     if chunk:
                         full_text += chunk
                         yield chunk
+                        await asyncio.sleep(0.01)  # smooth typing effect
 
-                        # tiny delay for smoother UX
-                        await asyncio.sleep(0.01)
-
-            # save after stream ends
+            # Save session after streaming ends
             sessions[session_id].append({"role": "user", "content": message})
             sessions[session_id].append({"role": "assistant", "content": full_text})
             sessions[session_id] = sessions[session_id][-20:]
@@ -172,27 +180,31 @@ async def chat_stream(req: ChatRequest):
     return StreamingResponse(generate(), media_type="text/plain")
 
 
-# 🧹 Clear session
+# Clear session
 @app.delete("/chat/{session_id}")
-async def clear(session_id: str):
+async def clear_session(session_id: str):
     sessions.pop(session_id, None)
     return {"cleared": session_id}
 
 
-# 🧹 Auto cache cleanup
-async def cleanup():
+# ------------------- Background Tasks -------------------
+
+# Periodic cache cleanup
+async def cleanup_cache():
     while True:
-        await asyncio.sleep(600)  # every 10 min
+        await asyncio.sleep(600)  # every 10 minutes
         cache.clear()
         print("🧹 Cache cleared")
 
+
 @app.on_event("startup")
-async def startup():
-    asyncio.create_task(cleanup())
+async def startup_event():
+    asyncio.create_task(cleanup_cache())
 
 
-# 🚀 Run
+# ------------------- Run -------------------
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 10000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")s
