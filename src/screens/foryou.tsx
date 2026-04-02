@@ -1,11 +1,13 @@
 // src/screens/foryou.tsx
 import { Ionicons } from "@expo/vector-icons";
+import { useFocusEffect } from "@react-navigation/native";
 import { Audio, AVPlaybackStatus } from "expo-av";
 import { Directory, File } from "expo-file-system/next";
 import { Video } from "expo-video";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Animated,
   Dimensions,
   FlatList,
   GestureResponderEvent,
@@ -86,9 +88,7 @@ function getFilePath(id: string): File {
 
 async function ensureDir() {
   const dir = getLocalDir();
-  if (!dir.exists) {
-    dir.create();
-  }
+  if (!dir.exists) dir.create();
 }
 
 function readLP(id: string): string | null {
@@ -102,8 +102,7 @@ function saveLP(id: string, path: string) {
 async function isFileCached(id: string): Promise<boolean> {
   const p = readLP(id);
   if (!p) return false;
-  const f = new File(p);
-  return f.exists;
+  return new File(p).exists;
 }
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -219,11 +218,13 @@ const VideoCard = React.memo(
   ({
     item,
     isActive,
+    isFocused,
     authHeaders,
     bottomOffset,
   }: {
     item: DriveVideo;
     isActive: boolean;
+    isFocused: boolean;
     authHeaders: Record<string, string>;
     bottomOffset: number;
   }) => {
@@ -235,6 +236,10 @@ const VideoCard = React.memo(
     const [dur, setDur] = useState(0);
     const [localPath, setLocalPath] = useState<string | null>(null);
 
+    // Animated opacity for the play/pause icon — fades out after tap
+    const iconOpacity = useRef(new Animated.Value(0)).current;
+    const fadeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
     // Check local cache once on mount
     useEffect(() => {
       isFileCached(item.fileId).then((ok) => {
@@ -242,9 +247,27 @@ const VideoCard = React.memo(
       });
     }, [item.fileId]);
 
-    // Auto-play / pause / rewind based on visibility
+    // Pause instantly when tab loses focus (navigating away)
+    // Resume when tab regains focus and card is active
     useEffect(() => {
       if (!ref.current) return;
+      if (!isFocused) {
+        // navigated away — pause immediately, no reset
+        ref.current.pauseAsync?.().catch(() => {});
+        setPaused(true);
+        return;
+      }
+      // tab is focused again
+      if (isActive) {
+        ref.current.playAsync?.().catch(() => {});
+        setPaused(false);
+      }
+    }, [isFocused]);
+
+    // Handle card becoming active/inactive within the feed
+    useEffect(() => {
+      if (!ref.current) return;
+      if (!isFocused) return; // don't fight with the focus effect above
       if (isActive) {
         setPaused(false);
         ref.current.playAsync?.().catch(() => {});
@@ -258,6 +281,19 @@ const VideoCard = React.memo(
       }
     }, [isActive]);
 
+    // Show icon briefly then fade out
+    const flashIcon = useCallback(() => {
+      if (fadeTimer.current) clearTimeout(fadeTimer.current);
+      iconOpacity.setValue(1);
+      fadeTimer.current = setTimeout(() => {
+        Animated.timing(iconOpacity, {
+          toValue: 0,
+          duration: 400,
+          useNativeDriver: true,
+        }).start();
+      }, 600);
+    }, [iconOpacity]);
+
     const togglePlay = useCallback(() => {
       if (!ref.current) return;
       if (paused) {
@@ -267,7 +303,8 @@ const VideoCard = React.memo(
         ref.current.pauseAsync?.().catch(() => {});
         setPaused(true);
       }
-    }, [paused]);
+      flashIcon();
+    }, [paused, flashIcon]);
 
     const onStatus = useCallback((status: AVPlaybackStatus) => {
       if (!status.isLoaded) return;
@@ -287,6 +324,9 @@ const VideoCard = React.memo(
 
     const displayName = item.name.replace(/\.[^.]+$/, "");
 
+    // Which icon to show — pause when playing, play when paused
+    const overlayIcon = paused ? "play" : "pause";
+
     return (
       <View style={s.card}>
         <Video
@@ -294,7 +334,7 @@ const VideoCard = React.memo(
           source={source}
           style={StyleSheet.absoluteFill}
           contentFit="cover"
-          shouldPlay={isActive && !paused}
+          shouldPlay={isActive && isFocused && !paused}
           isLooping
           isMuted={false}
           onPlaybackStatusUpdate={onStatus}
@@ -322,14 +362,15 @@ const VideoCard = React.memo(
           </View>
         )}
 
-        {/* Pause icon */}
-        {paused && !loading && !hasError && (
-          <View style={s.pauseWrap} pointerEvents="none">
-            <View style={s.pauseCircle}>
-              <Ionicons name="pause" size={38} color="#fff" />
-            </View>
+        {/* Play/Pause flash icon — fades in on tap, then fades out */}
+        <Animated.View
+          style={[s.iconWrap, { opacity: iconOpacity }]}
+          pointerEvents="none"
+        >
+          <View style={s.iconCircle}>
+            <Ionicons name={overlayIcon} size={26} color="#fff" />
           </View>
-        )}
+        </Animated.View>
 
         {/* Scrim — tall enough to cover the whole HUD area */}
         <View
@@ -372,11 +413,22 @@ export default function ForYouScreen() {
   const [fetchErr, setFetchErr] = useState(false);
   const [activeIdx, setActiveIdx] = useState(0);
   const [authHeaders, setAuthHeaders] = useState<Record<string, string>>({});
+  const [isFocused, setIsFocused] = useState(true);
   const flatRef = useRef<FlatList>(null);
 
   // How far above the screen bottom the HUD sits:
   // tab bar (56) + safe area bottom inset + 8px breathing room
   const bottomOffset = TAB_BAR_BASE + insets.bottom + 8;
+
+  // Instantly pause all videos when navigating away, resume on return
+  useFocusEffect(
+    useCallback(() => {
+      setIsFocused(true);
+      return () => {
+        setIsFocused(false);
+      };
+    }, []),
+  );
 
   // Init audio + get auth headers once
   useEffect(() => {
@@ -412,9 +464,7 @@ export default function ForYouScreen() {
       const headers = await getAuthHeaders();
       setAuthHeaders(headers);
 
-      const res = await fetch(`${API_URL}/api/videos/drive/feed`, {
-        headers,
-      });
+      const res = await fetch(`${API_URL}/api/videos/drive/feed`, { headers });
 
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
@@ -457,11 +507,12 @@ export default function ForYouScreen() {
       <VideoCard
         item={item}
         isActive={index === activeIdx}
+        isFocused={isFocused}
         authHeaders={authHeaders}
         bottomOffset={bottomOffset}
       />
     ),
-    [activeIdx, authHeaders, bottomOffset],
+    [activeIdx, isFocused, authHeaders, bottomOffset],
   );
 
   if (loading) {
@@ -558,18 +609,19 @@ const s = StyleSheet.create({
   },
   retryText: { color: "#000", fontWeight: "700", fontSize: 14 },
 
-  pauseWrap: {
+  // Small centred icon that flashes on tap then fades
+  iconWrap: {
     ...StyleSheet.absoluteFillObject,
     justifyContent: "center",
     alignItems: "center",
   },
-  pauseCircle: {
-    width: 84,
-    height: 84,
-    borderRadius: 42,
-    backgroundColor: "rgba(0,0,0,0.55)",
-    borderWidth: 2,
-    borderColor: "rgba(255,255,255,0.3)",
+  iconCircle: {
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    backgroundColor: "rgba(0,0,0,0.50)",
+    borderWidth: 1.5,
+    borderColor: "rgba(255,255,255,0.25)",
     justifyContent: "center",
     alignItems: "center",
   },
