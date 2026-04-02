@@ -1,13 +1,11 @@
 // src/screens/foryou.tsx
 import { Ionicons } from "@expo/vector-icons";
-import { useFocusEffect } from "@react-navigation/native";
 import { Audio, AVPlaybackStatus } from "expo-av";
-import { Directory, File } from "expo-file-system/next";
+import * as FileSystem from "expo-file-system";
 import { Video } from "expo-video";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
-  Animated,
   Dimensions,
   FlatList,
   GestureResponderEvent,
@@ -18,8 +16,6 @@ import {
   Text,
   View,
 } from "react-native";
-import { MMKV } from "react-native-mmkv";
-import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { auth } from "../firebase/auth";
 
 // ── Config ─────────────────────────────────────────────────────────────────────
@@ -30,15 +26,12 @@ const { width: W, height: H } = Dimensions.get("window");
 const STATUS_H =
   Platform.OS === "android" ? (RNStatusBar.currentHeight ?? 24) : 0;
 
-// Tab bar base height (matches tabs/_layout.tsx: 56 + insets.bottom)
-const TAB_BAR_BASE = 56;
+// ── MMKV store — initialized at module level (not lazily) ─────────────────────
+// Creating MMKV inside a function/closure that runs during render causes
+// "Cannot read property 'prototype' of undefined" because the native module
+// hasn't fully registered yet when the lazy factory first fires.
+const store = new MMKV({ id: "ypn-drive-feed-v3" });
 
-// ── MMKV store ────────────────────────────────────────────────────────────────
-let _store: MMKV | null = null;
-const store = () => {
-  if (!_store) _store = new MMKV({ id: "ypn-drive-feed-v3" });
-  return _store;
-};
 const MK_DATA = "manifest_v3";
 const MK_TS = "manifest_ts_v3";
 const MK_LP = (id: string) => `lp_${id}`;
@@ -55,9 +48,9 @@ type DriveVideo = {
 // ── MMKV helpers ──────────────────────────────────────────────────────────────
 function l1Read(): DriveVideo[] | null {
   try {
-    const ts = store().getNumber(MK_TS);
+    const ts = store.getNumber(MK_TS);
     if (!ts || Date.now() - ts > L1_TTL_MS) return null;
-    const raw = store().getString(MK_DATA);
+    const raw = store.getString(MK_DATA);
     return raw ? (JSON.parse(raw) as DriveVideo[]) : null;
   } catch {
     return null;
@@ -66,43 +59,44 @@ function l1Read(): DriveVideo[] | null {
 
 function l1Write(data: DriveVideo[]) {
   try {
-    store().set(MK_DATA, JSON.stringify(data));
-    store().set(MK_TS, Date.now());
+    store.set(MK_DATA, JSON.stringify(data));
+    store.set(MK_TS, Date.now());
   } catch {}
 }
 
-// ── Local file cache (new expo-file-system API) ───────────────────────────────
-const LOCAL_DIR_NAME = "ypn_drive_v3";
-
-function getLocalDir(): Directory {
-  return new Directory(
-    `${require("expo-file-system/next").Paths.cache}/${LOCAL_DIR_NAME}/`,
-  );
-}
-
-function getFilePath(id: string): File {
-  return new File(
-    `${require("expo-file-system/next").Paths.cache}/${LOCAL_DIR_NAME}/${id}.mp4`,
-  );
-}
+// ── Local file cache ──────────────────────────────────────────────────────────
+const LOCAL_DIR = FileSystem.cacheDirectory + "ypn_drive_v3/";
 
 async function ensureDir() {
-  const dir = getLocalDir();
-  if (!dir.exists) dir.create();
+  const info = await FileSystem.getInfoAsync(LOCAL_DIR);
+  if (!info.exists)
+    await FileSystem.makeDirectoryAsync(LOCAL_DIR, { intermediates: true });
 }
 
+const filePath = (id: string) => LOCAL_DIR + id + ".mp4";
+
 function readLP(id: string): string | null {
-  return store().getString(MK_LP(id)) ?? null;
+  try {
+    return store.getString(MK_LP(id)) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function saveLP(id: string, path: string) {
-  store().set(MK_LP(id), path);
+  try {
+    store.set(MK_LP(id), path);
+  } catch {}
 }
 
 async function isFileCached(id: string): Promise<boolean> {
-  const p = readLP(id);
-  if (!p) return false;
-  return new File(p).exists;
+  try {
+    const p = readLP(id);
+    if (!p) return false;
+    return (await FileSystem.getInfoAsync(p)).exists;
+  } catch {
+    return false;
+  }
 }
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -121,33 +115,20 @@ const streamUrl = (id: string) => `${API_URL}/api/videos/drive/stream/${id}`;
 
 // ── Prefetch first N videos to local cache ────────────────────────────────────
 async function prefetch(videos: DriveVideo[]) {
-  await ensureDir();
-  for (const v of videos.slice(0, PREFETCH_COUNT)) {
-    try {
-      if (await isFileCached(v.fileId)) continue;
-      const destFile = getFilePath(v.fileId);
-      const headers = await getAuthHeaders();
-      const response = await fetch(streamUrl(v.fileId), { headers });
-      if (response.ok) {
-        const blob = await response.blob();
-        const reader = new FileReader();
-        await new Promise<void>((resolve, reject) => {
-          reader.onloadend = () => {
-            try {
-              const base64 = (reader.result as string).split(",")[1];
-              destFile.write(base64);
-              saveLP(v.fileId, destFile.uri);
-              resolve();
-            } catch (e) {
-              reject(e);
-            }
-          };
-          reader.onerror = reject;
-          reader.readAsDataURL(blob);
+  try {
+    await ensureDir();
+    for (const v of videos.slice(0, PREFETCH_COUNT)) {
+      try {
+        if (await isFileCached(v.fileId)) continue;
+        const dest = filePath(v.fileId);
+        const headers = await getAuthHeaders();
+        const dl = await FileSystem.downloadAsync(streamUrl(v.fileId), dest, {
+          headers,
         });
-      }
-    } catch {}
-  }
+        if (dl.status === 200) saveLP(v.fileId, dest);
+      } catch {}
+    }
+  } catch {}
 }
 
 // ── Time formatter ────────────────────────────────────────────────────────────
@@ -218,15 +199,11 @@ const VideoCard = React.memo(
   ({
     item,
     isActive,
-    isFocused,
     authHeaders,
-    bottomOffset,
   }: {
     item: DriveVideo;
     isActive: boolean;
-    isFocused: boolean;
     authHeaders: Record<string, string>;
-    bottomOffset: number;
   }) => {
     const ref = useRef<Video>(null);
     const [paused, setPaused] = useState(false);
@@ -236,38 +213,22 @@ const VideoCard = React.memo(
     const [dur, setDur] = useState(0);
     const [localPath, setLocalPath] = useState<string | null>(null);
 
-    // Animated opacity for the play/pause icon — fades out after tap
-    const iconOpacity = useRef(new Animated.Value(0)).current;
-    const fadeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-    // Check local cache once on mount
+    // Check local cache once on mount — wrapped in try/catch to be safe
     useEffect(() => {
-      isFileCached(item.fileId).then((ok) => {
-        if (ok) setLocalPath(readLP(item.fileId));
-      });
+      let cancelled = false;
+      isFileCached(item.fileId)
+        .then((ok) => {
+          if (!cancelled && ok) setLocalPath(readLP(item.fileId));
+        })
+        .catch(() => {});
+      return () => {
+        cancelled = true;
+      };
     }, [item.fileId]);
 
-    // Pause instantly when tab loses focus (navigating away)
-    // Resume when tab regains focus and card is active
+    // Auto-play / pause / rewind based on visibility
     useEffect(() => {
       if (!ref.current) return;
-      if (!isFocused) {
-        // navigated away — pause immediately, no reset
-        ref.current.pauseAsync?.().catch(() => {});
-        setPaused(true);
-        return;
-      }
-      // tab is focused again
-      if (isActive) {
-        ref.current.playAsync?.().catch(() => {});
-        setPaused(false);
-      }
-    }, [isFocused]);
-
-    // Handle card becoming active/inactive within the feed
-    useEffect(() => {
-      if (!ref.current) return;
-      if (!isFocused) return; // don't fight with the focus effect above
       if (isActive) {
         setPaused(false);
         ref.current.playAsync?.().catch(() => {});
@@ -281,19 +242,6 @@ const VideoCard = React.memo(
       }
     }, [isActive]);
 
-    // Show icon briefly then fade out
-    const flashIcon = useCallback(() => {
-      if (fadeTimer.current) clearTimeout(fadeTimer.current);
-      iconOpacity.setValue(1);
-      fadeTimer.current = setTimeout(() => {
-        Animated.timing(iconOpacity, {
-          toValue: 0,
-          duration: 400,
-          useNativeDriver: true,
-        }).start();
-      }, 600);
-    }, [iconOpacity]);
-
     const togglePlay = useCallback(() => {
       if (!ref.current) return;
       if (paused) {
@@ -303,8 +251,7 @@ const VideoCard = React.memo(
         ref.current.pauseAsync?.().catch(() => {});
         setPaused(true);
       }
-      flashIcon();
-    }, [paused, flashIcon]);
+    }, [paused]);
 
     const onStatus = useCallback((status: AVPlaybackStatus) => {
       if (!status.isLoaded) return;
@@ -324,9 +271,6 @@ const VideoCard = React.memo(
 
     const displayName = item.name.replace(/\.[^.]+$/, "");
 
-    // Which icon to show — pause when playing, play when paused
-    const overlayIcon = paused ? "play" : "pause";
-
     return (
       <View style={s.card}>
         <Video
@@ -334,7 +278,7 @@ const VideoCard = React.memo(
           source={source}
           style={StyleSheet.absoluteFill}
           contentFit="cover"
-          shouldPlay={isActive && isFocused && !paused}
+          shouldPlay={isActive && !paused}
           isLooping
           isMuted={false}
           onPlaybackStatusUpdate={onStatus}
@@ -362,27 +306,18 @@ const VideoCard = React.memo(
           </View>
         )}
 
-        {/* Play/Pause flash icon — fades in on tap, then fades out */}
-        <Animated.View
-          style={[s.iconWrap, { opacity: iconOpacity }]}
-          pointerEvents="none"
-        >
-          <View style={s.iconCircle}>
-            <Ionicons name={overlayIcon} size={26} color="#fff" />
+        {/* Pause icon */}
+        {paused && !loading && !hasError && (
+          <View style={s.pauseWrap} pointerEvents="none">
+            <View style={s.pauseCircle}>
+              <Ionicons name="pause" size={38} color="#fff" />
+            </View>
           </View>
-        </Animated.View>
+        )}
 
-        {/* Scrim — tall enough to cover the whole HUD area */}
-        <View
-          style={[s.scrim, { height: 160 + bottomOffset }]}
-          pointerEvents="none"
-        />
-
-        {/* HUD — progress bar sits just above the tab bar */}
-        <View
-          style={[s.hud, { bottom: bottomOffset + 12 }]}
-          pointerEvents="box-none"
-        >
+        {/* Scrim + HUD */}
+        <View style={s.scrim} pointerEvents="none" />
+        <View style={s.hud} pointerEvents="box-none">
           <Text style={s.title} numberOfLines={2}>
             {displayName}
           </Text>
@@ -406,29 +341,13 @@ const VideoCard = React.memo(
 
 // ── Main screen ───────────────────────────────────────────────────────────────
 export default function ForYouScreen() {
-  const insets = useSafeAreaInsets();
   const [videos, setVideos] = useState<DriveVideo[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [fetchErr, setFetchErr] = useState(false);
   const [activeIdx, setActiveIdx] = useState(0);
   const [authHeaders, setAuthHeaders] = useState<Record<string, string>>({});
-  const [isFocused, setIsFocused] = useState(true);
   const flatRef = useRef<FlatList>(null);
-
-  // How far above the screen bottom the HUD sits:
-  // tab bar (56) + safe area bottom inset + 8px breathing room
-  const bottomOffset = TAB_BAR_BASE + insets.bottom + 8;
-
-  // Instantly pause all videos when navigating away, resume on return
-  useFocusEffect(
-    useCallback(() => {
-      setIsFocused(true);
-      return () => {
-        setIsFocused(false);
-      };
-    }, []),
-  );
 
   // Init audio + get auth headers once
   useEffect(() => {
@@ -507,12 +426,10 @@ export default function ForYouScreen() {
       <VideoCard
         item={item}
         isActive={index === activeIdx}
-        isFocused={isFocused}
         authHeaders={authHeaders}
-        bottomOffset={bottomOffset}
       />
     ),
-    [activeIdx, isFocused, authHeaders, bottomOffset],
+    [activeIdx, authHeaders],
   );
 
   if (loading) {
@@ -609,38 +526,38 @@ const s = StyleSheet.create({
   },
   retryText: { color: "#000", fontWeight: "700", fontSize: 14 },
 
-  // Small centred icon that flashes on tap then fades
-  iconWrap: {
+  pauseWrap: {
     ...StyleSheet.absoluteFillObject,
     justifyContent: "center",
     alignItems: "center",
   },
-  iconCircle: {
-    width: 52,
-    height: 52,
-    borderRadius: 26,
-    backgroundColor: "rgba(0,0,0,0.50)",
-    borderWidth: 1.5,
-    borderColor: "rgba(255,255,255,0.25)",
+  pauseCircle: {
+    width: 84,
+    height: 84,
+    borderRadius: 42,
+    backgroundColor: "rgba(0,0,0,0.55)",
+    borderWidth: 2,
+    borderColor: "rgba(255,255,255,0.3)",
     justifyContent: "center",
     alignItems: "center",
   },
 
-  // height is set inline per-card via bottomOffset
   scrim: {
     position: "absolute",
     left: 0,
     right: 0,
     bottom: 0,
+    height: 160,
     backgroundColor: "rgba(0,0,0,0.55)",
   },
 
-  // bottom is set inline per-card via bottomOffset
   hud: {
     position: "absolute",
     left: 0,
     right: 0,
+    bottom: 0,
     paddingHorizontal: 16,
+    paddingBottom: 22,
   },
 
   title: {
