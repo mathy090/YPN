@@ -1,17 +1,16 @@
 // app/chat.tsx
 import { useLocalSearchParams } from "expo-router";
 import React from "react";
+import { Text, View } from "react-native"; // ✅ Added missing imports
 import TeamYPNScreen from "../src/screens/TeamYPN";
 
 export default function ChatScreen() {
   const { roomId } = useLocalSearchParams<{ roomId?: string }>();
 
-  // Only handle Team YPN for now (roomId = 'team-ypn')
   if (roomId === "team-ypn") {
     return <TeamYPNScreen />;
   }
 
-  // Future: Handle user chats and groups here
   return (
     <View
       style={{

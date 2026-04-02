@@ -1,6 +1,7 @@
 // src/screens/discord.tsx
 import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import NetInfo from "@react-native-community/netinfo";
 import {
   addDoc,
   collection,
@@ -25,7 +26,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
-  View
+  View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { auth } from "../firebase/auth";
@@ -39,9 +40,7 @@ const AI_URL = process.env.EXPO_PUBLIC_AI_URL
 const ADMIN_EMAIL = "admin@ypn.co.zw";
 const TAB_BAR_H = Platform.OS === "ios" ? 90 : 72;
 
-// ── MMKV — module level, never inside a function or closure ───────────────────
-const mmkv = new MMKV({ id: "ypn-discord-v5" });
-
+// ── AsyncStorage keys ─────────────────────────────────────────────────────────
 const L1_KEY = (id: string) => `discord_l1_${id}`;
 const L2_KEY = (id: string) => `discord_l2_${id}`;
 const LAST_MSG_KEY = (id: string) => `discord_last_${id}`;
@@ -68,13 +67,9 @@ type Channel = {
   order?: number;
 };
 
-type LastMessage = {
-  text: string;
-  time: number;
-  unread: number;
-};
+type LastMessage = { text: string; time: number; unread: number };
 
-// ── Default channels (fallback) ───────────────────────────────────────────────
+// ── Default channels ──────────────────────────────────────────────────────────
 const DEFAULT_CHANNELS: Channel[] = [
   {
     id: "general",
@@ -136,19 +131,15 @@ const AI_CHANNEL: Channel = {
   order: 0,
 };
 
-// ── Cache helpers ─────────────────────────────────────────────────────────────
+// ── AsyncStorage cache helpers ────────────────────────────────────────────────
 async function readCache(channelId: string): Promise<Message[] | null> {
   try {
-    const raw = mmkv.getString(L1_KEY(channelId));
+    const raw = await AsyncStorage.getItem(L1_KEY(channelId));
     if (raw) return JSON.parse(raw);
   } catch {}
   try {
     const raw = await AsyncStorage.getItem(L2_KEY(channelId));
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      mmkv.set(L1_KEY(channelId), raw);
-      return parsed;
-    }
+    if (raw) return JSON.parse(raw);
   } catch {}
   return null;
 }
@@ -156,22 +147,22 @@ async function readCache(channelId: string): Promise<Message[] | null> {
 async function writeCache(channelId: string, messages: Message[]) {
   const raw = JSON.stringify(messages.slice(-80));
   try {
-    mmkv.set(L1_KEY(channelId), raw);
+    await AsyncStorage.setItem(L1_KEY(channelId), raw);
   } catch {}
   try {
     await AsyncStorage.setItem(L2_KEY(channelId), raw);
   } catch {}
 }
 
-function saveLastMessage(channelId: string, lm: LastMessage) {
+async function saveLastMessage(channelId: string, lm: LastMessage) {
   try {
-    mmkv.set(LAST_MSG_KEY(channelId), JSON.stringify(lm));
+    await AsyncStorage.setItem(LAST_MSG_KEY(channelId), JSON.stringify(lm));
   } catch {}
 }
 
-function readLastMessage(channelId: string): LastMessage | null {
+async function readLastMessage(channelId: string): Promise<LastMessage | null> {
   try {
-    const raw = mmkv.getString(LAST_MSG_KEY(channelId));
+    const raw = await AsyncStorage.getItem(LAST_MSG_KEY(channelId));
     return raw ? JSON.parse(raw) : null;
   } catch {
     return null;
@@ -207,14 +198,20 @@ function ChannelListScreen({ onOpen }: { onOpen: (ch: Channel) => void }) {
     {},
   );
   const [bannerVisible, setBannerVisible] = useState(true);
+  const [isOffline, setIsOffline] = useState(false);
   const bannerAnim = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
+    const unsub = NetInfo.addEventListener((state) =>
+      setIsOffline(!state.isConnected),
+    );
     fetchChannels();
     loadLastMessages();
+    return () => unsub();
   }, []);
 
   async function fetchChannels() {
+    if (isOffline) return;
     try {
       const res = await fetch(`${API_URL}/api/discord/channels`);
       if (!res.ok) throw new Error("Failed");
@@ -225,10 +222,10 @@ function ChannelListScreen({ onOpen }: { onOpen: (ch: Channel) => void }) {
     }
   }
 
-  function loadLastMessages() {
+  async function loadLastMessages() {
     const map: Record<string, LastMessage> = {};
     for (const ch of [AI_CHANNEL, ...DEFAULT_CHANNELS]) {
-      const lm = readLastMessage(ch.id);
+      const lm = await readLastMessage(ch.id);
       if (lm) map[ch.id] = lm;
     }
     setLastMessages(map);
@@ -288,15 +285,12 @@ function ChannelListScreen({ onOpen }: { onOpen: (ch: Channel) => void }) {
 
   return (
     <View style={ls.root}>
-      {/* Header */}
       <View style={[ls.header, { paddingTop: insets.top + 8 }]}>
         <Text style={ls.headerTitle}>Community</Text>
         <TouchableOpacity style={ls.headerBtn} onPress={fetchChannels}>
           <Ionicons name="refresh-outline" size={20} color="#B3B3B3" />
         </TouchableOpacity>
       </View>
-
-      {/* Banner */}
       {bannerVisible && (
         <Animated.View style={[ls.banner, { opacity: bannerAnim }]}>
           <TouchableOpacity
@@ -330,9 +324,7 @@ function ChannelListScreen({ onOpen }: { onOpen: (ch: Channel) => void }) {
             </View>
             <Ionicons name="chevron-forward" size={16} color="#555" />
           </TouchableOpacity>
-
           <View style={ls.bannerDivider} />
-
           <TouchableOpacity
             style={ls.bannerRow}
             activeOpacity={0.8}
@@ -364,14 +356,11 @@ function ChannelListScreen({ onOpen }: { onOpen: (ch: Channel) => void }) {
             </View>
             <Ionicons name="chevron-forward" size={16} color="#555" />
           </TouchableOpacity>
-
           <TouchableOpacity style={ls.bannerDismiss} onPress={dismissBanner}>
             <Ionicons name="close" size={14} color="#555" />
           </TouchableOpacity>
         </Animated.View>
       )}
-
-      {/* List */}
       <FlatList
         data={[AI_CHANNEL, ...channels]}
         keyExtractor={(ch) => ch.id}
@@ -381,6 +370,12 @@ function ChannelListScreen({ onOpen }: { onOpen: (ch: Channel) => void }) {
         ItemSeparatorComponent={() => <View style={ls.separator} />}
         ListHeaderComponent={<Text style={ls.sectionLabel}>CHANNELS</Text>}
       />
+      {isOffline && (
+        <View style={ls.offlineBanner}>
+          <Ionicons name="wifi-off-outline" size={14} color="#fff" />
+          <Text style={ls.offlineText}>Offline • Cached channels only</Text>
+        </View>
+      )}
     </View>
   );
 }
@@ -403,6 +398,7 @@ function ChatScreen({
   const [sending, setSending] = useState(false);
   const [aiTyping, setAiTyping] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [isOffline, setIsOffline] = useState(false);
   const listRef = useRef<FlatList>(null);
   const me = auth.currentUser;
   const statusBarH =
@@ -413,9 +409,15 @@ function ChatScreen({
   }, []);
 
   useEffect(() => {
+    const unsub = NetInfo.addEventListener((state) =>
+      setIsOffline(!state.isConnected),
+    );
+    return () => unsub();
+  }, []);
+
+  useEffect(() => {
     setLoading(true);
     setMessages([]);
-
     readCache(channel.id).then((cached) => {
       if (cached?.length) {
         setMessages(cached);
@@ -423,8 +425,11 @@ function ChatScreen({
         scrollToBottom();
       }
     });
-
     if (channel.isAI) {
+      setLoading(false);
+      return;
+    }
+    if (isOffline) {
       setLoading(false);
       return;
     }
@@ -434,7 +439,6 @@ function ChatScreen({
       orderBy("createdAt", "asc"),
       limit(80),
     );
-
     const unsub = onSnapshot(
       q,
       (snap) => {
@@ -466,16 +470,27 @@ function ChatScreen({
       },
       () => setLoading(false),
     );
-
     return () => unsub();
-  }, [channel.id]);
+  }, [channel.id, isOffline]);
 
-  // ── Send to AI ──────────────────────────────────────────────────────────
   const sendToAI = useCallback(
     async (text: string) => {
       if (!text.trim() || sending) return;
+      if (isOffline) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `err_${Date.now()}`,
+            text: "No internet connection. Please check your network.",
+            uid: "ypn-ai",
+            displayName: "YPN AI",
+            createdAt: Date.now(),
+            isAI: true,
+          },
+        ]);
+        return;
+      }
       setSending(true);
-
       const userMsg: Message = {
         id: `local_${Date.now()}`,
         text,
@@ -483,7 +498,6 @@ function ChatScreen({
         displayName: me?.displayName ?? "You",
         createdAt: Date.now(),
       };
-
       setMessages((prev) => {
         const next = [...prev, userMsg];
         writeCache(channel.id, next);
@@ -495,7 +509,6 @@ function ChatScreen({
       setInput("");
       setAiTyping(true);
       scrollToBottom();
-
       try {
         const res = await fetch(AI_URL, {
           method: "POST",
@@ -507,7 +520,6 @@ function ChatScreen({
         });
         const data = await res.json();
         const reply = data.reply ?? data.message ?? "I'm here to help!";
-
         const aiMsg: Message = {
           id: `ai_${Date.now()}`,
           text: reply,
@@ -542,16 +554,28 @@ function ChatScreen({
         scrollToBottom();
       }
     },
-    [sending, me, channel.id],
+    [sending, me, channel.id, isOffline],
   );
 
-  // ── Send to Firestore ───────────────────────────────────────────────────
   const sendToFirestore = useCallback(
     async (text: string) => {
-      if (!text.trim() || !me || sending) return;
+      if (!text.trim() || !me || sending || isOffline) {
+        if (isOffline)
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `err_${Date.now()}`,
+              text: "No internet connection.",
+              uid: me?.uid ?? "user",
+              displayName: me?.displayName ?? "You",
+              createdAt: Date.now(),
+              failed: true,
+            },
+          ]);
+        return;
+      }
       setSending(true);
       setInput("");
-
       const oid = `local_${Date.now()}`;
       setMessages((prev) => [
         ...prev,
@@ -565,7 +589,6 @@ function ChatScreen({
         },
       ]);
       scrollToBottom();
-
       try {
         await addDoc(collection(db, "channels", channel.id, "messages"), {
           text,
@@ -585,7 +608,7 @@ function ChatScreen({
         setSending(false);
       }
     },
-    [sending, me, channel.id],
+    [sending, me, channel.id, isOffline],
   );
 
   const handleSend = useCallback(() => {
@@ -594,7 +617,6 @@ function ChatScreen({
     channel.isAI ? sendToAI(text) : sendToFirestore(text);
   }, [input, channel.isAI, sendToAI, sendToFirestore]);
 
-  // ── Render message ──────────────────────────────────────────────────────
   const renderMessage = useCallback(
     ({ item }: { item: Message }) => {
       const isMe = item.uid === me?.uid;
@@ -603,7 +625,6 @@ function ChatScreen({
         hour: "2-digit",
         minute: "2-digit",
       });
-
       return (
         <View style={[cs.msgRow, isMe && !isAI && cs.msgRowMe]}>
           {!isMe && (
@@ -683,7 +704,6 @@ function ChatScreen({
 
   return (
     <View style={cs.root}>
-      {/* Header */}
       <View
         style={[
           cs.header,
@@ -725,7 +745,6 @@ function ChatScreen({
           </Text>
         </View>
       </View>
-
       <KeyboardAvoidingView
         style={{ flex: 1 }}
         behavior={Platform.OS === "ios" ? "padding" : "height"}
@@ -780,8 +799,6 @@ function ChatScreen({
             }
           />
         )}
-
-        {/* Input bar */}
         <View
           style={[
             cs.inputBar,
@@ -813,12 +830,12 @@ function ChatScreen({
             />
             <TouchableOpacity
               onPress={handleSend}
-              disabled={!input.trim() || sending || !me}
+              disabled={!input.trim() || sending || !me || isOffline}
               style={[
                 cs.sendBtn,
                 {
                   backgroundColor:
-                    !input.trim() || !me ? "#222" : channel.color,
+                    !input.trim() || !me || isOffline ? "#222" : channel.color,
                 },
               ]}
               activeOpacity={0.8}
@@ -838,6 +855,11 @@ function ChatScreen({
               )}
             </TouchableOpacity>
           </View>
+          {isOffline && (
+            <Text style={cs.offlineHint}>
+              ⚠️ Offline — messages won't send until reconnected
+            </Text>
+          )}
         </View>
       </KeyboardAvoidingView>
     </View>
@@ -849,8 +871,7 @@ function ChatScreen({
 // ══════════════════════════════════════════════════════════════════════════════
 export default function DiscordScreen() {
   const [activeChannel, setActiveChannel] = useState<Channel | null>(null);
-
-  if (activeChannel) {
+  if (activeChannel)
     return (
       <ChatScreen
         channel={activeChannel}
@@ -858,16 +879,14 @@ export default function DiscordScreen() {
         onNewMessage={() => {}}
       />
     );
-  }
   return <ChannelListScreen onOpen={setActiveChannel} />;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// STYLES
+// STYLES (added offline banners/hints)
 // ══════════════════════════════════════════════════════════════════════════════
 const ls = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#0D0D0D" },
-
   header: {
     flexDirection: "row",
     alignItems: "center",
@@ -892,7 +911,6 @@ const ls = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
   },
-
   banner: {
     margin: 12,
     marginBottom: 4,
@@ -932,7 +950,6 @@ const ls = StyleSheet.create({
     marginHorizontal: 14,
   },
   bannerDismiss: { position: "absolute", top: 8, right: 8, padding: 4 },
-
   sectionLabel: {
     color: "#444",
     fontSize: 10,
@@ -942,7 +959,6 @@ const ls = StyleSheet.create({
     paddingTop: 16,
     paddingBottom: 6,
   },
-
   row: {
     flexDirection: "row",
     alignItems: "center",
@@ -973,7 +989,6 @@ const ls = StyleSheet.create({
     borderWidth: 2,
     borderColor: "#0D0D0D",
   },
-
   textBlock: { flex: 1, minWidth: 0 },
   topRow: {
     flexDirection: "row",
@@ -1010,11 +1025,23 @@ const ls = StyleSheet.create({
     backgroundColor: "#1A1A1A",
     marginLeft: 80,
   },
+  offlineBanner: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: "#333",
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 16,
+    paddingVertical: 6,
+    gap: 6,
+  },
+  offlineText: { color: "#fff", fontSize: 11, fontWeight: "500" },
 });
 
 const cs = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#0D0D0D" },
-
   header: {
     flexDirection: "row",
     alignItems: "center",
@@ -1058,7 +1085,6 @@ const cs = StyleSheet.create({
   headerMid: { flex: 1 },
   headerTitle: { color: "#fff", fontSize: 15, fontWeight: "700" },
   headerSub: { color: "#666", fontSize: 11, marginTop: 1 },
-
   centre: { flex: 1, justifyContent: "center", alignItems: "center" },
   emptyWrap: { alignItems: "center", padding: 32, gap: 10, marginTop: 60 },
   emptyTitle: { color: "#fff", fontSize: 18, fontWeight: "700", marginTop: 4 },
@@ -1068,7 +1094,6 @@ const cs = StyleSheet.create({
     textAlign: "center",
     lineHeight: 20,
   },
-
   msgRow: {
     flexDirection: "row",
     marginVertical: 2,
@@ -1087,7 +1112,6 @@ const cs = StyleSheet.create({
     marginBottom: 2,
     flexShrink: 0,
   },
-
   bubble: {
     maxWidth: "78%",
     paddingHorizontal: 11,
@@ -1098,7 +1122,6 @@ const cs = StyleSheet.create({
   bubbleThem: { backgroundColor: "#1A1A1A", borderBottomLeftRadius: 4 },
   bubblePending: { opacity: 0.5 },
   bubbleFailed: { borderWidth: 1, borderColor: "#FF453A" },
-
   senderName: { fontSize: 10, fontWeight: "700", marginBottom: 2 },
   msgText: { color: "#E0E0E0", fontSize: 14, lineHeight: 20 },
   typingText: {
@@ -1107,7 +1130,6 @@ const cs = StyleSheet.create({
     fontStyle: "italic",
     padding: 4,
   },
-
   msgMeta: {
     flexDirection: "row",
     alignItems: "center",
@@ -1116,7 +1138,6 @@ const cs = StyleSheet.create({
     gap: 3,
   },
   timeText: { color: "rgba(255,255,255,0.25)", fontSize: 9 },
-
   inputBar: {
     backgroundColor: "#111",
     borderTopWidth: StyleSheet.hairlineWidth,
@@ -1154,4 +1175,11 @@ const cs = StyleSheet.create({
     marginBottom: 4,
   },
   authNoteText: { color: "#FFA500", fontSize: 11 },
+  offlineHint: {
+    color: "#FFA500",
+    fontSize: 10,
+    textAlign: "center",
+    marginTop: 4,
+    fontStyle: "italic",
+  },
 });
