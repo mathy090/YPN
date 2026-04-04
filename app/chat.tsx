@@ -1,13 +1,15 @@
 // app/chat.tsx
-import { useLocalSearchParams } from "expo-router";
-import React from "react";
-import { Text, View } from "react-native"; // ✅ Added missing imports
+// Routes chat rooms. Only Team YPN AI chat is currently active.
+// Future: add real user-to-user DMs here.
+
+import { useLocalSearchParams, View } from "expo-router";
+import { Text } from "react-native";
 import TeamYPNScreen from "../src/screens/TeamYPN";
 
 export default function ChatScreen() {
   const { roomId } = useLocalSearchParams<{ roomId?: string }>();
 
-  if (roomId === "team-ypn") {
+  if (roomId === "team-ypn" || !roomId) {
     return <TeamYPNScreen />;
   }
 
@@ -20,7 +22,7 @@ export default function ChatScreen() {
         alignItems: "center",
       }}
     >
-      <Text style={{ color: "#FFF", fontSize: 18 }}>Chat room not found</Text>
+      <Text style={{ color: "#555", fontSize: 16 }}>Chat room not found</Text>
     </View>
   );
 }
