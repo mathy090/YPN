@@ -1,17 +1,7 @@
 // src/screens/TeamYPN.tsx
-// ─────────────────────────────────────────────────────────────────────────────
-// YPN AI Chat — WhatsApp-style layout
-//   • Tab bar hidden on mount, restored on unmount
-//   • 3-dot animated typing indicator (Meta/WhatsApp style)
-//   • Simulated character-by-character text reveal after reply arrives
-//   • Two-layer cache: MMKV (L1) → AsyncStorage (L2), capped at 100 msgs
-//   • Network-aware send, retry on failure, date headers, read receipts
-// ─────────────────────────────────────────────────────────────────────────────
-
 import { Ionicons } from "@expo/vector-icons";
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import NetInfo from "@react-native-community/netinfo";
-import { useNavigation } from "@react-navigation/native";
+import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import { useRouter } from "expo-router";
 import React, {
   useCallback,
@@ -24,6 +14,7 @@ import React, {
 import {
   ActivityIndicator,
   Animated,
+  BackHandler,
   Easing,
   FlatList,
   Image,
@@ -37,24 +28,22 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
-import { MMKV } from "react-native-mmkv";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { auth } from "../firebase/auth";
+import {
+  cacheTeamYPNMessages,
+  getCachedTeamYPNMessages,
+  TeamYPNMessage,
+} from "../utils/teamypncache";
 
 // ── Constants ──────────────────────────────────────────────────────────────────
-const AI_API_URL = "https://ypn-1.onrender.com/chat";
-const CACHE_KEY_L1 = "ypn_chat_teamypn_v2";
-const CACHE_KEY_L2 = "ypn_chat_teamypn_async_v2";
+const AI_API_URL = process.env.EXPO_PUBLIC_AI_URL
+  ? `${process.env.EXPO_PUBLIC_AI_URL}/chat`
+  : "https://ypn-1.onrender.com/chat";
+
 const MAX_CACHED = 100;
-// Simulate streaming: reveal N characters every tick
 const STREAM_CHUNK = 4;
 const STREAM_INTERVAL_MS = 18;
-
-// ── MMKV singleton ─────────────────────────────────────────────────────────────
-let _mmkv: MMKV | null = null;
-const mmkv = (): MMKV => {
-  if (!_mmkv) _mmkv = new MMKV({ id: "ypn-chat-v2" });
-  return _mmkv;
-};
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 type MsgStatus = "sending" | "sent" | "read" | "failed";
@@ -63,7 +52,7 @@ type Message = {
   id: string;
   text: string;
   sender: "user" | "ai";
-  timestamp: number; // unix ms
+  timestamp: number;
   status: MsgStatus;
 };
 
@@ -71,41 +60,11 @@ type ListRow =
   | { type: "header"; label: string; key: string }
   | { type: "message"; msg: Message; key: string };
 
-// ── Cache helpers ──────────────────────────────────────────────────────────────
-function readL1(): Message[] | null {
-  try {
-    const raw = mmkv().getString(CACHE_KEY_L1);
-    return raw ? (JSON.parse(raw) as Message[]) : null;
-  } catch {
-    return null;
-  }
-}
+export type TeamYPNScreenProps = {
+  onBack?: () => void;
+};
 
-function writeL1(msgs: Message[]): void {
-  try {
-    mmkv().set(CACHE_KEY_L1, JSON.stringify(msgs.slice(-MAX_CACHED)));
-  } catch {}
-}
-
-async function readL2(): Promise<Message[] | null> {
-  try {
-    const raw = await AsyncStorage.getItem(CACHE_KEY_L2);
-    return raw ? (JSON.parse(raw) as Message[]) : null;
-  } catch {
-    return null;
-  }
-}
-
-async function writeL2(msgs: Message[]): Promise<void> {
-  try {
-    await AsyncStorage.setItem(
-      CACHE_KEY_L2,
-      JSON.stringify(msgs.slice(-MAX_CACHED)),
-    );
-  } catch {}
-}
-
-// ── Date header helpers ────────────────────────────────────────────────────────
+// ── Date helpers ───────────────────────────────────────────────────────────────
 function dateLabel(ts: number): string {
   const d = new Date(ts);
   const now = new Date();
@@ -129,7 +88,7 @@ function timeStr(ts: number): string {
   });
 }
 
-// ── 3-dot typing indicator ─────────────────────────────────────────────────────
+// ── Typing Indicator ───────────────────────────────────────────────────────────
 const TypingIndicator = React.memo(() => {
   const dots = [
     useRef(new Animated.Value(0)).current,
@@ -200,7 +159,7 @@ const ty = StyleSheet.create({
   },
 });
 
-// ── Read receipt icon ──────────────────────────────────────────────────────────
+// ── Ticks ──────────────────────────────────────────────────────────────────────
 const Ticks = React.memo(({ status }: { status: MsgStatus }) => {
   if (status === "sending") {
     return <ActivityIndicator size={10} color="rgba(255,255,255,0.5)" />;
@@ -212,11 +171,10 @@ const Ticks = React.memo(({ status }: { status: MsgStatus }) => {
   return <Ionicons name="checkmark-done" size={14} color={color} />;
 });
 
-// ── Message bubble ─────────────────────────────────────────────────────────────
+// ── Bubble ─────────────────────────────────────────────────────────────────────
 type BubbleProps = {
   msg: Message;
   onRetry: (msg: Message) => void;
-  // streamingId + streamText: for the currently-streaming AI message
   streamingId: string | null;
   streamText: string;
 };
@@ -292,7 +250,7 @@ const bs = StyleSheet.create({
   },
 });
 
-// ── Date header row ────────────────────────────────────────────────────────────
+// ── Date Header ────────────────────────────────────────────────────────────────
 const DateHeader = React.memo(({ label }: { label: string }) => (
   <View style={dh.wrap}>
     <View style={dh.pill}>
@@ -320,9 +278,9 @@ const dh = StyleSheet.create({
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Main screen
+// Main Screen
 // ══════════════════════════════════════════════════════════════════════════════
-export default function TeamYPNScreen() {
+export default function TeamYPNScreen({ onBack }: TeamYPNScreenProps) {
   const router = useRouter();
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
@@ -334,22 +292,69 @@ export default function TeamYPNScreen() {
   const [showTyping, setShowTyping] = useState(false);
   const [isOnline, setIsOnline] = useState(true);
 
-  // Simulated streaming state
   const [streamingId, setStreamingId] = useState<string | null>(null);
   const [streamText, setStreamText] = useState("");
 
   const listRef = useRef<FlatList>(null);
   const streamTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // ── Hide tab bar on mount, restore on unmount ───────────────────────────────
+  const me = auth.currentUser;
+
+  // ── Load cached messages on mount ────────────────────────────────────────────
+  useEffect(() => {
+    (async () => {
+      const cached = await getCachedTeamYPNMessages();
+      if (cached.length > 0) {
+        setMessages(cached as Message[]);
+        setLoading(false);
+        scrollToBottom(false);
+        return;
+      }
+      setLoading(false);
+      scrollToBottom(false);
+    })();
+  }, []);
+
+  // ── Persist messages on change ───────────────────────────────────────────────
+  useEffect(() => {
+    if (messages.length === 0) return;
+    cacheTeamYPNMessages(messages.slice(-MAX_CACHED) as TeamYPNMessage[]);
+  }, [messages]);
+
+  // ── Tab bar: hide on mount, restore on unmount ──────────────────────────────
   useLayoutEffect(() => {
-    navigation.setOptions({ tabBarStyle: { display: "none" } });
+    navigation.setOptions({
+      tabBarStyle: {
+        height: 0,
+        overflow: "hidden",
+        display: "none",
+      },
+    });
     return () => {
       navigation.setOptions({ tabBarStyle: undefined });
     };
   }, [navigation]);
 
-  // ── Network listener ────────────────────────────────────────────────────────
+  // ── Android back button: navigate to Discord main page or call onBack ───────
+  useFocusEffect(
+    useCallback(() => {
+      const onBackPress = () => {
+        if (onBack) {
+          onBack();
+        } else {
+          router.replace("/tabs/discord");
+        }
+        return true;
+      };
+      const subscription = BackHandler.addEventListener(
+        "hardwareBackPress",
+        onBackPress,
+      );
+      return () => subscription.remove();
+    }, [onBack, router]),
+  );
+
+  // ── Network listener ─────────────────────────────────────────────────────────
   useEffect(() => {
     const unsub = NetInfo.addEventListener((state) => {
       setIsOnline(
@@ -359,34 +364,7 @@ export default function TeamYPNScreen() {
     return () => unsub();
   }, []);
 
-  // ── Boot: L1 → L2 → empty ──────────────────────────────────────────────────
-  useEffect(() => {
-    (async () => {
-      const l1 = readL1();
-      if (l1 && l1.length > 0) {
-        setMessages(l1);
-        setLoading(false);
-        scrollToBottom(false);
-        return;
-      }
-      const l2 = await readL2();
-      if (l2 && l2.length > 0) {
-        setMessages(l2);
-        writeL1(l2); // warm L1
-      }
-      setLoading(false);
-      scrollToBottom(false);
-    })();
-  }, []);
-
-  // ── Persist messages whenever they change ───────────────────────────────────
-  useEffect(() => {
-    if (loading) return;
-    writeL1(messages);
-    writeL2(messages); // fire-and-forget
-  }, [messages, loading]);
-
-  // ── Cleanup stream timer on unmount ────────────────────────────────────────
+  // ── Cleanup stream timer ─────────────────────────────────────────────────────
   useEffect(() => {
     return () => {
       if (streamTimer.current) clearInterval(streamTimer.current);
@@ -397,7 +375,6 @@ export default function TeamYPNScreen() {
     setTimeout(() => listRef.current?.scrollToEnd({ animated }), 60);
   }, []);
 
-  // ── Simulated streaming reveal ──────────────────────────────────────────────
   const startStreaming = useCallback(
     (msgId: string, fullText: string) => {
       if (streamTimer.current) clearInterval(streamTimer.current);
@@ -414,7 +391,6 @@ export default function TeamYPNScreen() {
         if (revealed >= fullText.length) {
           clearInterval(streamTimer.current!);
           streamTimer.current = null;
-          // Commit full text into the message list, clear streaming state
           setMessages((prev) =>
             prev.map((m) =>
               m.id === msgId ? { ...m, text: fullText, status: "read" } : m,
@@ -428,12 +404,11 @@ export default function TeamYPNScreen() {
     [scrollToBottom],
   );
 
-  // ── Send message ────────────────────────────────────────────────────────────
   const sendMessage = useCallback(
     async (text: string, retryMsgId?: string) => {
       const trimmed = text.trim();
       if (!trimmed || sending) return;
-      if (!isOnline) return; // TODO: queue offline
+      if (!isOnline) return;
 
       setSending(true);
 
@@ -447,7 +422,6 @@ export default function TeamYPNScreen() {
       };
 
       setMessages((prev) => {
-        // If retry: replace old failed msg, else append
         if (retryMsgId) {
           return prev.map((m) => (m.id === retryMsgId ? userMsg : m));
         }
@@ -456,14 +430,12 @@ export default function TeamYPNScreen() {
       setInput("");
       scrollToBottom();
 
-      // Mark as sent after a tick
       setTimeout(() => {
         setMessages((prev) =>
           prev.map((m) => (m.id === userMsgId ? { ...m, status: "sent" } : m)),
         );
       }, 300);
 
-      // Show typing indicator
       setShowTyping(true);
       scrollToBottom();
 
@@ -471,26 +443,32 @@ export default function TeamYPNScreen() {
         const res = await fetch(AI_API_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: trimmed }),
+          body: JSON.stringify({
+            message: trimmed,
+            session_id: me?.uid ?? "ypn-general",
+          }),
         });
 
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) {
+          const errText = await res.text().catch(() => "");
+          console.error("[TeamYPN] AI fetch error:", res.status, errText);
+          throw new Error(`HTTP ${res.status}`);
+        }
+
         const data = await res.json();
         const reply: string =
           data.reply ?? data.message ?? data.text ?? "I'm here to help!";
 
         setShowTyping(false);
 
-        // Mark user msg as read
         setMessages((prev) =>
           prev.map((m) => (m.id === userMsgId ? { ...m, status: "read" } : m)),
         );
 
-        // Insert AI placeholder (text will be revealed by streamer)
         const aiMsgId = `ai_${Date.now()}`;
         const aiMsg: Message = {
           id: aiMsgId,
-          text: "", // placeholder — streamer fills this
+          text: "",
           sender: "ai",
           timestamp: Date.now(),
           status: "read",
@@ -498,9 +476,9 @@ export default function TeamYPNScreen() {
         setMessages((prev) => [...prev, aiMsg]);
         scrollToBottom();
 
-        // Start character-by-character reveal
         startStreaming(aiMsgId, reply);
-      } catch {
+      } catch (e) {
+        console.error("[TeamYPN] send error:", e);
         setShowTyping(false);
         setMessages((prev) =>
           prev.map((m) =>
@@ -511,7 +489,7 @@ export default function TeamYPNScreen() {
         setSending(false);
       }
     },
-    [sending, isOnline, scrollToBottom, startStreaming],
+    [sending, isOnline, scrollToBottom, startStreaming, me],
   );
 
   const handleRetry = useCallback(
@@ -521,7 +499,6 @@ export default function TeamYPNScreen() {
     [sendMessage],
   );
 
-  // ── Build flat list data with date headers ──────────────────────────────────
   const listData = useMemo<ListRow[]>(() => {
     const rows: ListRow[] = [];
     let lastLabel = "";
@@ -536,7 +513,6 @@ export default function TeamYPNScreen() {
     return rows;
   }, [messages]);
 
-  // ── Render row ──────────────────────────────────────────────────────────────
   const renderRow = useCallback(
     ({ item }: { item: ListRow }) => {
       if (item.type === "header") {
@@ -556,7 +532,6 @@ export default function TeamYPNScreen() {
 
   const keyExtractor = useCallback((item: ListRow) => item.key, []);
 
-  // ── Empty state ─────────────────────────────────────────────────────────────
   const EmptyState = useMemo(
     () => (
       <View style={s.empty}>
@@ -574,7 +549,6 @@ export default function TeamYPNScreen() {
     [],
   );
 
-  // ── Layout ──────────────────────────────────────────────────────────────────
   const statusBarH =
     Platform.OS === "android" ? (StatusBar.currentHeight ?? 24) : 0;
 
@@ -582,11 +556,16 @@ export default function TeamYPNScreen() {
     <View style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor="#111" />
 
-      {/* ── Header ── */}
       <View style={[s.header, { paddingTop: insets.top || statusBarH + 8 }]}>
         <TouchableOpacity
           style={s.backBtn}
-          onPress={() => router.back()}
+          onPress={() => {
+            if (onBack) {
+              onBack();
+            } else {
+              router.replace("/tabs/discord");
+            }
+          }}
           hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
         >
           <Ionicons name="arrow-back" size={24} color="#fff" />
@@ -607,12 +586,11 @@ export default function TeamYPNScreen() {
         <View style={s.onlineDot} />
       </View>
 
-      {/* ── Chat body ── */}
       <KeyboardAvoidingView
         style={{ flex: 1 }}
-        behavior={Platform.OS === "ios" ? "padding" : "height"}
+        behavior="padding"
         keyboardVerticalOffset={
-          (insets.top || statusBarH) + 56 /* header height */
+          Platform.OS === "ios" ? (insets.top || statusBarH) + 56 : 0
         }
       >
         {loading ? (
@@ -638,7 +616,6 @@ export default function TeamYPNScreen() {
           />
         )}
 
-        {/* ── Offline banner ── */}
         {!isOnline && (
           <View style={s.offlineBanner}>
             <Ionicons name="wifi-outline" size={13} color="#FFA500" />
@@ -646,7 +623,6 @@ export default function TeamYPNScreen() {
           </View>
         )}
 
-        {/* ── Input bar ── */}
         <View style={[s.inputBar, { paddingBottom: insets.bottom || 8 }]}>
           <TextInput
             value={input}
@@ -681,14 +657,11 @@ export default function TeamYPNScreen() {
   );
 }
 
-// ── Styles ─────────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
   root: {
     flex: 1,
     backgroundColor: "#0a0a0a",
   },
-
-  // Header
   header: {
     flexDirection: "row",
     alignItems: "center",
@@ -738,8 +711,6 @@ const s = StyleSheet.create({
     backgroundColor: "#25D366",
     marginRight: 4,
   },
-
-  // Body
   centre: {
     flex: 1,
     justifyContent: "center",
@@ -749,8 +720,6 @@ const s = StyleSheet.create({
     paddingTop: 8,
     paddingHorizontal: 2,
   },
-
-  // Empty state
   empty: {
     flex: 1,
     alignItems: "center",
@@ -776,8 +745,6 @@ const s = StyleSheet.create({
     textAlign: "center",
     lineHeight: 21,
   },
-
-  // Offline
   offlineBanner: {
     flexDirection: "row",
     alignItems: "center",
@@ -791,8 +758,6 @@ const s = StyleSheet.create({
     fontSize: 12,
     fontWeight: "600",
   },
-
-  // Input bar
   inputBar: {
     flexDirection: "row",
     alignItems: "flex-end",

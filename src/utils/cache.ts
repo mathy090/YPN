@@ -1,10 +1,10 @@
 // src/utils/cache.ts
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as Crypto from 'expo-crypto';
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as Crypto from "expo-crypto";
 
-const CACHE_PREFIX = 'YPN_SECURE_CACHE:';
-const DEVICE_ID_KEY = 'YPN_DEVICE_ID';
-const INITIALIZATION_FLAG = 'YPN_CACHE_INITIALIZED';
+const CACHE_PREFIX = "YPN_SECURE_CACHE:";
+const DEVICE_ID_KEY = "YPN_DEVICE_ID";
+const INITIALIZATION_FLAG = "YPN_CACHE_INITIALIZED";
 const DEFAULT_TTL = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
 
 let deviceId: string | null = null;
@@ -24,7 +24,7 @@ const generateDeviceId = async (): Promise<string> => {
  */
 export const initializeSecureCache = async (): Promise<void> => {
   if (deviceId) {
-    console.log('Secure cache already initialized.');
+    console.log("Secure cache already initialized.");
     return;
   }
 
@@ -35,16 +35,18 @@ export const initializeSecureCache = async (): Promise<void> => {
       const storedDeviceId = await AsyncStorage.getItem(DEVICE_ID_KEY);
       if (storedDeviceId) {
         deviceId = storedDeviceId;
-        console.log('Secure cache initialized with existing device ID.');
+        console.log("Secure cache initialized with existing device ID.");
       } else {
-        console.warn('Initialization flag found, but device ID missing. Reinitializing...');
+        console.warn(
+          "Initialization flag found, but device ID missing. Reinitializing...",
+        );
         await _performInitialization();
       }
     } else {
       await _performInitialization();
     }
   } catch (error) {
-    console.error('Error initializing secure cache:', error);
+    console.error("Error initializing secure cache:", error);
     await _performInitialization();
   }
 };
@@ -56,10 +58,10 @@ const _performInitialization = async (): Promise<void> => {
   try {
     deviceId = await generateDeviceId();
     await AsyncStorage.setItem(DEVICE_ID_KEY, deviceId);
-    await AsyncStorage.setItem(INITIALIZATION_FLAG, 'true');
-    console.log('Secure cache initialized with new device ID:', deviceId);
+    await AsyncStorage.setItem(INITIALIZATION_FLAG, "true");
+    console.log("Secure cache initialized with new device ID:", deviceId);
   } catch (error) {
-    console.error('Critical error during cache initialization:', error);
+    console.error("Critical error during cache initialization:", error);
     deviceId = null;
     throw error;
   }
@@ -73,7 +75,9 @@ const _performInitialization = async (): Promise<void> => {
  */
 const prepareKey = (key: string): string => {
   if (!deviceId) {
-    throw new Error('Secure cache not initialized. Call initializeSecureCache first.');
+    throw new Error(
+      "Secure cache not initialized. Call initializeSecureCache first.",
+    );
   }
   return `${CACHE_PREFIX}${deviceId}:${key}`;
 };
@@ -85,7 +89,11 @@ const prepareKey = (key: string): string => {
  * @param ttl Time to live in milliseconds (defaults to 24 hours).
  * @returns A promise that resolves when the data is stored.
  */
-export const setSecureCache = async (key: string, data: any, ttl: number = DEFAULT_TTL): Promise<void> => {
+export const setSecureCache = async (
+  key: string,
+  data: any,
+  ttl: number = DEFAULT_TTL,
+): Promise<void> => {
   try {
     const fullKey = prepareKey(key);
     const item = {
@@ -110,7 +118,7 @@ export const setSecureCache = async (key: string, data: any, ttl: number = DEFAU
  */
 export const getSecureCache = async (key: string) => {
   if (!deviceId) {
-    console.error('Secure cache not initialized. Cannot retrieve data.');
+    console.error("Secure cache not initialized. Cannot retrieve data.");
     return null;
   }
 
@@ -119,14 +127,18 @@ export const getSecureCache = async (key: string) => {
     const cachedItemStr = await AsyncStorage.getItem(fullKey);
 
     if (!cachedItemStr) {
-      console.log(`Cache miss for key: ${fullKey} (Not found or belongs to different device/installation)`);
+      console.log(
+        `Cache miss for key: ${fullKey} (Not found or belongs to different device/installation)`,
+      );
       return null;
     }
 
     const cachedItem = JSON.parse(cachedItemStr);
 
     if (cachedItem.deviceId !== deviceId) {
-      console.log(`Cache miss for key: ${fullKey} (Data belongs to a different device/installation)`);
+      console.log(
+        `Cache miss for key: ${fullKey} (Data belongs to a different device/installation)`,
+      );
       return null;
     }
 
@@ -170,19 +182,23 @@ export const removeSecureCache = async (key: string): Promise<void> => {
 export const clearSecureCache = async (): Promise<void> => {
   try {
     if (!deviceId) {
-      console.error('Secure cache not initialized. Cannot clear.');
+      console.error("Secure cache not initialized. Cannot clear.");
       return;
     }
     const keys = await AsyncStorage.getAllKeys();
-    const cacheKeys = keys.filter(k => k.startsWith(`${CACHE_PREFIX}${deviceId}:`));
+    const cacheKeys = keys.filter((k) =>
+      k.startsWith(`${CACHE_PREFIX}${deviceId}:`),
+    );
     if (cacheKeys.length > 0) {
       await AsyncStorage.multiRemove(cacheKeys);
-      console.log(`Cleared ${cacheKeys.length} cached items for current device.`);
+      console.log(
+        `Cleared ${cacheKeys.length} cached items for current device.`,
+      );
     } else {
-      console.log('No cached items found for current device to clear.');
+      console.log("No cached items found for current device to clear.");
     }
   } catch (error) {
-    console.error('Error clearing secure cache:', error);
+    console.error("Error clearing secure cache:", error);
     throw error;
   }
 };

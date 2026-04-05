@@ -11,6 +11,7 @@ import {
   Image,
   Keyboard,
   KeyboardAvoidingView,
+  Linking,
   Platform,
   ScrollView,
   StyleSheet,
@@ -23,6 +24,19 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { auth } from "../../src/firebase/auth";
 import { useAuth } from "../../src/store/authStore";
 import { saveToken, verifyWithBackend } from "../../src/utils/tokenManager";
+
+// ── Admin contact ─────────────────────────────────────────────────────────────
+const ADMIN_EMAIL = "tafadzwarunowanda@gmail.com";
+
+function openResetEmail() {
+  const subject = encodeURIComponent("Password Reset Request");
+  const body = encodeURIComponent(
+    "Hi,\n\nI would like to reset my password for my YPN account.\n\nMy email: \n\nThank you!",
+  );
+  Linking.openURL(
+    `mailto:${ADMIN_EMAIL}?subject=${subject}&body=${body}`,
+  ).catch(() => {});
+}
 
 export default function OTP() {
   const router = useRouter();
@@ -63,19 +77,17 @@ export default function OTP() {
       const idToken = await firebaseUser.getIdToken(true);
       await saveToken(idToken);
 
-      let hasProfile = false;
+      // Verify with backend
       try {
-        const result = await verifyWithBackend(idToken);
-        hasProfile = result.hasProfile;
+        await verifyWithBackend(idToken);
       } catch {
-        // Backend unreachable — allow login, treat as no profile
-        hasProfile = false;
+        // Backend unreachable — allow login
       }
 
       await login();
 
-      // Navigate: no profile → set name first, otherwise → home
-      router.replace(hasProfile ? "/tabs/discord" : "/auth/device");
+      // Navigate to device page after successful login
+      router.replace("/auth/device");
     } catch (e: any) {
       if (
         e.code === "auth/network-request-failed" ||
@@ -195,6 +207,15 @@ export default function OTP() {
                 </TouchableOpacity>
               </View>
 
+              {/* Forgot password link */}
+              <TouchableOpacity
+                style={s.forgotLink}
+                onPress={openResetEmail}
+                activeOpacity={0.7}
+              >
+                <Text style={s.forgotText}>Forgot password?</Text>
+              </TouchableOpacity>
+
               {error ? <Text style={s.err}>{error}</Text> : null}
             </View>
 
@@ -213,7 +234,7 @@ export default function OTP() {
 
             <TouchableOpacity
               style={s.link}
-              onPress={() => router.replace("/auth/phone")}
+              onPress={() => router.replace("/auth/device")}
             >
               <Text style={s.linkText}>
                 No account?{" "}
@@ -309,6 +330,16 @@ const s = StyleSheet.create({
   rowActive: { borderColor: "#1DB954" },
   icon: { marginRight: 10 },
   input: { flex: 1, color: "#fff", fontSize: 15 },
+  forgotLink: {
+    alignSelf: "flex-end",
+    marginTop: 8,
+    paddingVertical: 4,
+  },
+  forgotText: {
+    color: "#1DB954",
+    fontSize: 12,
+    fontWeight: "600",
+  },
   err: { color: "#E91429", fontSize: 12, marginTop: 10 },
   btn: {
     backgroundColor: "#1DB954",

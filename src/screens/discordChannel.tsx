@@ -1,30 +1,43 @@
 // src/screens/discordChannel.tsx
 import { Ionicons } from "@expo/vector-icons";
+import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import {
-    addDoc,
-    collection,
-    limit,
-    onSnapshot,
-    orderBy,
-    query,
-    serverTimestamp,
+  addDoc,
+  collection,
+  limit,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
 } from "firebase/firestore";
-import React, { useEffect, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import {
-    ActivityIndicator,
-    FlatList,
-    KeyboardAvoidingView,
-    Platform,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
+  ActivityIndicator,
+  BackHandler,
+  FlatList,
+  KeyboardAvoidingView,
+  Platform,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { auth } from "../firebase/auth";
 import { db } from "../firebase/firestore";
+import {
+  cacheDiscordMessages,
+  CachedMessage,
+  getCachedDiscordMessages,
+} from "../utils/cache";
 
 type Message = {
   id: string;
@@ -36,6 +49,7 @@ type Message = {
 
 export default function DiscordChannelScreen() {
   const router = useRouter();
+  const navigation = useNavigation();
   const insets = useSafeAreaInsets();
 
   const {
@@ -61,6 +75,40 @@ export default function DiscordChannelScreen() {
   const [loading, setLoading] = useState(true);
   const listRef = useRef<FlatList>(null);
 
+  // Ensure tab bar is visible on this screen
+  useLayoutEffect(() => {
+    navigation.setOptions({ tabBarStyle: undefined });
+  }, [navigation]);
+
+  // Android back button: navigate to Discord main page
+  useFocusEffect(
+    useCallback(() => {
+      const onBackPress = () => {
+        router.replace("/tabs/discord");
+        return true;
+      };
+      const subscription = BackHandler.addEventListener(
+        "hardwareBackPress",
+        onBackPress,
+      );
+      return () => subscription.remove();
+    }, [router]),
+  );
+
+  // Load cached messages on mount
+  useEffect(() => {
+    if (!channelId) return;
+
+    (async () => {
+      const cached = await getCachedDiscordMessages(channelId);
+      if (cached && cached.length > 0) {
+        setMessages(cached as Message[]);
+        setLoading(false);
+        setTimeout(() => listRef.current?.scrollToEnd({ animated: false }), 50);
+      }
+    })();
+  }, [channelId]);
+
   useEffect(() => {
     if (!channelId) return;
 
@@ -82,6 +130,9 @@ export default function DiscordChannelScreen() {
         }));
         setMessages(msgs);
         setLoading(false);
+        cacheDiscordMessages(channelId, msgs as CachedMessage[]).catch((e) =>
+          console.warn("Failed to cache Discord messages:", e),
+        );
         setTimeout(() => listRef.current?.scrollToEnd({ animated: false }), 80);
       },
       (err) => {
@@ -110,7 +161,7 @@ export default function DiscordChannelScreen() {
       setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 80);
     } catch (e) {
       console.error("[DiscordChannel] send:", e);
-      setInput(text); // restore on fail
+      setInput(text);
     } finally {
       setSending(false);
     }
@@ -161,10 +212,9 @@ export default function DiscordChannelScreen() {
 
   return (
     <View style={[s.root, { paddingTop: insets.top }]}>
-      {/* Header */}
       <View style={s.header}>
         <TouchableOpacity
-          onPress={() => router.back()}
+          onPress={() => router.replace("/tabs/discord")}
           style={s.backBtn}
           hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
         >
@@ -181,8 +231,8 @@ export default function DiscordChannelScreen() {
 
       <KeyboardAvoidingView
         style={{ flex: 1 }}
-        behavior={Platform.OS === "ios" ? "padding" : "height"}
-        keyboardVerticalOffset={insets.top + 56}
+        behavior="padding"
+        keyboardVerticalOffset={Platform.OS === "ios" ? insets.top + 56 : 0}
       >
         {loading ? (
           <View style={s.centre}>
@@ -212,7 +262,6 @@ export default function DiscordChannelScreen() {
           />
         )}
 
-        {/* Input bar */}
         <View
           style={[s.inputBar, { paddingBottom: Math.max(insets.bottom, 8) }]}
         >

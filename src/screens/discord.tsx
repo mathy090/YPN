@@ -1,6 +1,7 @@
 // src/screens/discord.tsx
 import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { useNavigation } from "@react-navigation/native";
 import {
   addDoc,
   collection,
@@ -11,7 +12,13 @@ import {
   serverTimestamp,
   Timestamp,
 } from "firebase/firestore";
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import {
   ActivityIndicator,
   Animated,
@@ -25,12 +32,13 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
-  View
+  View,
 } from "react-native";
 import { MMKV } from "react-native-mmkv";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { auth } from "../firebase/auth";
 import { db } from "../firebase/firestore";
+import TeamYPNScreen from "./TeamYPN"; // Import TeamYPNScreen
 
 // ── Config ──────────────────────────────────────────────────────
 const AI_URL = process.env.EXPO_PUBLIC_AI_URL
@@ -40,7 +48,7 @@ const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
 const ADMIN_EMAIL = "tafadzwarunowanda@gmail.com";
 const TAB_BAR_H = Platform.OS === "ios" ? 90 : 60;
 
-// ── Two-layer message + channel cache ───────────────────────────
+// ── Two-layer message + channel cache (for regular channels only) ───────────────────────────
 let _mmkv: MMKV | null = null;
 const store = () => {
   if (!_mmkv) _mmkv = new MMKV({ id: "ypn-discord-v6" });
@@ -128,7 +136,6 @@ function openEmail(subject: string, body: string) {
 }
 
 // ── Android keyboard hook ────────────────────────────────────────
-// Animates input bar to sit right above the keyboard on Android 11+
 function useKeyboardOffset() {
   const offset = useRef(new Animated.Value(0)).current;
 
@@ -186,13 +193,11 @@ function ChannelListScreen({
         { paddingTop: Platform.OS === "android" ? statusBarH : insets.top },
       ]}
     >
-      {/* Header */}
       <View style={ls.header}>
         <Text style={ls.headerTitle}>YPN Community</Text>
         <View style={ls.onlineDot} />
       </View>
 
-      {/* Banners */}
       <View style={ls.bannersWrap}>
         <TouchableOpacity
           style={[ls.banner, { borderLeftColor: "#5865F2" }]}
@@ -235,13 +240,11 @@ function ChannelListScreen({
         </TouchableOpacity>
       </View>
 
-      {/* Section label */}
       <View style={ls.sectionRow}>
         <Text style={ls.sectionLabel}>CHATS</Text>
         <View style={ls.sectionLine} />
       </View>
 
-      {/* Channel rows */}
       {loadingChannels && channels.length === 0 ? (
         <View style={ls.loadingWrap}>
           <ActivityIndicator color="#1DB954" />
@@ -284,7 +287,6 @@ function ChannelListScreen({
 
 const ls = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#000" },
-
   header: {
     flexDirection: "row",
     alignItems: "center",
@@ -306,7 +308,6 @@ const ls = StyleSheet.create({
     borderRadius: 5,
     backgroundColor: "#1DB954",
   },
-
   bannersWrap: { paddingHorizontal: 14, paddingTop: 14, gap: 8 },
   banner: {
     flexDirection: "row",
@@ -330,7 +331,6 @@ const ls = StyleSheet.create({
   bannerBody: { flex: 1 },
   bannerTitle: { color: "#EFEFEF", fontSize: 13, fontWeight: "600" },
   bannerSub: { color: "#555", fontSize: 11, marginTop: 2 },
-
   sectionRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -350,7 +350,6 @@ const ls = StyleSheet.create({
     height: StyleSheet.hairlineWidth,
     backgroundColor: "#111",
   },
-
   loadingWrap: {
     flex: 1,
     justifyContent: "center",
@@ -358,7 +357,6 @@ const ls = StyleSheet.create({
     gap: 12,
   },
   loadingText: { color: "#333", fontSize: 13 },
-
   row: {
     flexDirection: "row",
     alignItems: "center",
@@ -395,7 +393,7 @@ const ls = StyleSheet.create({
 });
 
 // ════════════════════════════════════════════════════════════════
-// CHAT SCREEN
+// CHAT SCREEN (for regular channels only)
 // ════════════════════════════════════════════════════════════════
 function ChatScreen({
   channel,
@@ -421,7 +419,6 @@ function ChatScreen({
     setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 60);
   }, []);
 
-  // Load messages / subscribe
   useEffect(() => {
     setLoading(true);
     setMessages([]);
@@ -434,6 +431,7 @@ function ChatScreen({
       }
     });
 
+    // AI channel should never reach here (handled by TeamYPNScreen)
     if (channel.isAI) {
       setLoading(false);
       return;
@@ -474,72 +472,6 @@ function ChatScreen({
     if (messages.length > 0) scrollToBottom();
   }, [messages.length, aiTyping]);
 
-  // Send to AI
-  const sendToAI = useCallback(
-    async (text: string) => {
-      if (!text.trim() || sending) return;
-      setSending(true);
-
-      const userMsg: Message = {
-        id: `u_${Date.now()}`,
-        text,
-        uid: me?.uid ?? "user",
-        displayName: me?.displayName ?? "You",
-        createdAt: Date.now(),
-      };
-      setMessages((p) => {
-        const n = [...p, userMsg];
-        writeMsgCache(channel.id, n);
-        return n;
-      });
-      setInput("");
-      setAiTyping(true);
-
-      try {
-        const res = await fetch(AI_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            message: text,
-            session_id: me?.uid ?? "ypn-general",
-          }),
-        });
-        const data = await res.json();
-        const reply = data.reply ?? data.message ?? "I'm here to help!";
-        const aiMsg: Message = {
-          id: `ai_${Date.now()}`,
-          text: reply,
-          uid: "ypn-ai",
-          displayName: "YPN AI",
-          createdAt: Date.now(),
-          isAI: true,
-        };
-        setMessages((p) => {
-          const n = [...p, aiMsg];
-          writeMsgCache(channel.id, n);
-          return n;
-        });
-      } catch {
-        setMessages((p) => [
-          ...p,
-          {
-            id: `err_${Date.now()}`,
-            text: "Couldn't reach the AI. Check your connection.",
-            uid: "ypn-ai",
-            displayName: "YPN AI",
-            createdAt: Date.now(),
-            isAI: true,
-          },
-        ]);
-      } finally {
-        setAiTyping(false);
-        setSending(false);
-      }
-    },
-    [sending, me, channel.id],
-  );
-
-  // Send to Firestore
   const sendToFirestore = useCallback(
     async (text: string) => {
       if (!text.trim() || !me || sending) return;
@@ -582,15 +514,12 @@ function ChatScreen({
   const handleSend = useCallback(() => {
     const text = input.trim();
     if (!text) return;
-    if (channel.isAI) sendToAI(text);
-    else sendToFirestore(text);
-  }, [input, channel.isAI, sendToAI, sendToFirestore]);
+    sendToFirestore(text);
+  }, [input, sendToFirestore]);
 
-  // Render a single message bubble
   const renderMessage = useCallback(
     ({ item }: { item: Message }) => {
       const isMe = item.uid === me?.uid;
-      const isAI = item.isAI;
       const time = new Date(item.createdAt).toLocaleTimeString([], {
         hour: "2-digit",
         minute: "2-digit",
@@ -599,7 +528,6 @@ function ChatScreen({
 
       return (
         <View style={[cs.row, isMe && cs.rowMe]}>
-          {/* Avatar — only for others */}
           {!isMe && (
             <View
               style={[cs.avatar, { backgroundColor: channel.color + "33" }]}
@@ -611,12 +539,11 @@ function ChatScreen({
                   fontWeight: "700",
                 }}
               >
-                {isAI ? "AI" : (item.displayName?.[0] ?? "?").toUpperCase()}
+                {(item.displayName?.[0] ?? "?").toUpperCase()}
               </Text>
             </View>
           )}
 
-          {/* Bubble */}
           <View
             style={[
               cs.bubble,
@@ -629,7 +556,7 @@ function ChatScreen({
           >
             {!isMe && (
               <Text style={[cs.sender, { color: channel.color }]}>
-                {isAI ? "YPN AI" : item.displayName}
+                {item.displayName}
               </Text>
             )}
             <Text style={[cs.msgText, isMe && { color: darkText }]}>
@@ -678,7 +605,6 @@ function ChatScreen({
     [me, channel],
   );
 
-  // iOS uses KeyboardAvoidingView; Android uses the animated marginBottom
   const InputBar = (
     <Animated.View
       style={[
@@ -749,7 +675,6 @@ function ChatScreen({
         },
       ]}
     >
-      {/* Header with back button */}
       <View style={cs.header}>
         <TouchableOpacity
           onPress={onBack}
@@ -762,23 +687,15 @@ function ChatScreen({
           style={[cs.headerAvatar, { backgroundColor: channel.color + "22" }]}
         >
           <Text style={{ fontSize: 22 }}>{channel.emoji}</Text>
-          {channel.isAI && <View style={cs.headerOnline} />}
         </View>
         <View style={cs.headerText}>
-          <Text style={cs.headerName}>
-            {channel.isAI ? channel.name : `#${channel.name}`}
-          </Text>
+          <Text style={cs.headerName}>#{channel.name}</Text>
           <Text style={[cs.headerStatus, { color: channel.color }]}>
-            {channel.isAI
-              ? aiTyping
-                ? "typing…"
-                : "Online"
-              : channel.description}
+            {channel.description}
           </Text>
         </View>
       </View>
 
-      {/* Messages list */}
       {loading ? (
         <View style={cs.centre}>
           <ActivityIndicator color={channel.color} size="large" />
@@ -796,38 +713,13 @@ function ChatScreen({
           ListEmptyComponent={
             <View style={cs.emptyWrap}>
               <Text style={{ fontSize: 52 }}>{channel.emoji}</Text>
-              <Text style={cs.emptyTitle}>
-                {channel.isAI ? "Say hello to YPN AI" : `#${channel.name}`}
-              </Text>
+              <Text style={cs.emptyTitle}>#{channel.name}</Text>
               <Text style={cs.emptyDesc}>{channel.description}</Text>
             </View>
-          }
-          ListFooterComponent={
-            aiTyping ? (
-              <View style={cs.row}>
-                <View
-                  style={[cs.avatar, { backgroundColor: channel.color + "33" }]}
-                >
-                  <Text
-                    style={{
-                      fontSize: 11,
-                      color: channel.color,
-                      fontWeight: "700",
-                    }}
-                  >
-                    AI
-                  </Text>
-                </View>
-                <View style={cs.bubbleThem}>
-                  <Text style={cs.typingText}>typing…</Text>
-                </View>
-              </View>
-            ) : null
           }
         />
       )}
 
-      {/* Sticky input bar */}
       {InputBar}
     </View>
   );
@@ -835,7 +727,6 @@ function ChatScreen({
 
 const cs = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#0A0A0A" },
-
   header: {
     flexDirection: "row",
     alignItems: "center",
@@ -861,33 +752,19 @@ const cs = StyleSheet.create({
     alignItems: "center",
     position: "relative",
   },
-  headerOnline: {
-    position: "absolute",
-    bottom: 0,
-    right: 0,
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-    backgroundColor: "#1DB954",
-    borderWidth: 2,
-    borderColor: "#111",
-  },
   headerText: { flex: 1 },
   headerName: { color: "#fff", fontSize: 16, fontWeight: "700" },
   headerStatus: { fontSize: 12, marginTop: 1 },
-
   centre: {
     flex: 1,
     justifyContent: "center",
     alignItems: "center",
   },
-
   msgList: {
     paddingHorizontal: 8,
     paddingTop: 10,
     paddingBottom: 16,
   },
-
   row: {
     flexDirection: "row",
     marginBottom: 5,
@@ -895,7 +772,6 @@ const cs = StyleSheet.create({
     paddingHorizontal: 2,
   },
   rowMe: { flexDirection: "row-reverse" },
-
   avatar: {
     width: 30,
     height: 30,
@@ -907,7 +783,6 @@ const cs = StyleSheet.create({
     alignSelf: "flex-end",
     marginBottom: 2,
   },
-
   bubble: {
     maxWidth: "75%",
     borderRadius: 18,
@@ -921,10 +796,8 @@ const cs = StyleSheet.create({
   },
   bubblePending: { opacity: 0.55 },
   bubbleFailed: { borderWidth: 1, borderColor: "#FF453A" },
-
   sender: { fontSize: 11, fontWeight: "700", marginBottom: 3 },
   msgText: { color: "#E8E8E8", fontSize: 15, lineHeight: 22 },
-
   metaRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -933,14 +806,6 @@ const cs = StyleSheet.create({
     gap: 3,
   },
   time: { fontSize: 10, color: "rgba(255,255,255,0.35)" },
-
-  typingText: {
-    color: "#555",
-    fontStyle: "italic",
-    fontSize: 13,
-    padding: 2,
-  },
-
   emptyWrap: {
     alignItems: "center",
     paddingTop: 80,
@@ -959,7 +824,6 @@ const cs = StyleSheet.create({
     textAlign: "center",
     lineHeight: 20,
   },
-
   inputWrap: {
     backgroundColor: "#111",
     borderTopWidth: StyleSheet.hairlineWidth,
@@ -1009,11 +873,29 @@ const cs = StyleSheet.create({
 // ROOT — switches between channel list and individual chat
 // ════════════════════════════════════════════════════════════════
 export default function DiscordScreen() {
+  const navigation = useNavigation();
   const [channels, setChannels] = useState<Channel[]>([]);
   const [loadingChannels, setLoadingChannels] = useState(true);
   const [activeChannel, setActiveChannel] = useState<Channel | null>(null);
 
-  // Fetch channels from backend + poll every 60s
+  useLayoutEffect(() => {
+    if (activeChannel) {
+      navigation.setOptions({
+        tabBarStyle: {
+          height: 0,
+          overflow: "hidden",
+          display: "none",
+        },
+      });
+    } else {
+      navigation.setOptions({ tabBarStyle: undefined });
+    }
+
+    return () => {
+      navigation.setOptions({ tabBarStyle: undefined });
+    };
+  }, [navigation, activeChannel]);
+
   useEffect(() => {
     const cached = readChannelCache();
     if (cached?.length) {
@@ -1043,6 +925,11 @@ export default function DiscordScreen() {
   }, []);
 
   if (activeChannel) {
+    // ✅ Render TeamYPNScreen for AI channel (unified cache + streaming)
+    if (activeChannel.isAI) {
+      return <TeamYPNScreen onBack={() => setActiveChannel(null)} />;
+    }
+    // Render ChatScreen for regular channels
     return (
       <ChatScreen
         channel={activeChannel}
