@@ -1,12 +1,4 @@
 // src/store/authStore.ts
-//
-// AUTH FLOW:
-//  1. Online + Firebase session alive → verify with backend → instant login
-//  2. Online + backend rejects token  → force logout
-//  3. Offline + cached session        → restore last session silently
-//  4. Offline + no cache              → welcome screen
-//  5. Comes back online after offline → re-verify → stay in OR logout
-
 import NetInfo from "@react-native-community/netinfo";
 import { User } from "firebase/auth";
 import { create } from "zustand";
@@ -20,6 +12,7 @@ import {
 } from "../utils/session";
 import {
   clearToken,
+  getToken,
   saveToken,
   verifyWithBackend,
 } from "../utils/tokenManager";
@@ -69,21 +62,25 @@ export const useAuth = create<AuthState>((set, get) => ({
     const online = await checkConnectivity();
 
     if (!online) {
+      // Offline: allow access only if cached session and token exist
       const cached = await loadSession();
+      const token = await getToken();
       set({
         user: null,
         initialized: true,
-        isLoggedIn: !!cached,
+        isLoggedIn: !!cached && !!token,
         isOffline: true,
       });
       return;
     }
 
+    // Online: wait for Firebase auth state
     await new Promise<void>((resolve) => {
       const unsub = subscribeToAuth(async (firebaseUser) => {
         unsub();
 
         if (!firebaseUser) {
+          // No Firebase user — clear everything
           await clearSession();
           await clearToken();
           set({
@@ -97,6 +94,7 @@ export const useAuth = create<AuthState>((set, get) => ({
         }
 
         try {
+          // Firebase user exists — verify with backend
           const idToken = await firebaseUser.getIdToken(true);
           await saveToken(idToken);
           const { uid, email } = await verifyWithBackend(idToken);
@@ -121,6 +119,7 @@ export const useAuth = create<AuthState>((set, get) => ({
             err?.code === "EMAIL_NOT_VERIFIED";
 
           if (isAuthError) {
+            // Auth error — force logout
             await fbLogout();
             await clearSession();
             await clearToken();
@@ -131,6 +130,7 @@ export const useAuth = create<AuthState>((set, get) => ({
               isOffline: false,
             });
           } else {
+            // Backend unreachable — allow access if cached session exists
             const cached = await loadSession();
             set({
               user: firebaseUser,
@@ -169,13 +169,12 @@ export const useAuth = create<AuthState>((set, get) => ({
   },
 
   logout: async () => {
-    try {
-      await fbLogout();
-    } catch {
-      /* local signout always works */
-    }
-    await clearSession();
+    // ✅ Ensure Firebase sign-out succeeds
+    await fbLogout();
+
+    // Clear local data only after successful sign-out
     await clearToken();
+    await clearSession();
     set({ user: null, isLoggedIn: false, isOffline: false });
   },
 
