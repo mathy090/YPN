@@ -1,4 +1,14 @@
 // app/tabs/settings.tsx
+//
+// Logout calls authStore.logout() which:
+//   1. Firebase signOut
+//   2. AsyncStorage.clear()
+//   3. SecureStore key deletes
+//   4. expo-sqlite dbWipe() — videos, news, kv
+//   5. Store reset (initialized:false, hasAgreed:false)
+// Then navigates to /welcome.
+// On next cold start, index.tsx finds no session anywhere → welcome.
+
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import {
@@ -12,8 +22,6 @@ import {
   View,
 } from "react-native";
 import { useAuth } from "../../src/store/authStore";
-import { clearSecureCache } from "../../src/utils/cache";
-import { clearToken } from "../../src/utils/tokenManager";
 
 const ADMIN_EMAIL = "tafadzwarunowanda@gmail.com";
 
@@ -24,22 +32,17 @@ function openAdminEmail() {
   );
   Linking.openURL(
     `mailto:${ADMIN_EMAIL}?subject=${subject}&body=${body}`,
-  ).catch(() => {
-    Alert.alert(
-      "Error",
-      "Could not open email client. Please contact admin manually.",
-    );
-  });
+  ).catch(() => Alert.alert("Error", "Could not open email client."));
 }
 
 export default function SettingsScreen() {
   const { logout, user } = useAuth();
   const router = useRouter();
 
-  const handleSignOut = async () => {
+  const handleSignOut = () => {
     Alert.alert(
       "Sign Out",
-      "Are you sure you want to sign out? All session data in AI chat won't be retained.",
+      "Are you sure? All local session data will be cleared.",
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -47,23 +50,17 @@ export default function SettingsScreen() {
           style: "destructive",
           onPress: async () => {
             try {
-              // Clear all cache
-              await clearSecureCache();
-
-              // Clear token
-              await clearToken();
-
-              // Logout from store (ensures Firebase sign-out)
+              // Single call — wipes Firebase, AsyncStorage,
+              // SecureStore, and expo-sqlite (ypn.db)
               await logout();
-
-              // Navigate to welcome
+              // Navigate immediately — index gate is now bypassed
+              // because we're going directly to /welcome, not /
               router.replace("/welcome");
-            } catch (error) {
-              console.error("Sign out failed:", error);
+            } catch (e) {
+              console.error("[settings] logout error:", e);
               Alert.alert(
                 "Sign Out Failed",
                 "Could not sign out. Please try again.",
-                [{ text: "OK", style: "cancel" }],
               );
             }
           },
@@ -95,6 +92,7 @@ export default function SettingsScreen() {
         <Text style={s.title}>Settings</Text>
       </View>
 
+      {/* Profile card */}
       <View style={s.profileCard}>
         <View style={s.avatarCircle}>
           <Text style={s.avatarText}>{avatarChar}</Text>
@@ -105,6 +103,7 @@ export default function SettingsScreen() {
         </View>
       </View>
 
+      {/* Admin contact */}
       <TouchableOpacity
         style={s.banner}
         onPress={openAdminEmail}
@@ -122,6 +121,7 @@ export default function SettingsScreen() {
 
       <View style={s.divider} />
 
+      {/* Sign out */}
       <TouchableOpacity
         style={s.logoutBtn}
         onPress={handleSignOut}
@@ -137,9 +137,14 @@ export default function SettingsScreen() {
 }
 
 const s = StyleSheet.create({
-  root: { flex: 1, backgroundColor: "#000", paddingHorizontal: 20 },
+  root: {
+    flex: 1,
+    backgroundColor: "#000",
+    paddingHorizontal: 20,
+  },
   header: { paddingBottom: 24 },
   title: { color: "#fff", fontSize: 32, fontWeight: "800" },
+
   profileCard: {
     flexDirection: "row",
     alignItems: "center",
@@ -164,6 +169,7 @@ const s = StyleSheet.create({
   profileInfo: { flex: 1 },
   profileName: { color: "#fff", fontSize: 17, fontWeight: "600" },
   profileEmail: { color: "#8E8E93", fontSize: 13, marginTop: 2 },
+
   banner: {
     flexDirection: "row",
     alignItems: "center",
@@ -186,7 +192,13 @@ const s = StyleSheet.create({
   bannerText: { flex: 1 },
   bannerTitle: { color: "#FFA500", fontSize: 14, fontWeight: "600" },
   bannerSub: { color: "#B3B3B3", fontSize: 12, marginTop: 2 },
-  divider: { height: 1, backgroundColor: "#222", marginVertical: 24 },
+
+  divider: {
+    height: 1,
+    backgroundColor: "#222",
+    marginVertical: 24,
+  },
+
   logoutBtn: {
     flexDirection: "row",
     alignItems: "center",
@@ -198,6 +210,7 @@ const s = StyleSheet.create({
     padding: 16,
   },
   logoutText: { color: "#FF453A", fontSize: 16, fontWeight: "600" },
+
   version: {
     color: "#333",
     fontSize: 12,

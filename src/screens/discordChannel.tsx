@@ -11,7 +11,7 @@ import {
   query,
   serverTimestamp,
 } from "firebase/firestore";
-import React, {
+import {
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -295,13 +295,6 @@ export default function DiscordChannelScreen() {
             )}
           </TouchableOpacity>
         </View>
-
-        {!me && (
-          <View style={s.signInBanner}>
-            <Ionicons name="lock-closed-outline" size={12} color="#FFA500" />
-            <Text style={s.signInText}>Sign in to send messages</Text>
-          </View>
-        )}
       </KeyboardAvoidingView>
     </View>
   );
