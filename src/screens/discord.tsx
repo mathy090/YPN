@@ -1,7 +1,5 @@
 // src/screens/discord.tsx
 import { Ionicons } from "@expo/vector-icons";
-import AsyncStorage from "@react-native-async-storage/async-storage";
-import { useNavigation } from "@react-navigation/native";
 import {
   addDoc,
   collection,
@@ -12,21 +10,13 @@ import {
   serverTimestamp,
   Timestamp,
 } from "firebase/firestore";
-import React, {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
-  Animated,
   FlatList,
-  Keyboard,
-  KeyboardEvent,
-  Linking,
+  KeyboardAvoidingView,
   Platform,
+  Pressable,
   StatusBar,
   StyleSheet,
   Text,
@@ -34,70 +24,19 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
-import { MMKV } from "react-native-mmkv";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { auth } from "../firebase/auth";
-import { db } from "../firebase/firestore";
-import TeamYPNScreen from "./TeamYPN"; // Import TeamYPNScreen
+import { db as firestoreDb } from "../firebase/firestore";
+import { chatCacheRead, chatCacheWrite } from "../utils/db";
 
-// ── Config ──────────────────────────────────────────────────────
+// ── Constants ──────────────────────────────────────────────────
 const AI_URL = process.env.EXPO_PUBLIC_AI_URL
   ? `${process.env.EXPO_PUBLIC_AI_URL}/chat`
   : "https://ypn-1.onrender.com/chat";
-const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
-const ADMIN_EMAIL = "tafadzwarunowanda@gmail.com";
-const TAB_BAR_H = Platform.OS === "ios" ? 90 : 60;
 
-// ── Two-layer message + channel cache (for regular channels only) ───────────────────────────
-let _mmkv: MMKV | null = null;
-const store = () => {
-  if (!_mmkv) _mmkv = new MMKV({ id: "ypn-discord-v6" });
-  return _mmkv;
-};
-const MSG_L1 = (id: string) => `msg_l1_${id}`;
-const MSG_L2 = (id: string) => `msg_l2_${id}`;
-const CH_KEY = "channels_v2";
+const TAB_BAR_H = Platform.OS === "ios" ? 90 : 72;
 
-async function readMsgCache(id: string): Promise<Message[] | null> {
-  try {
-    const raw = store().getString(MSG_L1(id));
-    if (raw) return JSON.parse(raw);
-  } catch {}
-  try {
-    const raw = await AsyncStorage.getItem(MSG_L2(id));
-    if (raw) {
-      store().set(MSG_L1(id), raw);
-      return JSON.parse(raw);
-    }
-  } catch {}
-  return null;
-}
-
-async function writeMsgCache(id: string, msgs: Message[]) {
-  const raw = JSON.stringify(msgs.slice(-80));
-  try {
-    store().set(MSG_L1(id), raw);
-  } catch {}
-  try {
-    await AsyncStorage.setItem(MSG_L2(id), raw);
-  } catch {}
-}
-
-function readChannelCache(): Channel[] | null {
-  try {
-    const raw = store().getString(CH_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch {
-    return null;
-  }
-}
-function writeChannelCache(ch: Channel[]) {
-  try {
-    store().set(CH_KEY, JSON.stringify(ch));
-  } catch {}
-}
-
-// ── Types ────────────────────────────────────────────────────────
+// ── Types ──────────────────────────────────────────────────────
 type Message = {
   id: string;
   text: string;
@@ -118,295 +57,65 @@ type Channel = {
   isAI?: boolean;
 };
 
-// ── Static AI channel — always first ────────────────────────────
-const AI_CHANNEL: Channel = {
-  id: "ai-private",
-  name: "Team YPN",
-  description: "Your private AI assistant",
-  color: "#1DB954",
-  emoji: "🤖",
-  isAI: true,
-};
+// ── Channel definitions ────────────────────────────────────────
+const CHANNELS: Channel[] = [
+  {
+    id: "ai-private",
+    name: "Private Chat",
+    description: "Chat with YPN AI",
+    color: "#1DB954",
+    emoji: "🤖",
+    isAI: true,
+  },
+  {
+    id: "general",
+    name: "general",
+    description: "General YPN community",
+    color: "#5865F2",
+    emoji: "💬",
+  },
+  {
+    id: "mental-health",
+    name: "mental-health",
+    description: "Safe space to talk",
+    color: "#57F287",
+    emoji: "💚",
+  },
+  {
+    id: "jobs",
+    name: "jobs",
+    description: "Opportunities & careers",
+    color: "#FEE75C",
+    emoji: "💼",
+  },
+  {
+    id: "education",
+    name: "education",
+    description: "Learning & resources",
+    color: "#EB459E",
+    emoji: "📚",
+  },
+  {
+    id: "prayer",
+    name: "prayer",
+    description: "Prayer & support",
+    color: "#FF7043",
+    emoji: "🙏",
+  },
+  {
+    id: "announcements",
+    name: "announcements",
+    description: "YPN news & updates",
+    color: "#ED4245",
+    emoji: "📢",
+  },
+];
 
-// ── Email helper ─────────────────────────────────────────────────
-function openEmail(subject: string, body: string) {
-  Linking.openURL(
-    `mailto:${ADMIN_EMAIL}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`,
-  ).catch(() => {});
-}
-
-// ── Android keyboard hook ────────────────────────────────────────
-function useKeyboardOffset() {
-  const offset = useRef(new Animated.Value(0)).current;
-
-  useEffect(() => {
-    if (Platform.OS !== "android") return;
-
-    const onShow = (e: KeyboardEvent) => {
-      Animated.timing(offset, {
-        toValue: e.endCoordinates.height,
-        duration: e.duration > 0 ? e.duration : 220,
-        useNativeDriver: false,
-      }).start();
-    };
-
-    const onHide = (e: KeyboardEvent) => {
-      Animated.timing(offset, {
-        toValue: 0,
-        duration: e.duration > 0 ? e.duration : 180,
-        useNativeDriver: false,
-      }).start();
-    };
-
-    const s1 = Keyboard.addListener("keyboardDidShow", onShow);
-    const s2 = Keyboard.addListener("keyboardDidHide", onHide);
-    return () => {
-      s1.remove();
-      s2.remove();
-    };
-  }, []);
-
-  return offset;
-}
-
-// ════════════════════════════════════════════════════════════════
-// CHANNEL LIST SCREEN
-// ════════════════════════════════════════════════════════════════
-function ChannelListScreen({
-  channels,
-  loadingChannels,
-  onSelect,
-}: {
-  channels: Channel[];
-  loadingChannels: boolean;
-  onSelect: (ch: Channel) => void;
-}) {
+// ══════════════════════════════════════════════════════════════
+export default function DiscordScreen() {
   const insets = useSafeAreaInsets();
-  const statusBarH =
-    Platform.OS === "android" ? (StatusBar.currentHeight ?? 24) : 0;
-  const allChannels: Channel[] = [AI_CHANNEL, ...channels];
-
-  return (
-    <View
-      style={[
-        ls.root,
-        { paddingTop: Platform.OS === "android" ? statusBarH : insets.top },
-      ]}
-    >
-      <View style={ls.header}>
-        <Text style={ls.headerTitle}>YPN Community</Text>
-        <View style={ls.onlineDot} />
-      </View>
-
-      <View style={ls.bannersWrap}>
-        <TouchableOpacity
-          style={[ls.banner, { borderLeftColor: "#5865F2" }]}
-          activeOpacity={0.8}
-          onPress={() =>
-            openEmail(
-              "Add my content to For You",
-              "Hi,\n\nI would like to add my social content to the YPN For You feed.\n\nMy name: \nMy social handle: \nPlatform (TikTok / Instagram / YouTube): \n\nThank you!",
-            )
-          }
-        >
-          <View style={[ls.bannerIcon, { backgroundColor: "#5865F222" }]}>
-            <Ionicons name="film-outline" size={18} color="#5865F2" />
-          </View>
-          <View style={ls.bannerBody}>
-            <Text style={ls.bannerTitle}>Add content to For You</Text>
-            <Text style={ls.bannerSub}>Contact admin</Text>
-          </View>
-          <Ionicons name="chevron-forward" size={14} color="#3A3A3A" />
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          style={[ls.banner, { borderLeftColor: "#FEE75C" }]}
-          activeOpacity={0.8}
-          onPress={() =>
-            openEmail(
-              "Channel suggestion for YPN",
-              "Hi,\n\nI would like to suggest a new community channel:\n\nChannel name: \nDescription: \nWhy it would be useful: \n\nThank you!",
-            )
-          }
-        >
-          <View style={[ls.bannerIcon, { backgroundColor: "#FEE75C22" }]}>
-            <Ionicons name="bulb-outline" size={18} color="#FEE75C" />
-          </View>
-          <View style={ls.bannerBody}>
-            <Text style={ls.bannerTitle}>Suggest a channel</Text>
-            <Text style={ls.bannerSub}>Contact admin</Text>
-          </View>
-          <Ionicons name="chevron-forward" size={14} color="#3A3A3A" />
-        </TouchableOpacity>
-      </View>
-
-      <View style={ls.sectionRow}>
-        <Text style={ls.sectionLabel}>CHATS</Text>
-        <View style={ls.sectionLine} />
-      </View>
-
-      {loadingChannels && channels.length === 0 ? (
-        <View style={ls.loadingWrap}>
-          <ActivityIndicator color="#1DB954" />
-          <Text style={ls.loadingText}>Loading channels…</Text>
-        </View>
-      ) : (
-        <FlatList
-          data={allChannels}
-          keyExtractor={(ch) => ch.id}
-          showsVerticalScrollIndicator={false}
-          contentContainerStyle={{
-            paddingBottom: TAB_BAR_H + insets.bottom + 12,
-          }}
-          renderItem={({ item, index }) => (
-            <TouchableOpacity
-              style={[ls.row, index < allChannels.length - 1 && ls.rowDivider]}
-              activeOpacity={0.7}
-              onPress={() => onSelect(item)}
-            >
-              <View style={[ls.avatar, { backgroundColor: item.color + "22" }]}>
-                <Text style={{ fontSize: 24 }}>{item.emoji}</Text>
-                {item.isAI && <View style={ls.onlinePip} />}
-              </View>
-              <View style={ls.rowText}>
-                <Text style={ls.rowName}>
-                  {item.isAI ? item.name : `#${item.name}`}
-                </Text>
-                <Text style={ls.rowDesc} numberOfLines={1}>
-                  {item.description}
-                </Text>
-              </View>
-              <Ionicons name="chevron-forward" size={16} color="#2A2A2A" />
-            </TouchableOpacity>
-          )}
-        />
-      )}
-    </View>
-  );
-}
-
-const ls = StyleSheet.create({
-  root: { flex: 1, backgroundColor: "#000" },
-  header: {
-    flexDirection: "row",
-    alignItems: "center",
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "#111",
-  },
-  headerTitle: {
-    flex: 1,
-    color: "#fff",
-    fontSize: 22,
-    fontWeight: "800",
-    letterSpacing: 0.2,
-  },
-  onlineDot: {
-    width: 10,
-    height: 10,
-    borderRadius: 5,
-    backgroundColor: "#1DB954",
-  },
-  bannersWrap: { paddingHorizontal: 14, paddingTop: 14, gap: 8 },
-  banner: {
-    flexDirection: "row",
-    alignItems: "center",
-    backgroundColor: "#0E0E0E",
-    borderRadius: 12,
-    borderLeftWidth: 3,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#1A1A1A",
-    paddingHorizontal: 12,
-    paddingVertical: 11,
-    gap: 12,
-  },
-  bannerIcon: {
-    width: 36,
-    height: 36,
-    borderRadius: 9,
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  bannerBody: { flex: 1 },
-  bannerTitle: { color: "#EFEFEF", fontSize: 13, fontWeight: "600" },
-  bannerSub: { color: "#555", fontSize: 11, marginTop: 2 },
-  sectionRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    paddingHorizontal: 16,
-    marginTop: 22,
-    marginBottom: 4,
-    gap: 10,
-  },
-  sectionLabel: {
-    color: "#2E2E2E",
-    fontSize: 10,
-    fontWeight: "700",
-    letterSpacing: 1.4,
-  },
-  sectionLine: {
-    flex: 1,
-    height: StyleSheet.hairlineWidth,
-    backgroundColor: "#111",
-  },
-  loadingWrap: {
-    flex: 1,
-    justifyContent: "center",
-    alignItems: "center",
-    gap: 12,
-  },
-  loadingText: { color: "#333", fontSize: 13 },
-  row: {
-    flexDirection: "row",
-    alignItems: "center",
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    gap: 14,
-  },
-  rowDivider: {
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "#0E0E0E",
-  },
-  avatar: {
-    width: 52,
-    height: 52,
-    borderRadius: 26,
-    justifyContent: "center",
-    alignItems: "center",
-    position: "relative",
-  },
-  onlinePip: {
-    position: "absolute",
-    bottom: 1,
-    right: 1,
-    width: 13,
-    height: 13,
-    borderRadius: 6.5,
-    backgroundColor: "#1DB954",
-    borderWidth: 2,
-    borderColor: "#000",
-  },
-  rowText: { flex: 1 },
-  rowName: { color: "#FFFFFF", fontSize: 16, fontWeight: "600" },
-  rowDesc: { color: "#444", fontSize: 13, marginTop: 2 },
-});
-
-// ════════════════════════════════════════════════════════════════
-// CHAT SCREEN (for regular channels only)
-// ════════════════════════════════════════════════════════════════
-function ChatScreen({
-  channel,
-  onBack,
-}: {
-  channel: Channel;
-  onBack: () => void;
-}) {
-  const insets = useSafeAreaInsets();
-  const statusBarH =
-    Platform.OS === "android" ? (StatusBar.currentHeight ?? 24) : 0;
-  const keyboardOffset = useKeyboardOffset();
-
+  const [activeChannel, setActiveChannel] = useState<Channel>(CHANNELS[0]);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -415,15 +124,20 @@ function ChatScreen({
   const listRef = useRef<FlatList>(null);
   const me = auth.currentUser;
 
+  const statusBarH =
+    Platform.OS === "android" ? (StatusBar.currentHeight ?? 24) : 0;
+
   const scrollToBottom = useCallback(() => {
-    setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 60);
+    setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 80);
   }, []);
 
+  // ── Load channel ────────────────────────────────────────────
   useEffect(() => {
     setLoading(true);
     setMessages([]);
 
-    readMsgCache(channel.id).then((cached) => {
+    // Load from SQLite cache first
+    chatCacheRead<Message>(activeChannel.id).then((cached) => {
       if (cached?.length) {
         setMessages(cached);
         setLoading(false);
@@ -431,14 +145,13 @@ function ChatScreen({
       }
     });
 
-    // AI channel should never reach here (handled by TeamYPNScreen)
-    if (channel.isAI) {
+    if (activeChannel.isAI) {
       setLoading(false);
       return;
     }
 
     const q = query(
-      collection(db, "channels", channel.id, "messages"),
+      collection(firestoreDb, "channels", activeChannel.id, "messages"),
       orderBy("createdAt", "asc"),
       limit(80),
     );
@@ -459,490 +172,700 @@ function ChatScreen({
         });
         setMessages(msgs);
         setLoading(false);
-        writeMsgCache(channel.id, msgs);
+        chatCacheWrite(activeChannel.id, msgs);
         scrollToBottom();
       },
       () => setLoading(false),
     );
 
     return () => unsub();
-  }, [channel.id]);
+  }, [activeChannel.id]);
 
-  useEffect(() => {
-    if (messages.length > 0) scrollToBottom();
-  }, [messages.length, aiTyping]);
+  // ── Send to AI ──────────────────────────────────────────────
+  const sendToAI = useCallback(
+    async (text: string) => {
+      if (!text.trim() || sending) return;
+      setSending(true);
 
+      const userMsg: Message = {
+        id: `local_${Date.now()}`,
+        text,
+        uid: me?.uid ?? "user",
+        displayName: me?.displayName ?? "You",
+        createdAt: Date.now(),
+      };
+
+      setMessages((prev) => {
+        const next = [...prev, userMsg];
+        chatCacheWrite(activeChannel.id, next);
+        return next;
+      });
+      setInput("");
+      setAiTyping(true);
+      scrollToBottom();
+
+      try {
+        const res = await fetch(AI_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: text,
+            session_id: me?.uid ?? "ypn-general",
+          }),
+        });
+        const data = await res.json();
+        const reply = data.reply ?? data.message ?? "I'm here to help!";
+
+        const aiMsg: Message = {
+          id: `ai_${Date.now()}`,
+          text: reply,
+          uid: "ypn-ai",
+          displayName: "YPN AI",
+          createdAt: Date.now(),
+          isAI: true,
+        };
+        setMessages((prev) => {
+          const next = [...prev, aiMsg];
+          chatCacheWrite(activeChannel.id, next);
+          return next;
+        });
+      } catch {
+        const errMsg: Message = {
+          id: `err_${Date.now()}`,
+          text: "Couldn't reach the AI. Please check your connection.",
+          uid: "ypn-ai",
+          displayName: "YPN AI",
+          createdAt: Date.now(),
+          isAI: true,
+        };
+        setMessages((prev) => [...prev, errMsg]);
+      } finally {
+        setAiTyping(false);
+        setSending(false);
+        scrollToBottom();
+      }
+    },
+    [sending, me, activeChannel.id],
+  );
+
+  // ── Send to Firestore ───────────────────────────────────────
   const sendToFirestore = useCallback(
     async (text: string) => {
       if (!text.trim() || !me || sending) return;
       setSending(true);
       setInput("");
 
-      const oid = `o_${Date.now()}`;
+      const optimisticId = `local_${Date.now()}`;
       const optimistic: Message = {
-        id: oid,
+        id: optimisticId,
         text,
         uid: me.uid,
         displayName: me.displayName ?? me.email?.split("@")[0] ?? "Member",
         createdAt: Date.now(),
         pending: true,
       };
-      setMessages((p) => [...p, optimistic]);
+      setMessages((prev) => [...prev, optimistic]);
+      scrollToBottom();
 
       try {
-        await addDoc(collection(db, "channels", channel.id, "messages"), {
-          text,
-          uid: me.uid,
-          displayName:
-            me.displayName ?? me.email?.split("@")[0] ?? "YPN Member",
-          createdAt: serverTimestamp(),
-        });
-        setMessages((p) => p.filter((m) => m.id !== oid));
+        await addDoc(
+          collection(firestoreDb, "channels", activeChannel.id, "messages"),
+          {
+            text,
+            uid: me.uid,
+            displayName:
+              me.displayName ?? me.email?.split("@")[0] ?? "YPN Member",
+            createdAt: serverTimestamp(),
+          },
+        );
+        setMessages((prev) => prev.filter((m) => m.id !== optimisticId));
       } catch {
-        setMessages((p) =>
-          p.map((m) =>
-            m.id === oid ? { ...m, pending: false, failed: true } : m,
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === optimisticId ? { ...m, pending: false, failed: true } : m,
           ),
         );
       } finally {
         setSending(false);
       }
     },
-    [sending, me, channel.id],
+    [sending, me, activeChannel.id],
   );
 
   const handleSend = useCallback(() => {
     const text = input.trim();
     if (!text) return;
-    sendToFirestore(text);
-  }, [input, sendToFirestore]);
+    if (activeChannel.isAI) sendToAI(text);
+    else sendToFirestore(text);
+  }, [input, activeChannel.isAI, sendToAI, sendToFirestore]);
 
+  // ── Render message ──────────────────────────────────────────
   const renderMessage = useCallback(
     ({ item }: { item: Message }) => {
       const isMe = item.uid === me?.uid;
+      const isAI = item.isAI;
       const time = new Date(item.createdAt).toLocaleTimeString([], {
         hour: "2-digit",
         minute: "2-digit",
       });
-      const darkText = isMe && channel.color === "#FEE75C" ? "#000" : "#fff";
 
       return (
-        <View style={[cs.row, isMe && cs.rowMe]}>
+        <Pressable style={[mS.row, isMe && !isAI && mS.rowMe]}>
           {!isMe && (
             <View
-              style={[cs.avatar, { backgroundColor: channel.color + "33" }]}
+              style={[
+                mS.avatar,
+                {
+                  backgroundColor: activeChannel.color + "33",
+                  borderColor: activeChannel.color + "55",
+                },
+              ]}
             >
-              <Text
-                style={{
-                  fontSize: 11,
-                  color: channel.color,
-                  fontWeight: "700",
-                }}
-              >
-                {(item.displayName?.[0] ?? "?").toUpperCase()}
+              <Text style={[mS.avatarText, { color: activeChannel.color }]}>
+                {isAI ? "🤖" : (item.displayName?.[0] ?? "?").toUpperCase()}
               </Text>
             </View>
           )}
-
           <View
             style={[
-              cs.bubble,
-              isMe
-                ? [cs.bubbleMe, { backgroundColor: channel.color }]
-                : cs.bubbleThem,
-              item.pending && cs.bubblePending,
-              item.failed && cs.bubbleFailed,
+              mS.bubble,
+              isMe && !isAI
+                ? [mS.bubbleMe, { backgroundColor: activeChannel.color }]
+                : mS.bubbleThem,
+              item.pending && mS.bubblePending,
+              item.failed && mS.bubbleFailed,
             ]}
           >
             {!isMe && (
-              <Text style={[cs.sender, { color: channel.color }]}>
-                {item.displayName}
+              <Text style={[mS.senderName, { color: activeChannel.color }]}>
+                {isAI ? "YPN AI 🤖" : item.displayName}
               </Text>
             )}
-            <Text style={[cs.msgText, isMe && { color: darkText }]}>
+            <Text
+              style={[
+                mS.msgText,
+                isMe &&
+                  !isAI && {
+                    color: activeChannel.color === "#FEE75C" ? "#000" : "#fff",
+                  },
+              ]}
+            >
               {item.text}
             </Text>
-            <View style={cs.metaRow}>
+            <View style={mS.meta}>
               <Text
-                style={[
-                  cs.time,
-                  isMe && {
-                    color:
-                      darkText === "#000"
-                        ? "rgba(0,0,0,0.45)"
-                        : "rgba(255,255,255,0.45)",
-                  },
-                ]}
+                style={[mS.time, isMe && !isAI && { color: "rgba(0,0,0,0.4)" }]}
               >
                 {time}
               </Text>
               {item.pending && (
-                <Ionicons name="time-outline" size={11} color="#555" />
+                <Ionicons name="time-outline" size={10} color="#8E8E93" />
               )}
               {item.failed && (
                 <Ionicons
                   name="alert-circle-outline"
-                  size={11}
+                  size={10}
                   color="#FF453A"
                 />
               )}
               {isMe && !item.pending && !item.failed && (
                 <Ionicons
                   name="checkmark-done"
-                  size={11}
-                  color={
-                    darkText === "#000"
-                      ? "rgba(0,0,0,0.45)"
-                      : "rgba(255,255,255,0.45)"
-                  }
+                  size={10}
+                  color={isMe && !isAI ? "rgba(0,0,0,0.4)" : "#8E8E93"}
                 />
               )}
             </View>
           </View>
-        </View>
+        </Pressable>
       );
     },
-    [me, channel],
+    [me, activeChannel],
   );
 
-  const InputBar = (
-    <Animated.View
-      style={[
-        cs.inputWrap,
-        Platform.OS === "android"
-          ? { marginBottom: keyboardOffset }
-          : {
-              paddingBottom: insets.bottom > 0 ? insets.bottom : 8,
-            },
-      ]}
-    >
-      {!me && (
-        <View style={cs.authRow}>
-          <Ionicons name="lock-closed-outline" size={12} color="#FFA500" />
-          <Text style={cs.authText}>Sign in to send messages</Text>
-        </View>
+  const inputBarBottom = TAB_BAR_H + insets.bottom - insets.bottom;
+
+  return (
+    <View style={dS.root}>
+      {Platform.OS === "android" && (
+        <View style={{ height: statusBarH, backgroundColor: "#111" }} />
       )}
-      <View style={cs.inputRow}>
-        <TextInput
-          value={input}
-          onChangeText={setInput}
-          placeholder={me ? "Message…" : "Sign in to chat"}
-          placeholderTextColor="#555"
-          style={cs.input}
-          multiline
-          maxLength={2000}
-          editable={!!me}
-          returnKeyType="send"
-          blurOnSubmit={false}
-          onSubmitEditing={handleSend}
-          textAlignVertical="center"
-        />
+      {Platform.OS === "ios" && (
+        <View style={{ height: insets.top, backgroundColor: "#111" }} />
+      )}
+
+      {/* Header */}
+      <View style={dS.header}>
         <TouchableOpacity
-          onPress={handleSend}
-          disabled={!input.trim() || sending || !me}
-          activeOpacity={0.8}
-          style={[
-            cs.sendBtn,
-            {
-              backgroundColor: input.trim() && me ? channel.color : "#1C1C1C",
-            },
-          ]}
+          onPress={() => setSidebarOpen((p) => !p)}
+          style={dS.headerBtn}
+          hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
         >
-          {sending ? (
-            <ActivityIndicator size="small" color="#fff" />
+          <Ionicons
+            name={sidebarOpen ? "close" : "menu"}
+            size={20}
+            color="#fff"
+          />
+        </TouchableOpacity>
+
+        <Text style={{ fontSize: 16 }}>{activeChannel.emoji}</Text>
+
+        <View style={dS.headerTitleWrap}>
+          <Text style={dS.headerTitle} numberOfLines={1}>
+            {activeChannel.isAI ? activeChannel.name : `#${activeChannel.name}`}
+          </Text>
+          <Text style={dS.headerSub} numberOfLines={1}>
+            {activeChannel.description}
+          </Text>
+        </View>
+
+        {activeChannel.isAI && (
+          <View
+            style={[
+              dS.aiBadge,
+              {
+                backgroundColor: activeChannel.color + "22",
+                borderColor: activeChannel.color + "44",
+              },
+            ]}
+          >
+            <View
+              style={[dS.aiDot, { backgroundColor: activeChannel.color }]}
+            />
+            <Text style={[dS.aiBadgeText, { color: activeChannel.color }]}>
+              Online
+            </Text>
+          </View>
+        )}
+      </View>
+
+      {/* Body */}
+      <View style={dS.body}>
+        {sidebarOpen && (
+          <>
+            <Pressable
+              style={dS.overlay}
+              onPress={() => setSidebarOpen(false)}
+            />
+            <View
+              style={[
+                dS.sidebar,
+                { paddingBottom: insets.bottom + TAB_BAR_H + 8 },
+              ]}
+            >
+              <Text style={dS.sidebarHeading}>YPN Community</Text>
+
+              {CHANNELS.filter((c) => c.isAI).map((ch) => (
+                <ChannelItem
+                  key={ch.id}
+                  channel={ch}
+                  isActive={activeChannel.id === ch.id}
+                  onPress={() => {
+                    setActiveChannel(ch);
+                    setSidebarOpen(false);
+                  }}
+                />
+              ))}
+
+              <Text style={dS.sectionLabel}>TEXT CHANNELS</Text>
+
+              {CHANNELS.filter((c) => !c.isAI).map((ch) => (
+                <ChannelItem
+                  key={ch.id}
+                  channel={ch}
+                  isActive={activeChannel.id === ch.id}
+                  onPress={() => {
+                    setActiveChannel(ch);
+                    setSidebarOpen(false);
+                  }}
+                />
+              ))}
+            </View>
+          </>
+        )}
+
+        {/* Chat area */}
+        <KeyboardAvoidingView
+          style={dS.chat}
+          behavior={Platform.OS === "ios" ? "padding" : "height"}
+          keyboardVerticalOffset={
+            (Platform.OS === "ios" ? insets.top : statusBarH) + 52
+          }
+        >
+          {loading ? (
+            <View style={dS.centre}>
+              <ActivityIndicator color={activeChannel.color} size="large" />
+            </View>
           ) : (
-            <Ionicons
-              name="send"
-              size={18}
-              color={
-                input.trim() && me && channel.color === "#FEE75C"
-                  ? "#000"
-                  : "#fff"
+            <FlatList
+              ref={listRef}
+              data={messages}
+              keyExtractor={(m) => m.id}
+              renderItem={renderMessage}
+              contentContainerStyle={[
+                dS.messageList,
+                { paddingBottom: TAB_BAR_H + insets.bottom + 56 },
+              ]}
+              showsVerticalScrollIndicator={false}
+              onContentSizeChange={scrollToBottom}
+              ListEmptyComponent={
+                <View style={dS.emptyContainer}>
+                  <Text style={{ fontSize: 52 }}>{activeChannel.emoji}</Text>
+                  <Text style={dS.emptyTitle}>
+                    {activeChannel.isAI
+                      ? "Start a conversation"
+                      : `#${activeChannel.name}`}
+                  </Text>
+                  <Text style={dS.emptyDesc}>{activeChannel.description}</Text>
+                </View>
+              }
+              ListFooterComponent={
+                aiTyping ? (
+                  <View style={[mS.row, { paddingHorizontal: 10 }]}>
+                    <View
+                      style={[
+                        mS.avatar,
+                        {
+                          backgroundColor: "#1DB95433",
+                          borderColor: "#1DB95455",
+                        },
+                      ]}
+                    >
+                      <Text style={{ fontSize: 14 }}>🤖</Text>
+                    </View>
+                    <View style={mS.bubbleThem}>
+                      <Text style={dS.typingText}>typing…</Text>
+                    </View>
+                  </View>
+                ) : null
               }
             />
           )}
-        </TouchableOpacity>
-      </View>
-    </Animated.View>
-  );
 
-  return (
-    <View
-      style={[
-        cs.root,
-        {
-          paddingTop: Platform.OS === "android" ? statusBarH : insets.top,
-        },
-      ]}
-    >
-      <View style={cs.header}>
-        <TouchableOpacity
-          onPress={onBack}
-          style={cs.backBtn}
-          hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
-        >
-          <Ionicons name="arrow-back" size={24} color="#fff" />
-        </TouchableOpacity>
-        <View
-          style={[cs.headerAvatar, { backgroundColor: channel.color + "22" }]}
-        >
-          <Text style={{ fontSize: 22 }}>{channel.emoji}</Text>
-        </View>
-        <View style={cs.headerText}>
-          <Text style={cs.headerName}>#{channel.name}</Text>
-          <Text style={[cs.headerStatus, { color: channel.color }]}>
-            {channel.description}
-          </Text>
-        </View>
-      </View>
-
-      {loading ? (
-        <View style={cs.centre}>
-          <ActivityIndicator color={channel.color} size="large" />
-        </View>
-      ) : (
-        <FlatList
-          ref={listRef}
-          data={messages}
-          keyExtractor={(m) => m.id}
-          renderItem={renderMessage}
-          contentContainerStyle={cs.msgList}
-          showsVerticalScrollIndicator={false}
-          keyboardShouldPersistTaps="handled"
-          onContentSizeChange={scrollToBottom}
-          ListEmptyComponent={
-            <View style={cs.emptyWrap}>
-              <Text style={{ fontSize: 52 }}>{channel.emoji}</Text>
-              <Text style={cs.emptyTitle}>#{channel.name}</Text>
-              <Text style={cs.emptyDesc}>{channel.description}</Text>
+          {/* Input bar */}
+          <View
+            style={[
+              dS.inputBar,
+              { paddingBottom: TAB_BAR_H + insets.bottom - 48 },
+            ]}
+          >
+            {!me && (
+              <View style={dS.authBanner}>
+                <Ionicons
+                  name="lock-closed-outline"
+                  size={11}
+                  color="#FFA500"
+                />
+                <Text style={dS.authText}>Sign in to send messages</Text>
+              </View>
+            )}
+            <View style={dS.inputRow}>
+              <TextInput
+                value={input}
+                onChangeText={setInput}
+                placeholder={
+                  me
+                    ? `Message ${
+                        activeChannel.isAI ? "YPN AI" : `#${activeChannel.name}`
+                      }`
+                    : "Sign in to chat"
+                }
+                placeholderTextColor="#555"
+                style={dS.textInput}
+                multiline
+                maxLength={2000}
+                editable={!!me}
+                onSubmitEditing={handleSend}
+                blurOnSubmit={false}
+              />
+              <TouchableOpacity
+                onPress={handleSend}
+                disabled={!input.trim() || sending || !me}
+                style={[
+                  dS.sendBtn,
+                  {
+                    backgroundColor:
+                      !input.trim() || !me ? "#222" : activeChannel.color,
+                  },
+                ]}
+                activeOpacity={0.8}
+              >
+                {sending ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <Ionicons
+                    name="send"
+                    size={17}
+                    color={
+                      activeChannel.color === "#FEE75C" && !!input.trim()
+                        ? "#000"
+                        : "#fff"
+                    }
+                  />
+                )}
+              </TouchableOpacity>
             </View>
-          }
-        />
-      )}
-
-      {InputBar}
+          </View>
+        </KeyboardAvoidingView>
+      </View>
     </View>
   );
 }
 
-const cs = StyleSheet.create({
-  root: { flex: 1, backgroundColor: "#0A0A0A" },
+// ── ChannelItem ────────────────────────────────────────────────
+function ChannelItem({
+  channel,
+  isActive,
+  onPress,
+}: {
+  channel: Channel;
+  isActive: boolean;
+  onPress: () => void;
+}) {
+  return (
+    <TouchableOpacity
+      style={[
+        sideS.item,
+        isActive && { backgroundColor: channel.color + "18" },
+      ]}
+      onPress={onPress}
+      activeOpacity={0.7}
+    >
+      <View
+        style={[
+          sideS.icon,
+          {
+            backgroundColor: channel.color + "22",
+            borderColor: channel.color + "44",
+          },
+        ]}
+      >
+        <Text style={{ fontSize: 15 }}>{channel.emoji}</Text>
+      </View>
+      <View style={sideS.itemText}>
+        <Text
+          style={[
+            sideS.chName,
+            isActive && { color: channel.color, fontWeight: "700" },
+          ]}
+          numberOfLines={1}
+        >
+          {channel.isAI ? channel.name : `#${channel.name}`}
+        </Text>
+        <Text style={sideS.chDesc} numberOfLines={1}>
+          {channel.description}
+        </Text>
+      </View>
+      {isActive && (
+        <View style={[sideS.activeDot, { backgroundColor: channel.color }]} />
+      )}
+    </TouchableOpacity>
+  );
+}
+
+// ── Styles ─────────────────────────────────────────────────────
+const dS = StyleSheet.create({
+  root: { flex: 1, backgroundColor: "#0D0D0D" },
   header: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#111",
-    paddingHorizontal: 10,
+    paddingHorizontal: 12,
     paddingVertical: 10,
+    backgroundColor: "#111",
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "#1A1A1A",
-    gap: 10,
+    borderBottomColor: "#2A2A2A",
+    gap: 8,
+    minHeight: 52,
   },
-  backBtn: {
-    width: 38,
-    height: 38,
+  headerBtn: {
+    width: 32,
+    height: 32,
     justifyContent: "center",
     alignItems: "center",
-    borderRadius: 19,
+    borderRadius: 8,
+    backgroundColor: "rgba(255,255,255,0.06)",
   },
-  headerAvatar: {
-    width: 42,
-    height: 42,
-    borderRadius: 21,
-    justifyContent: "center",
+  headerTitleWrap: { flex: 1 },
+  headerTitle: { color: "#fff", fontSize: 15, fontWeight: "700" },
+  headerSub: { color: "#555", fontSize: 11, marginTop: 1 },
+  aiBadge: {
+    flexDirection: "row",
     alignItems: "center",
-    position: "relative",
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 10,
+    borderWidth: 1,
+    gap: 5,
   },
-  headerText: { flex: 1 },
-  headerName: { color: "#fff", fontSize: 16, fontWeight: "700" },
-  headerStatus: { fontSize: 12, marginTop: 1 },
+  aiDot: { width: 6, height: 6, borderRadius: 3 },
+  aiBadgeText: { fontSize: 11, fontWeight: "700" },
+  body: { flex: 1, position: "relative" },
+  overlay: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: "rgba(0,0,0,0.5)",
+    zIndex: 10,
+  },
+  sidebar: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    bottom: 0,
+    width: 260,
+    backgroundColor: "#111",
+    borderRightWidth: StyleSheet.hairlineWidth,
+    borderRightColor: "#2A2A2A",
+    paddingTop: 12,
+    paddingHorizontal: 8,
+    zIndex: 20,
+  },
+  sidebarHeading: {
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: "800",
+    paddingHorizontal: 8,
+    paddingBottom: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: "#2A2A2A",
+    marginBottom: 8,
+    letterSpacing: 0.3,
+  },
+  sectionLabel: {
+    color: "#444",
+    fontSize: 10,
+    fontWeight: "700",
+    letterSpacing: 1,
+    paddingHorizontal: 8,
+    marginTop: 14,
+    marginBottom: 6,
+    textTransform: "uppercase",
+  },
+  chat: { flex: 1 },
+  messageList: { paddingVertical: 8, paddingHorizontal: 4 },
   centre: {
     flex: 1,
     justifyContent: "center",
     alignItems: "center",
+    minHeight: 300,
   },
-  msgList: {
-    paddingHorizontal: 8,
-    paddingTop: 10,
-    paddingBottom: 16,
-  },
-  row: {
-    flexDirection: "row",
-    marginBottom: 5,
-    alignItems: "flex-end",
-    paddingHorizontal: 2,
-  },
-  rowMe: { flexDirection: "row-reverse" },
-  avatar: {
-    width: 30,
-    height: 30,
-    borderRadius: 15,
-    justifyContent: "center",
+  emptyContainer: {
     alignItems: "center",
-    marginHorizontal: 5,
-    flexShrink: 0,
-    alignSelf: "flex-end",
-    marginBottom: 2,
-  },
-  bubble: {
-    maxWidth: "75%",
-    borderRadius: 18,
-    paddingHorizontal: 13,
-    paddingVertical: 8,
-  },
-  bubbleMe: { borderBottomRightRadius: 4 },
-  bubbleThem: {
-    backgroundColor: "#1C1C1C",
-    borderBottomLeftRadius: 4,
-  },
-  bubblePending: { opacity: 0.55 },
-  bubbleFailed: { borderWidth: 1, borderColor: "#FF453A" },
-  sender: { fontSize: 11, fontWeight: "700", marginBottom: 3 },
-  msgText: { color: "#E8E8E8", fontSize: 15, lineHeight: 22 },
-  metaRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "flex-end",
-    marginTop: 4,
-    gap: 3,
-  },
-  time: { fontSize: 10, color: "rgba(255,255,255,0.35)" },
-  emptyWrap: {
-    alignItems: "center",
-    paddingTop: 80,
-    paddingHorizontal: 32,
+    padding: 32,
     gap: 10,
+    marginTop: 60,
   },
-  emptyTitle: {
-    color: "#fff",
-    fontSize: 18,
-    fontWeight: "700",
-    marginTop: 8,
-  },
+  emptyTitle: { color: "#fff", fontSize: 18, fontWeight: "700", marginTop: 4 },
   emptyDesc: {
-    color: "#444",
+    color: "#555",
     fontSize: 13,
     textAlign: "center",
     lineHeight: 20,
   },
-  inputWrap: {
+  typingText: { color: "#555", fontStyle: "italic", fontSize: 13 },
+  inputBar: {
     backgroundColor: "#111",
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: "#1A1A1A",
+    borderTopColor: "#2A2A2A",
     paddingTop: 8,
     paddingHorizontal: 10,
-    paddingBottom: 8,
   },
-  inputRow: {
-    flexDirection: "row",
-    alignItems: "flex-end",
-    gap: 8,
-  },
-  input: {
+  inputRow: { flexDirection: "row", alignItems: "flex-end", gap: 8 },
+  textInput: {
     flex: 1,
-    backgroundColor: "#1C1C1C",
-    borderRadius: 22,
-    paddingHorizontal: 16,
-    paddingVertical: Platform.OS === "android" ? 8 : 10,
+    backgroundColor: "#1A1A1A",
+    borderRadius: 20,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
     color: "#fff",
     fontSize: 15,
-    maxHeight: 110,
+    maxHeight: 100,
     lineHeight: 20,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: "#2A2A2A",
-    textAlignVertical: "center",
   },
   sendBtn: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+    width: 38,
+    height: 38,
+    borderRadius: 19,
     justifyContent: "center",
     alignItems: "center",
-    flexShrink: 0,
   },
-  authRow: {
+  authBanner: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
     gap: 5,
-    paddingBottom: 6,
+    paddingVertical: 4,
+    marginBottom: 6,
   },
   authText: { color: "#FFA500", fontSize: 11 },
 });
 
-// ════════════════════════════════════════════════════════════════
-// ROOT — switches between channel list and individual chat
-// ════════════════════════════════════════════════════════════════
-export default function DiscordScreen() {
-  const navigation = useNavigation();
-  const [channels, setChannels] = useState<Channel[]>([]);
-  const [loadingChannels, setLoadingChannels] = useState(true);
-  const [activeChannel, setActiveChannel] = useState<Channel | null>(null);
+const sideS = StyleSheet.create({
+  item: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 8,
+    paddingVertical: 8,
+    borderRadius: 10,
+    marginBottom: 2,
+    gap: 10,
+  },
+  icon: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    borderWidth: 1.5,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  itemText: { flex: 1 },
+  chName: { color: "#8E8E93", fontSize: 13, fontWeight: "500" },
+  chDesc: { color: "#3A3A3A", fontSize: 11, marginTop: 1 },
+  activeDot: { width: 6, height: 6, borderRadius: 3 },
+});
 
-  useLayoutEffect(() => {
-    if (activeChannel) {
-      navigation.setOptions({
-        tabBarStyle: {
-          height: 0,
-          overflow: "hidden",
-          display: "none",
-        },
-      });
-    } else {
-      navigation.setOptions({ tabBarStyle: undefined });
-    }
-
-    return () => {
-      navigation.setOptions({ tabBarStyle: undefined });
-    };
-  }, [navigation, activeChannel]);
-
-  useEffect(() => {
-    const cached = readChannelCache();
-    if (cached?.length) {
-      setChannels(cached);
-      setLoadingChannels(false);
-    }
-
-    async function fetchChannels() {
-      try {
-        const res = await fetch(`${API_URL}/api/discord/channels`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data: Channel[] = await res.json();
-        if (data.length > 0) {
-          writeChannelCache(data);
-          setChannels(data);
-        }
-      } catch (e) {
-        console.warn("[Discord] channel fetch:", e);
-      } finally {
-        setLoadingChannels(false);
-      }
-    }
-
-    fetchChannels();
-    const timer = setInterval(fetchChannels, 60_000);
-    return () => clearInterval(timer);
-  }, []);
-
-  if (activeChannel) {
-    // ✅ Render TeamYPNScreen for AI channel (unified cache + streaming)
-    if (activeChannel.isAI) {
-      return <TeamYPNScreen onBack={() => setActiveChannel(null)} />;
-    }
-    // Render ChatScreen for regular channels
-    return (
-      <ChatScreen
-        channel={activeChannel}
-        onBack={() => setActiveChannel(null)}
-      />
-    );
-  }
-
-  return (
-    <ChannelListScreen
-      channels={channels}
-      loadingChannels={loadingChannels}
-      onSelect={(ch) => setActiveChannel(ch)}
-    />
-  );
-}
+const mS = StyleSheet.create({
+  row: {
+    flexDirection: "row",
+    marginVertical: 2,
+    paddingHorizontal: 8,
+    alignItems: "flex-end",
+  },
+  rowMe: { flexDirection: "row-reverse" },
+  avatar: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    borderWidth: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    marginHorizontal: 6,
+    marginBottom: 2,
+    flexShrink: 0,
+  },
+  avatarText: { fontWeight: "700", fontSize: 11 },
+  bubble: {
+    maxWidth: "78%",
+    paddingHorizontal: 11,
+    paddingVertical: 7,
+    borderRadius: 16,
+  },
+  bubbleMe: { borderBottomRightRadius: 4 },
+  bubbleThem: { backgroundColor: "#1A1A1A", borderBottomLeftRadius: 4 },
+  bubblePending: { opacity: 0.5 },
+  bubbleFailed: { borderWidth: 1, borderColor: "#FF453A" },
+  senderName: { fontSize: 10, fontWeight: "700", marginBottom: 2 },
+  msgText: { color: "#E0E0E0", fontSize: 14, lineHeight: 20 },
+  meta: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "flex-end",
+    marginTop: 3,
+    gap: 3,
+  },
+  time: { color: "rgba(255,255,255,0.25)", fontSize: 9 },
+});

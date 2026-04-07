@@ -2,12 +2,13 @@
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import {
+  Alert,
   Platform,
   StatusBar as RNStatusBar,
   StyleSheet,
   Text,
   TouchableOpacity,
-  View
+  View,
 } from "react-native";
 import { useAuth } from "../../src/store/authStore";
 
@@ -18,11 +19,17 @@ export default function SettingsScreen() {
   const handleSignOut = async () => {
     try {
       await logout();
-    } catch (error) {
-      console.error("Sign out error:", error);
-    } finally {
-      // Always navigate to welcome, even if logout threw
+      // expo-router: replace to welcome so back-nav is impossible
       router.replace("/welcome");
+    } catch (error) {
+      console.error("Sign out failed:", error);
+      // Still navigate away even if remote signout had an issue
+      router.replace("/welcome");
+      Alert.alert(
+        "Sign Out Issue",
+        "You may still be signed in on this device. Please try again.",
+        [{ text: "OK", style: "cancel" }],
+      );
     }
   };
 
@@ -56,7 +63,7 @@ export default function SettingsScreen() {
 
       <View style={s.divider} />
 
-      {/* Sign out */}
+      {/* Logout */}
       <TouchableOpacity
         style={s.logoutBtn}
         onPress={handleSignOut}

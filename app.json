@@ -2,7 +2,7 @@
   "expo": {
     "name": "YPN",
     "slug": "YPN",
-    "version": "1.0.1",
+    "version": "2.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "ypn",
@@ -41,10 +41,7 @@
       ],
       "expo-font",
       "expo-secure-store",
-      "expo-sqlite",
-      "@react-native-google-signin/google-signin",
-      "react-native-localize",
-      "@react-native-community/datetimepicker"
+      "expo-sqlite"
     ],
     "experiments": {
       "typedRoutes": true,
@@ -55,6 +52,9 @@
       "eas": {
         "projectId": "a19cebbe-464a-48a4-a53d-a8bab9117154"
       }
+    },
+    "ios": {
+      "bundleIdentifier": "com.anonymous.YPN"
     }
   }
 }
