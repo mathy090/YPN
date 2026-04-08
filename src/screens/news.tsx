@@ -1,44 +1,31 @@
 // src/screens/news.tsx
 import { Ionicons } from "@expo/vector-icons";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import NetInfo from "@react-native-community/netinfo";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
-  FlatList,
   Image,
   Modal,
   Platform,
   RefreshControl,
   StatusBar as RNStatusBar,
+  ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from "react-native";
 import { WebView } from "react-native-webview";
-import { kvGetFresh, kvSetTTL } from "../utils/db";
 
-// ── Cache config ──────────────────────────────────────────────────────────────
-const NEWS_CACHE_KEY = "zw_news_v4";
-const NEWS_TTL_SEC = 20 * 60; // 20 minutes
-
+// ── Config ─────────────────────────────────────────────────────────────────────
 const API_URL = process.env.EXPO_PUBLIC_API_URL;
+const NEWS_KEY = "zw_news_v3";
+const NEWS_TS = "zw_news_ts_v3";
+const CACHE_TTL = 20 * 60 * 1000; // 20 minutes
 
-// ── Source filter chips ───────────────────────────────────────────────────────
-const SOURCE_FILTERS = [
-  { key: "all", name: "All", color: "#FFFFFF" },
-  { key: "Zimbabwe News", name: "Zim News", color: "#1DB954" },
-  { key: "Empowerment", name: "Empowerment", color: "#57F287" },
-  { key: "Mental Health", name: "Mental Health", color: "#5865F2" },
-  { key: "Jobs & Economy", name: "Jobs", color: "#FEE75C" },
-  { key: "Education", name: "Education", color: "#EB459E" },
-  { key: "Herald", name: "Herald", color: "#C0392B" },
-  { key: "NewsDay", name: "NewsDay", color: "#2980B9" },
-  { key: "263Chat", name: "263Chat", color: "#27AE60" },
-  { key: "ZimLive", name: "ZimLive", color: "#8E44AD" },
-  { key: "Africa Youth", name: "Africa", color: "#FF7043" },
-];
+// ✅ REMOVED: SOURCE_FILTERS array (no longer needed)
 
-// ── Types ─────────────────────────────────────────────────────────────────────
 type NewsItem = {
   id: string;
   title: string;
@@ -50,7 +37,26 @@ type NewsItem = {
   description: string;
 };
 
-// ── Relative time ─────────────────────────────────────────────────────────────
+// ── AsyncStorage cache helpers ─────────────────────────────────────────────────
+async function readCache(): Promise<NewsItem[] | null> {
+  try {
+    const tsRaw = await AsyncStorage.getItem(NEWS_TS);
+    const ts = tsRaw ? parseInt(tsRaw, 10) : 0;
+    if (!ts || Date.now() - ts > CACHE_TTL) return null;
+    const raw = await AsyncStorage.getItem(NEWS_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeCache(items: NewsItem[]) {
+  try {
+    await AsyncStorage.setItem(NEWS_KEY, JSON.stringify(items));
+    await AsyncStorage.setItem(MK_TS, Date.now().toString());
+  } catch {}
+}
+
 function relativeTime(ts: number): string {
   const diff = Date.now() - ts;
   const m = Math.floor(diff / 60000);
@@ -65,7 +71,7 @@ function relativeTime(ts: number): string {
   return `${Math.floor(d / 365)}y ago`;
 }
 
-// ── In-app article reader ─────────────────────────────────────────────────────
+// ── In-app reader ───────────────────────────────────────────────────────────────
 function ArticleReader({
   url,
   title,
@@ -143,7 +149,7 @@ const r = StyleSheet.create({
   },
 });
 
-// ── News card ─────────────────────────────────────────────────────────────────
+// ── News card ───────────────────────────────────────────────────────────────────
 const NewsCard = React.memo(
   ({
     item,
@@ -198,58 +204,27 @@ const NewsCard = React.memo(
   ),
 );
 
-// ── Filter bar ────────────────────────────────────────────────────────────────
-const FilterBar = ({
-  active,
-  onSelect,
-}: {
-  active: string;
-  onSelect: (key: string) => void;
-}) => (
-  <FlatList
-    horizontal
-    data={SOURCE_FILTERS}
-    keyExtractor={(i) => i.key}
-    showsHorizontalScrollIndicator={false}
-    contentContainerStyle={s.filterRow}
-    renderItem={({ item }) => {
-      const isActive = active === item.key;
-      return (
-        <TouchableOpacity
-          onPress={() => onSelect(item.key)}
-          style={[
-            s.filterChip,
-            isActive && {
-              backgroundColor: item.color + "22",
-              borderColor: item.color,
-            },
-          ]}
-          activeOpacity={0.7}
-        >
-          <Text
-            style={[
-              s.filterText,
-              isActive && { color: item.color, fontWeight: "700" },
-            ]}
-          >
-            {item.name}
-          </Text>
-        </TouchableOpacity>
-      );
-    }}
-  />
-);
+// ✅ REMOVED: FilterBar component entirely
 
-// ── Main screen ───────────────────────────────────────────────────────────────
+// ── Main screen ─────────────────────────────────────────────────────────────────
 export default function NewsScreen() {
   const [articles, setArticles] = useState<NewsItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [filter, setFilter] = useState("all");
+  // ✅ REMOVED: filter state and logic
   const [error, setError] = useState(false);
+  const [isOffline, setIsOffline] = useState(false);
   const [reading, setReading] = useState<NewsItem | null>(null);
-
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Network listener
+  useEffect(() => {
+    const unsub = NetInfo.addEventListener((state) => {
+      setIsOffline(!state.isConnected);
+      if (state.isConnected && error) fetchFromBackend(false);
+    });
+    return () => unsub();
+  }, [error]);
 
   useEffect(() => {
     boot();
@@ -260,25 +235,39 @@ export default function NewsScreen() {
 
   const scheduleRefresh = () => {
     if (refreshTimer.current) clearTimeout(refreshTimer.current);
-    refreshTimer.current = setTimeout(
-      () => fetchFromBackend(false),
-      NEWS_TTL_SEC * 1000,
-    );
+    refreshTimer.current = setTimeout(() => fetchFromBackend(false), CACHE_TTL);
   };
 
   const boot = async () => {
-    // Try SQLite cache first (TTL-aware)
-    const cached = await kvGetFresh<NewsItem[]>(NEWS_CACHE_KEY);
-    if (cached && cached.length > 0) {
+    if (isOffline) {
+      const cached = await readCache();
+      if (cached?.length) {
+        setArticles(cached);
+        setLoading(false);
+        return;
+      }
+      setError(true);
+      setLoading(false);
+      return;
+    }
+    const cached = await readCache();
+    if (cached?.length) {
       setArticles(cached);
       setLoading(false);
-      scheduleRefresh();
+      const tsRaw = await AsyncStorage.getItem(NEWS_TS);
+      const ts = tsRaw ? parseInt(tsRaw, 10) : 0;
+      if (Date.now() - ts > CACHE_TTL) fetchFromBackend(false);
+      else scheduleRefresh();
     } else {
       await fetchFromBackend(false);
     }
   };
 
   const fetchFromBackend = async (manual = true) => {
+    if (isOffline) {
+      setError(true);
+      return;
+    }
     if (manual) setRefreshing(true);
     else if (!articles.length) setLoading(true);
     setError(false);
@@ -287,12 +276,10 @@ export default function NewsScreen() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: NewsItem[] = await res.json();
       if (data.length > 0) {
-        await kvSetTTL(NEWS_CACHE_KEY, data, NEWS_TTL_SEC);
+        await writeCache(data);
         setArticles(data);
         scheduleRefresh();
-      } else {
-        setError(true);
-      }
+      } else setError(true);
     } catch {
       setError(true);
     } finally {
@@ -301,9 +288,7 @@ export default function NewsScreen() {
     }
   };
 
-  const filtered =
-    filter === "all" ? articles : articles.filter((a) => a.source === filter);
-
+  // ✅ Show all articles directly (no filtering)
   const openArticle = useCallback((item: NewsItem) => setReading(item), []);
 
   if (loading) {
@@ -318,51 +303,62 @@ export default function NewsScreen() {
   return (
     <View style={s.root}>
       <View style={{ height: TOP_OFFSET }} />
-      <FilterBar active={filter} onSelect={setFilter} />
 
+      {/* ✅ REMOVED: <FilterBar active={filter} onSelect={setFilter} /> */}
+
+      {/* ✅ Article count badge (now at very top of content) */}
       {articles.length > 0 && (
         <View style={s.countRow}>
           <Text style={s.countText}>
-            {filtered.length} article{filtered.length !== 1 ? "s" : ""}
-            {filter !== "all" ? ` · ${filter}` : ""}
+            {articles.length} article{articles.length !== 1 ? "s" : ""}{" "}
+            available
           </Text>
         </View>
       )}
 
-      {error && articles.length === 0 ? (
+      {(error || isOffline) && articles.length === 0 ? (
         <View style={s.centre}>
-          <Ionicons name="wifi-outline" size={48} color="#333" />
-          <Text style={s.errorText}>Could not load news</Text>
-          <TouchableOpacity
-            style={s.retryBtn}
-            onPress={() => fetchFromBackend(true)}
-          >
-            <Text style={s.retryText}>Retry</Text>
-          </TouchableOpacity>
+          <Ionicons
+            name={isOffline ? "wifi-off-outline" : "wifi-outline"}
+            size={48}
+            color="#333"
+          />
+          <Text style={s.errorText}>
+            {isOffline ? "No internet connection" : "Could not load news"}
+          </Text>
+          {!isOffline && (
+            <TouchableOpacity
+              style={s.retryBtn}
+              onPress={() => fetchFromBackend(true)}
+            >
+              <Text style={s.retryText}>Retry</Text>
+            </TouchableOpacity>
+          )}
         </View>
       ) : (
-        <FlatList
-          data={filtered}
-          keyExtractor={(item) => item.id}
-          renderItem={({ item }) => (
-            <NewsCard item={item} onPress={openArticle} />
-          )}
+        // ✅ ScrollView with all articles
+        <ScrollView
           contentContainerStyle={s.list}
           showsVerticalScrollIndicator={false}
           refreshControl={
             <RefreshControl
               refreshing={refreshing}
-              onRefresh={() => fetchFromBackend(true)}
+              onRefresh={() => !isOffline && fetchFromBackend(true)}
               tintColor="#1DB954"
               colors={["#1DB954"]}
             />
           }
-          ListEmptyComponent={
+        >
+          {articles.length === 0 ? (
             <View style={s.centre}>
-              <Text style={s.errorText}>No articles for this source</Text>
+              <Text style={s.errorText}>No articles available</Text>
             </View>
-          }
-        />
+          ) : (
+            articles.map((item) => (
+              <NewsCard key={item.id} item={item} onPress={openArticle} />
+            ))
+          )}
+        </ScrollView>
       )}
 
       {reading && (
@@ -372,11 +368,17 @@ export default function NewsScreen() {
           onClose={() => setReading(null)}
         />
       )}
+
+      {isOffline && articles.length > 0 && (
+        <View style={s.offlineBanner}>
+          <Ionicons name="wifi-off-outline" size={16} color="#fff" />
+          <Text style={s.offlineText}>Offline • Showing cached news</Text>
+        </View>
+      )}
     </View>
   );
 }
 
-// ── Styles ────────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#000" },
   centre: {
@@ -396,16 +398,7 @@ const s = StyleSheet.create({
     borderRadius: 20,
   },
   retryText: { color: "#000", fontWeight: "700", fontSize: 14 },
-  filterRow: { paddingHorizontal: 12, paddingVertical: 8, gap: 7 },
-  filterChip: {
-    paddingHorizontal: 12,
-    paddingVertical: 5,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: "#2A2A2A",
-    backgroundColor: "#111",
-  },
-  filterText: { color: "#555", fontSize: 12, fontWeight: "500" },
+  // ✅ REMOVED: filterRow, filterChip, filterText styles
   countRow: { paddingHorizontal: 16, paddingBottom: 6 },
   countText: { color: "#3A3A3A", fontSize: 11 },
   list: { paddingHorizontal: 12, paddingBottom: 120 },
@@ -451,11 +444,19 @@ const s = StyleSheet.create({
     flex: 1,
   },
   desc: { color: "#555", fontSize: 11, lineHeight: 16, marginTop: 4 },
-  readRow: {
+  readRow: { flexDirection: "row", alignItems: "center", gap: 3, marginTop: 6 },
+  readMore: { color: "#1DB954", fontSize: 11, fontWeight: "600" },
+  offlineBanner: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: "#333",
     flexDirection: "row",
     alignItems: "center",
-    gap: 3,
-    marginTop: 6,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    gap: 8,
   },
-  readMore: { color: "#1DB954", fontSize: 11, fontWeight: "600" },
+  offlineText: { color: "#fff", fontSize: 12, fontWeight: "500" },
 });
