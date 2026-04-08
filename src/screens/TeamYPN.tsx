@@ -12,9 +12,12 @@ import React, {
   useState,
 } from "react";
 import {
+  ActionSheetIOS,
   ActivityIndicator,
+  Alert,
   Animated,
   BackHandler,
+  Clipboard,
   Easing,
   FlatList,
   Image,
@@ -29,6 +32,8 @@ import {
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { deleteMessage } from "../errorHandlerAIchat/deleteHandler";
+import { logChatError } from "../errorHandlerAIchat/errorLogger";
 import { auth } from "../firebase/auth";
 import {
   cacheTeamYPNMessages,
@@ -88,7 +93,7 @@ function timeStr(ts: number): string {
   });
 }
 
-// ── Typing Indicator ───────────────────────────────────────────────────────────
+// ── Typing indicator ───────────────────────────────────────────────────────────
 const TypingIndicator = React.memo(() => {
   const dots = [
     useRef(new Animated.Value(0)).current,
@@ -136,11 +141,7 @@ const TypingIndicator = React.memo(() => {
 });
 
 const ty = StyleSheet.create({
-  wrap: {
-    alignSelf: "flex-start",
-    marginLeft: 12,
-    marginBottom: 6,
-  },
+  wrap: { alignSelf: "flex-start", marginLeft: 12, marginBottom: 6 },
   bubble: {
     flexDirection: "row",
     backgroundColor: "#1f1f1f",
@@ -151,51 +152,132 @@ const ty = StyleSheet.create({
     gap: 5,
     alignItems: "center",
   },
-  dot: {
-    width: 7,
-    height: 7,
-    borderRadius: 3.5,
-    backgroundColor: "#25D366",
-  },
+  dot: { width: 7, height: 7, borderRadius: 3.5, backgroundColor: "#25D366" },
 });
 
 // ── Ticks ──────────────────────────────────────────────────────────────────────
 const Ticks = React.memo(({ status }: { status: MsgStatus }) => {
-  if (status === "sending") {
+  if (status === "sending")
     return <ActivityIndicator size={10} color="rgba(255,255,255,0.5)" />;
-  }
-  if (status === "failed") {
+  if (status === "failed")
     return <Ionicons name="alert-circle" size={14} color="#FF453A" />;
-  }
   const color = status === "read" ? "#34B7F1" : "rgba(255,255,255,0.55)";
   return <Ionicons name="checkmark-done" size={14} color={color} />;
 });
+
+// ── Cross-platform action sheet ────────────────────────────────────────────────
+function showMessageActions(
+  msg: Message,
+  onDelete: (id: string) => void,
+  onRetry: (msg: Message) => void,
+): void {
+  const canRetry = msg.status === "failed";
+
+  if (Platform.OS === "ios") {
+    const options = [
+      "Copy",
+      ...(canRetry ? ["Retry"] : []),
+      "Delete",
+      "Cancel",
+    ];
+    const cancelIndex = options.length - 1;
+    const destructiveIndex = options.indexOf("Delete");
+
+    ActionSheetIOS.showActionSheetWithOptions(
+      {
+        options,
+        cancelButtonIndex: cancelIndex,
+        destructiveButtonIndex: destructiveIndex,
+        title: msg.sender === "user" ? "Your message" : "Team YPN",
+        message: msg.text.length > 60 ? msg.text.slice(0, 60) + "…" : msg.text,
+      },
+      (index) => {
+        const chosen = options[index];
+        if (chosen === "Copy") Clipboard.setString(msg.text);
+        if (chosen === "Retry") onRetry(msg);
+        if (chosen === "Delete") onDelete(msg.id);
+      },
+    );
+  } else {
+    // Android: Alert with buttons
+    const buttons: Array<{
+      text: string;
+      style?: "cancel" | "destructive" | "default";
+      onPress?: () => void;
+    }> = [
+      {
+        text: "Copy",
+        onPress: () => Clipboard.setString(msg.text),
+      },
+    ];
+
+    if (canRetry) {
+      buttons.push({ text: "Retry", onPress: () => onRetry(msg) });
+    }
+
+    buttons.push({
+      text: "Delete",
+      style: "destructive",
+      onPress: () => onDelete(msg.id),
+    });
+
+    buttons.push({ text: "Cancel", style: "cancel" });
+
+    Alert.alert(
+      msg.sender === "user" ? "Your message" : "Team YPN",
+      msg.text.length > 80 ? msg.text.slice(0, 80) + "…" : msg.text,
+      buttons,
+    );
+  }
+}
 
 // ── Bubble ─────────────────────────────────────────────────────────────────────
 type BubbleProps = {
   msg: Message;
   onRetry: (msg: Message) => void;
+  onDelete: (id: string) => void;
   streamingId: string | null;
   streamText: string;
 };
 
 const Bubble = React.memo(
-  ({ msg, onRetry, streamingId, streamText }: BubbleProps) => {
+  ({ msg, onRetry, onDelete, streamingId, streamText }: BubbleProps) => {
     const isUser = msg.sender === "user";
+    const isFailed = msg.status === "failed";
     const displayText = msg.id === streamingId ? streamText : msg.text;
+
+    const handleLongPress = useCallback(() => {
+      showMessageActions(msg, onDelete, onRetry);
+    }, [msg, onDelete, onRetry]);
+
+    // Single tap on failed bubble = instant retry shortcut
+    const handlePress = useCallback(() => {
+      if (isFailed) onRetry(msg);
+    }, [isFailed, msg, onRetry]);
 
     return (
       <View style={[bs.row, isUser && bs.rowUser]}>
         <Pressable
-          onLongPress={msg.status === "failed" ? () => onRetry(msg) : undefined}
-          style={[bs.bubble, isUser ? bs.bubbleUser : bs.bubbleAI]}
+          onPress={handlePress}
+          onLongPress={handleLongPress}
+          delayLongPress={350}
+          style={({ pressed }) => [
+            bs.bubble,
+            isUser ? bs.bubbleUser : bs.bubbleAI,
+            isFailed && bs.bubbleFailed,
+            pressed && bs.bubblePressed,
+          ]}
         >
           <Text style={[bs.text, isUser && bs.textUser]}>{displayText}</Text>
           <View style={bs.meta}>
             <Text style={[bs.time, isUser && bs.timeUser]}>
               {timeStr(msg.timestamp)}
             </Text>
-            {isUser && <Ticks status={msg.status} />}
+            {isFailed && (
+              <Text style={bs.retryHint}>tap to retry · hold for options</Text>
+            )}
+            {isUser && !isFailed && <Ticks status={msg.status} />}
+            {isFailed && <Ticks status="failed" />}
           </View>
         </Pressable>
       </View>
@@ -210,47 +292,32 @@ const bs = StyleSheet.create({
     alignSelf: "flex-start",
     maxWidth: "80%",
   },
-  rowUser: {
-    alignSelf: "flex-end",
+  rowUser: { alignSelf: "flex-end" },
+  bubble: { borderRadius: 18, paddingHorizontal: 13, paddingVertical: 9 },
+  bubbleUser: { backgroundColor: "#25D366", borderBottomRightRadius: 4 },
+  bubbleAI: { backgroundColor: "#1f1f1f", borderBottomLeftRadius: 4 },
+  bubbleFailed: {
+    backgroundColor: "#2a1010",
+    borderWidth: 1,
+    borderColor: "#FF453A44",
   },
-  bubble: {
-    borderRadius: 18,
-    paddingHorizontal: 13,
-    paddingVertical: 9,
-  },
-  bubbleUser: {
-    backgroundColor: "#25D366",
-    borderBottomRightRadius: 4,
-  },
-  bubbleAI: {
-    backgroundColor: "#1f1f1f",
-    borderBottomLeftRadius: 4,
-  },
-  text: {
-    color: "#E0E0E0",
-    fontSize: 15,
-    lineHeight: 21,
-  },
-  textUser: {
-    color: "#fff",
-  },
+  bubblePressed: { opacity: 0.75 },
+  text: { color: "#E0E0E0", fontSize: 15, lineHeight: 21 },
+  textUser: { color: "#fff" },
   meta: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "flex-end",
     marginTop: 4,
     gap: 4,
+    flexWrap: "wrap",
   },
-  time: {
-    fontSize: 10,
-    color: "rgba(255,255,255,0.4)",
-  },
-  timeUser: {
-    color: "rgba(255,255,255,0.65)",
-  },
+  time: { fontSize: 10, color: "rgba(255,255,255,0.4)" },
+  timeUser: { color: "rgba(255,255,255,0.65)" },
+  retryHint: { fontSize: 9, color: "#FF453A99", fontStyle: "italic" },
 });
 
-// ── Date Header ────────────────────────────────────────────────────────────────
+// ── Date header ────────────────────────────────────────────────────────────────
 const DateHeader = React.memo(({ label }: { label: string }) => (
   <View style={dh.wrap}>
     <View style={dh.pill}>
@@ -260,25 +327,18 @@ const DateHeader = React.memo(({ label }: { label: string }) => (
 ));
 
 const dh = StyleSheet.create({
-  wrap: {
-    alignItems: "center",
-    marginVertical: 10,
-  },
+  wrap: { alignItems: "center", marginVertical: 10 },
   pill: {
     backgroundColor: "#1a2a1a",
     borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 4,
   },
-  text: {
-    color: "#8E8E93",
-    fontSize: 11,
-    fontWeight: "600",
-  },
+  text: { color: "#8E8E93", fontSize: 11, fontWeight: "600" },
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Main Screen
+// Main screen
 // ══════════════════════════════════════════════════════════════════════════════
 export default function TeamYPNScreen({ onBack }: TeamYPNScreenProps) {
   const router = useRouter();
@@ -300,61 +360,62 @@ export default function TeamYPNScreen({ onBack }: TeamYPNScreenProps) {
 
   const me = auth.currentUser;
 
-  // ── Load cached messages on mount ────────────────────────────────────────────
+  // ── Load cache on mount ───────────────────────────────────────────────────────
   useEffect(() => {
     (async () => {
-      const cached = await getCachedTeamYPNMessages();
-      if (cached.length > 0) {
-        setMessages(cached as Message[]);
+      try {
+        const cached = await getCachedTeamYPNMessages();
+        if (cached.length > 0) {
+          // Any message still "sending" after a restart = failed
+          const fixed = cached.map((m) =>
+            (m as Message).status === "sending"
+              ? { ...m, status: "failed" as MsgStatus }
+              : m,
+          );
+          setMessages(fixed as Message[]);
+        }
+      } catch (err) {
+        logChatError("mount.loadCache", err);
+      } finally {
         setLoading(false);
         scrollToBottom(false);
-        return;
       }
-      setLoading(false);
-      scrollToBottom(false);
     })();
   }, []);
 
-  // ── Persist messages on change ───────────────────────────────────────────────
+  // ── Persist on every change ───────────────────────────────────────────────────
   useEffect(() => {
     if (messages.length === 0) return;
-    cacheTeamYPNMessages(messages.slice(-MAX_CACHED) as TeamYPNMessage[]);
+    cacheTeamYPNMessages(messages.slice(-MAX_CACHED) as TeamYPNMessage[]).catch(
+      (err) => logChatError("persist.cache", err),
+    );
   }, [messages]);
 
-  // ── Tab bar: hide on mount, restore on unmount ──────────────────────────────
+  // ── Hide tab bar ──────────────────────────────────────────────────────────────
   useLayoutEffect(() => {
     navigation.setOptions({
-      tabBarStyle: {
-        height: 0,
-        overflow: "hidden",
-        display: "none",
-      },
+      tabBarStyle: { height: 0, overflow: "hidden", display: "none" },
     });
-    return () => {
-      navigation.setOptions({ tabBarStyle: undefined });
-    };
+    return () => navigation.setOptions({ tabBarStyle: undefined });
   }, [navigation]);
 
-  // ── Android back button: navigate to Discord main page or call onBack ───────
+  // ── Android back ──────────────────────────────────────────────────────────────
   useFocusEffect(
     useCallback(() => {
       const onBackPress = () => {
-        if (onBack) {
-          onBack();
-        } else {
-          router.replace("/tabs/discord");
-        }
+        if (onBack) onBack();
+        else router.replace("/tabs/discord");
         return true;
       };
-      const subscription = BackHandler.addEventListener(
+      const sub = BackHandler.addEventListener(
         "hardwareBackPress",
         onBackPress,
       );
-      return () => subscription.remove();
+      return () => sub.remove();
     }, [onBack, router]),
   );
 
-  // ── Network listener ─────────────────────────────────────────────────────────
+  // ── Network ───────────────────────────────────────────────────────────────────
   useEffect(() => {
     const unsub = NetInfo.addEventListener((state) => {
       setIsOnline(
@@ -364,7 +425,7 @@ export default function TeamYPNScreen({ onBack }: TeamYPNScreenProps) {
     return () => unsub();
   }, []);
 
-  // ── Cleanup stream timer ─────────────────────────────────────────────────────
+  // ── Cleanup stream timer ──────────────────────────────────────────────────────
   useEffect(() => {
     return () => {
       if (streamTimer.current) clearInterval(streamTimer.current);
@@ -375,6 +436,7 @@ export default function TeamYPNScreen({ onBack }: TeamYPNScreenProps) {
     setTimeout(() => listRef.current?.scrollToEnd({ animated }), 60);
   }, []);
 
+  // ── Stream AI reply character-by-character ────────────────────────────────────
   const startStreaming = useCallback(
     (msgId: string, fullText: string) => {
       if (streamTimer.current) clearInterval(streamTimer.current);
@@ -384,8 +446,7 @@ export default function TeamYPNScreen({ onBack }: TeamYPNScreenProps) {
 
       streamTimer.current = setInterval(() => {
         revealed += STREAM_CHUNK;
-        const slice = fullText.slice(0, revealed);
-        setStreamText(slice);
+        setStreamText(fullText.slice(0, revealed));
         scrollToBottom();
 
         if (revealed >= fullText.length) {
@@ -404,11 +465,11 @@ export default function TeamYPNScreen({ onBack }: TeamYPNScreenProps) {
     [scrollToBottom],
   );
 
+  // ── Core send logic (also used for retry) ─────────────────────────────────────
   const sendMessage = useCallback(
     async (text: string, retryMsgId?: string) => {
       const trimmed = text.trim();
-      if (!trimmed || sending) return;
-      if (!isOnline) return;
+      if (!trimmed || sending || !isOnline) return;
 
       setSending(true);
 
@@ -417,19 +478,19 @@ export default function TeamYPNScreen({ onBack }: TeamYPNScreenProps) {
         id: userMsgId,
         text: trimmed,
         sender: "user",
-        timestamp: Date.now(),
+        timestamp: retryMsgId ? Date.now() : Date.now(),
         status: "sending",
       };
 
-      setMessages((prev) => {
-        if (retryMsgId) {
-          return prev.map((m) => (m.id === retryMsgId ? userMsg : m));
-        }
-        return [...prev, userMsg];
-      });
-      setInput("");
+      // Optimistic: show in list immediately
+      setMessages((prev) =>
+        retryMsgId
+          ? prev.map((m) => (m.id === retryMsgId ? userMsg : m))
+          : [...prev, userMsg],
+      );
       scrollToBottom();
 
+      // Advance to "sent" after brief delay
       setTimeout(() => {
         setMessages((prev) =>
           prev.map((m) => (m.id === userMsgId ? { ...m, status: "sent" } : m)),
@@ -450,9 +511,8 @@ export default function TeamYPNScreen({ onBack }: TeamYPNScreenProps) {
         });
 
         if (!res.ok) {
-          const errText = await res.text().catch(() => "");
-          console.error("[TeamYPN] AI fetch error:", res.status, errText);
-          throw new Error(`HTTP ${res.status}`);
+          const errBody = await res.text().catch(() => "");
+          throw new Error(`HTTP ${res.status}: ${errBody}`);
         }
 
         const data = await res.json();
@@ -460,25 +520,25 @@ export default function TeamYPNScreen({ onBack }: TeamYPNScreenProps) {
           data.reply ?? data.message ?? data.text ?? "I'm here to help!";
 
         setShowTyping(false);
-
         setMessages((prev) =>
           prev.map((m) => (m.id === userMsgId ? { ...m, status: "read" } : m)),
         );
 
         const aiMsgId = `ai_${Date.now()}`;
-        const aiMsg: Message = {
-          id: aiMsgId,
-          text: "",
-          sender: "ai",
-          timestamp: Date.now(),
-          status: "read",
-        };
-        setMessages((prev) => [...prev, aiMsg]);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: aiMsgId,
+            text: "",
+            sender: "ai",
+            timestamp: Date.now(),
+            status: "read",
+          },
+        ]);
         scrollToBottom();
-
         startStreaming(aiMsgId, reply);
-      } catch (e) {
-        console.error("[TeamYPN] send error:", e);
+      } catch (err) {
+        logChatError("sendMessage", err, { messageId: userMsgId });
         setShowTyping(false);
         setMessages((prev) =>
           prev.map((m) =>
@@ -489,16 +549,37 @@ export default function TeamYPNScreen({ onBack }: TeamYPNScreenProps) {
         setSending(false);
       }
     },
-    [sending, isOnline, scrollToBottom, startStreaming, me],
+    [sending, isOnline, me, scrollToBottom, startStreaming],
   );
 
+  // ── Send button handler — clears input BEFORE the async call ─────────────────
+  const handleSend = useCallback(() => {
+    const captured = input.trim();
+    if (!captured) return;
+    setInput(""); // immediate clear → button goes disabled at once
+    sendMessage(captured);
+  }, [input, sendMessage]);
+
+  // ── Retry (single tap on failed bubble or action sheet) ───────────────────────
   const handleRetry = useCallback(
     (msg: Message) => {
+      logChatError("retry.attempt", `Retrying ${msg.id}`, {
+        messageId: msg.id,
+        level: "warn",
+      });
       sendMessage(msg.text, msg.id);
     },
     [sendMessage],
   );
 
+  // ── Delete (local only) ───────────────────────────────────────────────────────
+  const handleDelete = useCallback((id: string) => {
+    setMessages(
+      (prev) => deleteMessage(prev as TeamYPNMessage[], id) as Message[],
+    );
+  }, []);
+
+  // ── Build flat list data with date headers ────────────────────────────────────
   const listData = useMemo<ListRow[]>(() => {
     const rows: ListRow[] = [];
     let lastLabel = "";
@@ -515,19 +596,18 @@ export default function TeamYPNScreen({ onBack }: TeamYPNScreenProps) {
 
   const renderRow = useCallback(
     ({ item }: { item: ListRow }) => {
-      if (item.type === "header") {
-        return <DateHeader label={item.label} />;
-      }
+      if (item.type === "header") return <DateHeader label={item.label} />;
       return (
         <Bubble
           msg={item.msg}
           onRetry={handleRetry}
+          onDelete={handleDelete}
           streamingId={streamingId}
           streamText={streamText}
         />
       );
     },
-    [handleRetry, streamingId, streamText],
+    [handleRetry, handleDelete, streamingId, streamText],
   );
 
   const keyExtractor = useCallback((item: ListRow) => item.key, []);
@@ -552,19 +632,20 @@ export default function TeamYPNScreen({ onBack }: TeamYPNScreenProps) {
   const statusBarH =
     Platform.OS === "android" ? (StatusBar.currentHeight ?? 24) : 0;
 
+  // Send button is only active when there is text AND not currently sending
+  const canSend = input.trim().length > 0 && !sending && isOnline;
+
   return (
     <View style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor="#111" />
 
+      {/* Header */}
       <View style={[s.header, { paddingTop: insets.top || statusBarH + 8 }]}>
         <TouchableOpacity
           style={s.backBtn}
           onPress={() => {
-            if (onBack) {
-              onBack();
-            } else {
-              router.replace("/tabs/discord");
-            }
+            if (onBack) onBack();
+            else router.replace("/tabs/discord");
           }}
           hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
         >
@@ -579,11 +660,16 @@ export default function TeamYPNScreen({ onBack }: TeamYPNScreenProps) {
         <View style={s.headerInfo}>
           <Text style={s.headerName}>Team YPN</Text>
           <Text style={[s.headerStatus, showTyping && s.headerTyping]}>
-            {showTyping ? "typing..." : "Online"}
+            {showTyping ? "typing..." : isOnline ? "Online" : "Offline"}
           </Text>
         </View>
 
-        <View style={s.onlineDot} />
+        <View
+          style={[
+            s.onlineDot,
+            { backgroundColor: isOnline ? "#25D366" : "#FF453A" },
+          ]}
+        />
       </View>
 
       <KeyboardAvoidingView
@@ -623,6 +709,7 @@ export default function TeamYPNScreen({ onBack }: TeamYPNScreenProps) {
           </View>
         )}
 
+        {/* Input bar */}
         <View style={[s.inputBar, { paddingBottom: insets.bottom || 8 }]}>
           <TextInput
             value={input}
@@ -632,17 +719,14 @@ export default function TeamYPNScreen({ onBack }: TeamYPNScreenProps) {
             style={s.input}
             multiline
             maxLength={2000}
-            editable={!sending && isOnline}
-            onSubmitEditing={() => sendMessage(input)}
+            editable={isOnline}
+            onSubmitEditing={handleSend}
             blurOnSubmit={false}
           />
           <TouchableOpacity
-            style={[
-              s.sendBtn,
-              (!input.trim() || sending || !isOnline) && s.sendBtnOff,
-            ]}
-            onPress={() => sendMessage(input)}
-            disabled={!input.trim() || sending || !isOnline}
+            style={[s.sendBtn, !canSend && s.sendBtnOff]}
+            onPress={handleSend}
+            disabled={!canSend}
             activeOpacity={0.8}
           >
             {sending ? (
@@ -657,11 +741,9 @@ export default function TeamYPNScreen({ onBack }: TeamYPNScreenProps) {
   );
 }
 
+// ── Styles ─────────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
-  root: {
-    flex: 1,
-    backgroundColor: "#0a0a0a",
-  },
+  root: { flex: 1, backgroundColor: "#0a0a0a" },
   header: {
     flexDirection: "row",
     alignItems: "center",
@@ -686,40 +768,23 @@ const s = StyleSheet.create({
     borderWidth: 1.5,
     borderColor: "#25D36644",
   },
-  headerInfo: {
-    flex: 1,
-  },
+  headerInfo: { flex: 1 },
   headerName: {
     color: "#fff",
     fontSize: 16,
     fontWeight: "700",
     letterSpacing: 0.2,
   },
-  headerStatus: {
-    color: "#25D366",
-    fontSize: 12,
-    marginTop: 1,
-  },
-  headerTyping: {
-    color: "#25D366",
-    fontStyle: "italic",
-  },
+  headerStatus: { color: "#25D366", fontSize: 12, marginTop: 1 },
+  headerTyping: { fontStyle: "italic" },
   onlineDot: {
     width: 10,
     height: 10,
     borderRadius: 5,
-    backgroundColor: "#25D366",
     marginRight: 4,
   },
-  centre: {
-    flex: 1,
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  list: {
-    paddingTop: 8,
-    paddingHorizontal: 2,
-  },
+  centre: { flex: 1, justifyContent: "center", alignItems: "center" },
+  list: { paddingTop: 8, paddingHorizontal: 2 },
   empty: {
     flex: 1,
     alignItems: "center",
@@ -734,11 +799,7 @@ const s = StyleSheet.create({
     borderWidth: 2,
     borderColor: "#25D36633",
   },
-  emptyTitle: {
-    color: "#fff",
-    fontSize: 20,
-    fontWeight: "700",
-  },
+  emptyTitle: { color: "#fff", fontSize: 20, fontWeight: "700" },
   emptyDesc: {
     color: "#555",
     fontSize: 14,
@@ -753,11 +814,7 @@ const s = StyleSheet.create({
     backgroundColor: "#1a1200",
     paddingVertical: 6,
   },
-  offlineText: {
-    color: "#FFA500",
-    fontSize: 12,
-    fontWeight: "600",
-  },
+  offlineText: { color: "#FFA500", fontSize: 12, fontWeight: "600" },
   inputBar: {
     flexDirection: "row",
     alignItems: "flex-end",
@@ -788,7 +845,5 @@ const s = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
   },
-  sendBtnOff: {
-    backgroundColor: "#1a2e1a",
-  },
+  sendBtnOff: { backgroundColor: "#1a2e1a" },
 });
