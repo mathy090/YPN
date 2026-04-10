@@ -123,8 +123,82 @@ async function connectDB() {
 }
 
 function registerRoutes() {
-  // ── POST /api/auth/login (NEW) ─────────────────────────────────────────────
-  // Handles email/password login via Firebase Admin
+  // ── NEW: GET /api/auth/verify-username-ownership ───────────────────────
+  // Logic:
+  // 1. If user has NO profile yet: Check if username is globally available. If yes, allow.
+  // 2. If user HAS a profile: Check if entered username MATCHES their stored username.
+  app.get(
+    "/api/auth/verify-username-ownership",
+    verifyFirebaseToken,
+    async (req, res) => {
+      try {
+        const { uid } = req.user;
+        const requestedUsername = (req.query.username ?? "")
+          .toString()
+          .trim()
+          .toLowerCase();
+
+        if (!requestedUsername) {
+          return res
+            .status(400)
+            .json({ message: "Username parameter required." });
+        }
+
+        // Check if this user already has a profile in MongoDB
+        const existingProfile = await db
+          .collection("users")
+          .findOne({ uid }, { projection: { username: 1, _id: 0 } });
+
+        if (!existingProfile) {
+          // --- CASE A: NEW USER ---
+          // They don't have a username yet. Just check global availability.
+          const conflict = await db
+            .collection("users")
+            .findOne(
+              { username: requestedUsername },
+              { projection: { _id: 1 } },
+            );
+
+          if (conflict) {
+            // Username taken by someone else
+            return res.status(409).json({
+              owned: false,
+              message: "Username already taken.",
+              code: "TAKEN",
+            });
+          }
+
+          // Available for them to claim
+          return res.json({
+            owned: true,
+            message: "Username available for new account.",
+          });
+        } else {
+          // --- CASE B: RETURNING USER ---
+          // They already have a username. It MUST match.
+          const storedUsername = existingProfile.username;
+
+          if (storedUsername !== requestedUsername) {
+            // Mismatch!
+            return res.status(403).json({
+              owned: false,
+              message: "This is not your username.",
+              code: "NOT_OWNER",
+              storedUsername: storedUsername,
+            });
+          }
+
+          // Match!
+          return res.json({ owned: true, message: "Username verified." });
+        }
+      } catch (err) {
+        console.error("[verify-ownership]", err);
+        res.status(500).json({ message: "Internal server error." });
+      }
+    },
+  );
+
+  // ── POST /api/auth/login ─────────────────────────────────────────────
   app.post("/api/auth/login", jsonBody, async (req, res) => {
     const { email, password } = req.body;
 
@@ -135,8 +209,6 @@ function registerRoutes() {
     }
 
     try {
-      // 1. Verify credentials using Firebase REST API (since Admin SDK doesn't have verifyPassword)
-      // We use the Web API Key for this specific step
       const FIREBASE_WEB_API_KEY = process.env.FIREBASE_WEB_API_KEY;
 
       if (!FIREBASE_WEB_API_KEY) {
@@ -155,36 +227,35 @@ function registerRoutes() {
       const restData = await restResponse.json();
 
       if (!restResponse.ok) {
-        // Map Firebase errors to our custom codes
         if (restData.error?.message === "EMAIL_NOT_FOUND") {
-          return res.status(404).json({
-            message: "Account not found.",
-            code: "ACCOUNT_NOT_FOUND",
-          });
+          return res
+            .status(404)
+            .json({ message: "Account not found.", code: "ACCOUNT_NOT_FOUND" });
         }
         if (restData.error?.message === "INVALID_PASSWORD") {
-          return res.status(401).json({
-            message: "Invalid password.",
-            code: "INVALID_CREDENTIALS",
-          });
+          return res
+            .status(401)
+            .json({
+              message: "Invalid password.",
+              code: "INVALID_CREDENTIALS",
+            });
         }
         if (restData.error?.message === "USER_DISABLED") {
-          return res.status(403).json({
-            message: "Account disabled.",
-            code: "USER_DISABLED",
-          });
+          return res
+            .status(403)
+            .json({ message: "Account disabled.", code: "USER_DISABLED" });
         }
-        // Default to invalid credentials for other auth errors
-        return res.status(401).json({
-          message: "Invalid email or password.",
-          code: "INVALID_CREDENTIALS",
-        });
+        return res
+          .status(401)
+          .json({
+            message: "Invalid email or password.",
+            code: "INVALID_CREDENTIALS",
+          });
       }
 
       const idToken = restData.idToken;
       const uid = restData.localId;
 
-      // 2. Get User Record from Admin SDK to check email verification
       const userRecord = await admin.auth().getUser(uid);
 
       if (!userRecord.emailVerified) {
@@ -194,11 +265,9 @@ function registerRoutes() {
         });
       }
 
-      // 3. Check if user has a complete profile in MongoDB
       const userProfile = await db.collection("users").findOne({ uid });
-      const hasProfile = !!userProfile?.username; // Assuming username defines completion
+      const hasProfile = !!userProfile?.username;
 
-      // 4. Return Token and Status
       res.json({
         token: idToken,
         hasProfile: hasProfile,
@@ -240,7 +309,7 @@ function registerRoutes() {
     },
   );
 
-  // ── GET /api/auth/check-username ───────────────────────────────────────────
+  // ── GET /api/auth/check-username ──────────────────────────────────────────
   app.get("/api/auth/check-username", async (req, res) => {
     try {
       const raw = (req.query.username ?? "").toString().trim().toLowerCase();
@@ -272,10 +341,12 @@ function registerRoutes() {
       res.json({ available: true, message: "Username is available." });
     } catch (err) {
       console.error("[check-username]", err.message);
-      res.status(500).json({
-        code: "SERVER_ERROR",
-        message: "Sorry, this is on our side. Please try again.",
-      });
+      res
+        .status(500)
+        .json({
+          code: "SERVER_ERROR",
+          message: "Sorry, this is on our side. Please try again.",
+        });
     }
   });
 
@@ -287,8 +358,6 @@ function registerRoutes() {
     async (req, res) => {
       try {
         const { uid, email } = req.user;
-
-        // FIX: Removed duplicate 'username' declaration. Extract all needed fields at once.
         const { name, username: rawUsername, avatarFileId } = req.body ?? {};
 
         if (!name?.trim()) {
@@ -309,7 +378,6 @@ function registerRoutes() {
           });
         }
 
-        // Final race-condition safety check at write time
         const conflict = await db
           .collection("users")
           .findOne(
@@ -329,7 +397,7 @@ function registerRoutes() {
           {
             $set: {
               username: cleanUsername,
-              name: name.trim(), // Save the name too
+              name: name.trim(),
               email,
               ...(avatarFileId ? { avatarFileId } : {}),
               hasProfile: true,
@@ -342,17 +410,20 @@ function registerRoutes() {
         res.json({ success: true });
       } catch (err) {
         console.error("/api/users/profile error:", err);
-        // Duplicate key from MongoDB (race condition)
         if (err.code === 11000) {
-          return res.status(409).json({
-            code: "USERNAME_TAKEN",
-            message: "Username already taken. Please choose another.",
-          });
+          return res
+            .status(409)
+            .json({
+              code: "USERNAME_TAKEN",
+              message: "Username already taken. Please choose another.",
+            });
         }
-        res.status(500).json({
-          code: "SERVER_ERROR",
-          message: "Sorry, this is on our side. Please try again later.",
-        });
+        res
+          .status(500)
+          .json({
+            code: "SERVER_ERROR",
+            message: "Sorry, this is on our side. Please try again later.",
+          });
       }
     },
   );
@@ -360,20 +431,22 @@ function registerRoutes() {
   // ── GET /api/users/profile ─────────────────────────────────────────────────
   app.get("/api/users/profile", verifyFirebaseToken, async (req, res) => {
     try {
-      const user = await db.collection("users").findOne(
-        { uid: req.user.uid },
-        {
-          projection: {
-            _id: 0,
-            uid: 1,
-            email: 1,
-            name: 1,
-            username: 1,
-            avatarFileId: 1,
-            hasProfile: 1,
+      const user = await db
+        .collection("users")
+        .findOne(
+          { uid: req.user.uid },
+          {
+            projection: {
+              _id: 0,
+              uid: 1,
+              email: 1,
+              name: 1,
+              username: 1,
+              avatarFileId: 1,
+              hasProfile: 1,
+            },
           },
-        },
-      );
+        );
       if (!user) return res.status(404).json({ message: "Profile not found" });
       res.json(user);
     } catch (e) {
@@ -385,9 +458,9 @@ function registerRoutes() {
   app.get("/api/users/search", verifyFirebaseToken, async (req, res) => {
     try {
       const q = (req.query.q ?? "").toString().trim();
-      if (!q || q.length < 2) {
+      if (!q || q.length < 2)
         return res.status(400).json({ message: "Query too short" });
-      }
+
       const users = await db
         .collection("users")
         .find(
@@ -416,7 +489,7 @@ function registerRoutes() {
     }
   });
 
-  // ─ GET /photos/:filename ──────────────────────────────────────────────────
+  // ── GET /photos/:filename ──────────────────────────────────────────────────
   app.get("/photos/:filename", async (req, res) => {
     try {
       const files = await db

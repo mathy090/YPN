@@ -1,6 +1,6 @@
 // app/auth/otp.tsx — Login
 //
-// Robust Error Handling Logic:
+// Custom API Login Flow with Robust Error Handling:
 // 1. Check NetInfo first.
 // 2. If NO Internet -> "Poor internet connection."
 // 3. If Has Internet:
@@ -73,6 +73,7 @@ export default function OTP() {
       // Step 2: Attempt API Call
       let response;
       try {
+        // REMOVED AbortSignal.timeout to fix compatibility issues
         response = await fetch(`${API_URL}/api/auth/login`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -80,8 +81,6 @@ export default function OTP() {
             email: email.trim(),
             password: password,
           }),
-          // Add a timeout to prevent hanging if server is dead
-          signal: AbortSignal.timeout(10000),
         });
       } catch (fetchErr: any) {
         // Fetch failed (Timeout, Connection Refused, DNS fail)
