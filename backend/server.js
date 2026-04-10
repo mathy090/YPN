@@ -214,7 +214,7 @@ function registerRoutes() {
             .json({ code: "MISSING_NAME", message: "Name is required." });
         }
 
-        const cleanUsername = (username ?? "").trim().toLowerCase();
+        const { username, email, avatarFileId } = req.body ?? {};
 
         if (!cleanUsername || !/^[a-z0-9_]{3,20}$/.test(cleanUsername)) {
           return res.status(400).json({
@@ -240,13 +240,14 @@ function registerRoutes() {
         await db.collection("users").updateOne(
           { uid },
           {
-            $set: {
-              name: name.trim(),
-              username: cleanUsername,
-              email,
-              ...(avatarUrl ? { avatarUrl } : {}),
-              hasProfile: true,
-              updatedAt: new Date(),
+           $set: {
+  username: cleanUsername,
+  email,
+  ...(avatarFileId ? { avatarFileId } : {}),
+  hasProfile: true,
+  updatedAt: new Date(),
+},
+          
             },
             $setOnInsert: { createdAt: new Date() },
           },
