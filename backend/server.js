@@ -8,6 +8,7 @@ const multer = require("multer");
 const { GridFsStorage } = require("multer-gridfs-storage");
 const admin = require("firebase-admin");
 
+// Import routes
 const {
   router: keyRoutes,
   init: initKeyStore,
@@ -27,7 +28,7 @@ const {
 const mediaRoutes = require("./src/routes/mediaRoutes");
 const avatarRoutes = require("./src/routes/avatarRoutes");
 
-// ── Firebase Admin ────────────────────────────────────────────────────────────
+// ── Firebase Admin ───────────────────────────────────────────────────────────
 if (!process.env.FIREBASE_ADMIN_KEY) {
   console.error("FIREBASE_ADMIN_KEY not set");
   process.exit(1);
@@ -43,12 +44,12 @@ try {
 
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
-// ─ Express ───────────────────────────────────────────────────────────────────
+// ── Express ───────────────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
 const jsonBody = express.json();
 
-// ── Firebase token middleware ────────────────────────────────────────────────
+// ── Firebase token middleware ─────────────────────────────────────────────────
 async function verifyFirebaseToken(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer ")) {
@@ -97,7 +98,6 @@ async function connectDB() {
   await db
     .collection("users")
     .createIndex({ username: 1 }, { unique: true, sparse: true });
-
   // Index on email for fast lookup
   await db.collection("users").createIndex({ email: 1 }, { sparse: true });
 
@@ -123,73 +123,48 @@ async function connectDB() {
 }
 
 function registerRoutes() {
-  // ── NEW: GET /api/auth/verify-username-ownership ───────────────────────
-  // Logic:
-  // 1. If user has NO profile yet: Check if username is globally available. If yes, allow.
-  // 2. If user HAS a profile: Check if entered username MATCHES their stored username.
+  // ── GET /api/auth/verify-username-ownership ─────────────────────────────
+  // LOGIC:
+  // 1. If username DOES NOT exist in DB -> Allow (New User claiming name).
+  // 2. If username EXISTS and belongs to THIS user -> Allow (Returning User).
+  // 3. If username EXISTS but belongs to SOMEONE ELSE -> Deny (Taken).
   app.get(
     "/api/auth/verify-username-ownership",
     verifyFirebaseToken,
     async (req, res) => {
       try {
-        const { uid } = req.user;
+        const { uid } = req.user; // From the logged-in token
         const requestedUsername = (req.query.username ?? "")
           .toString()
           .trim()
           .toLowerCase();
 
         if (!requestedUsername) {
-          return res
-            .status(400)
-            .json({ message: "Username parameter required." });
+          return res.status(400).json({ message: "Username required." });
         }
 
-        // Check if this user already has a profile in MongoDB
-        const existingProfile = await db
+        // Find the user document that HAS this username
+        const userWithThisName = await db
           .collection("users")
-          .findOne({ uid }, { projection: { username: 1, _id: 0 } });
+          .findOne({ username: requestedUsername }, { projection: { uid: 1 } });
 
-        if (!existingProfile) {
-          // --- CASE A: NEW USER ---
-          // They don't have a username yet. Just check global availability.
-          const conflict = await db
-            .collection("users")
-            .findOne(
-              { username: requestedUsername },
-              { projection: { _id: 1 } },
-            );
+        if (!userWithThisName) {
+          // CASE 1: Username doesn't exist yet.
+          // It's free for anyone (including this user) to claim.
+          return res.json({ owned: true, message: "Username available." });
+        }
 
-          if (conflict) {
-            // Username taken by someone else
-            return res.status(409).json({
-              owned: false,
-              message: "Username already taken.",
-              code: "TAKEN",
-            });
-          }
-
-          // Available for them to claim
-          return res.json({
-            owned: true,
-            message: "Username available for new account.",
-          });
-        } else {
-          // --- CASE B: RETURNING USER ---
-          // They already have a username. It MUST match.
-          const storedUsername = existingProfile.username;
-
-          if (storedUsername !== requestedUsername) {
-            // Mismatch!
-            return res.status(403).json({
-              owned: false,
-              message: "This is not your username.",
-              code: "NOT_OWNER",
-              storedUsername: storedUsername,
-            });
-          }
-
-          // Match!
+        // Username exists. Check if it belongs to the current user.
+        if (userWithThisName.uid === uid) {
+          // CASE 2: Match! This user already owns this name.
           return res.json({ owned: true, message: "Username verified." });
+        } else {
+          // CASE 3: Mismatch! Someone else owns this name.
+          return res.status(403).json({
+            owned: false,
+            message: "This username is already taken by another user.",
+            code: "NOT_OWNER",
+          });
         }
       } catch (err) {
         console.error("[verify-ownership]", err);
