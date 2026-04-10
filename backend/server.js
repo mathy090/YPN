@@ -1,4 +1,3 @@
-// backend/server.js
 "use strict";
 require("dotenv").config();
 
@@ -44,12 +43,12 @@ try {
 
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
-// ── Express ───────────────────────────────────────────────────────────────────
+// ─ Express ───────────────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
 const jsonBody = express.json();
 
-// ── Firebase token middleware ─────────────────────────────────────────────────
+// ── Firebase token middleware ────────────────────────────────────────────────
 async function verifyFirebaseToken(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer ")) {
@@ -63,12 +62,10 @@ async function verifyFirebaseToken(req, res, next) {
     next();
   } catch (err) {
     if (err.code === "auth/id-token-expired") {
-      return res
-        .status(401)
-        .json({
-          message: "Token expired. Please sign in again.",
-          code: "TOKEN_EXPIRED",
-        });
+      return res.status(401).json({
+        message: "Token expired. Please sign in again.",
+        code: "TOKEN_EXPIRED",
+      });
     }
     return res
       .status(401)
@@ -78,13 +75,11 @@ async function verifyFirebaseToken(req, res, next) {
 
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get("/", (_req, res) =>
-  res
-    .status(200)
-    .json({
-      status: "ok",
-      service: "YPN Backend",
-      time: new Date().toISOString(),
-    }),
+  res.status(200).json({
+    status: "ok",
+    service: "YPN Backend",
+    time: new Date().toISOString(),
+  }),
 );
 app.head("/", (_req, res) => res.status(200).end());
 
@@ -98,7 +93,7 @@ async function connectDB() {
   await client.connect();
   db = client.db("ypn_users");
 
-  // Unique sparse index on username — sparse means docs without username are ignored
+  // Unique sparse index on username
   await db
     .collection("users")
     .createIndex({ username: 1 }, { unique: true, sparse: true });
@@ -128,6 +123,93 @@ async function connectDB() {
 }
 
 function registerRoutes() {
+  // ── POST /api/auth/login (NEW) ─────────────────────────────────────────────
+  // Handles email/password login via Firebase Admin
+  app.post("/api/auth/login", jsonBody, async (req, res) => {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res
+        .status(400)
+        .json({ message: "Email and password are required." });
+    }
+
+    try {
+      // 1. Verify credentials using Firebase REST API (since Admin SDK doesn't have verifyPassword)
+      // We use the Web API Key for this specific step
+      const FIREBASE_WEB_API_KEY = process.env.FIREBASE_WEB_API_KEY;
+
+      if (!FIREBASE_WEB_API_KEY) {
+        console.error("FIREBASE_WEB_API_KEY missing in env");
+        return res.status(500).json({ message: "Server configuration error." });
+      }
+
+      const restUrl = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_WEB_API_KEY}`;
+
+      const restResponse = await fetch(restUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password, returnSecureToken: true }),
+      });
+
+      const restData = await restResponse.json();
+
+      if (!restResponse.ok) {
+        // Map Firebase errors to our custom codes
+        if (restData.error?.message === "EMAIL_NOT_FOUND") {
+          return res.status(404).json({
+            message: "Account not found.",
+            code: "ACCOUNT_NOT_FOUND",
+          });
+        }
+        if (restData.error?.message === "INVALID_PASSWORD") {
+          return res.status(401).json({
+            message: "Invalid password.",
+            code: "INVALID_CREDENTIALS",
+          });
+        }
+        if (restData.error?.message === "USER_DISABLED") {
+          return res.status(403).json({
+            message: "Account disabled.",
+            code: "USER_DISABLED",
+          });
+        }
+        // Default to invalid credentials for other auth errors
+        return res.status(401).json({
+          message: "Invalid email or password.",
+          code: "INVALID_CREDENTIALS",
+        });
+      }
+
+      const idToken = restData.idToken;
+      const uid = restData.localId;
+
+      // 2. Get User Record from Admin SDK to check email verification
+      const userRecord = await admin.auth().getUser(uid);
+
+      if (!userRecord.emailVerified) {
+        return res.status(403).json({
+          message: "Email not verified. Please check your inbox.",
+          code: "EMAIL_NOT_VERIFIED",
+        });
+      }
+
+      // 3. Check if user has a complete profile in MongoDB
+      const userProfile = await db.collection("users").findOne({ uid });
+      const hasProfile = !!userProfile?.username; // Assuming username defines completion
+
+      // 4. Return Token and Status
+      res.json({
+        token: idToken,
+        hasProfile: hasProfile,
+        user: { uid, email: userRecord.email },
+      });
+    } catch (err) {
+      console.error("[/api/auth/login] Error:", err);
+      res.status(500).json({ message: "Internal server error." });
+    }
+  });
+
   // ── POST /api/auth/verify ──────────────────────────────────────────────────
   app.post(
     "/api/auth/verify",
@@ -159,7 +241,6 @@ function registerRoutes() {
   );
 
   // ── GET /api/auth/check-username ───────────────────────────────────────────
-  // No auth needed — called before profile is created
   app.get("/api/auth/check-username", async (req, res) => {
     try {
       const raw = (req.query.username ?? "").toString().trim().toLowerCase();
@@ -206,7 +287,9 @@ function registerRoutes() {
     async (req, res) => {
       try {
         const { uid, email } = req.user;
-        const { name, username, avatarUrl } = req.body ?? {};
+
+        // FIX: Removed duplicate 'username' declaration. Extract all needed fields at once.
+        const { name, username: rawUsername, avatarFileId } = req.body ?? {};
 
         if (!name?.trim()) {
           return res
@@ -214,7 +297,10 @@ function registerRoutes() {
             .json({ code: "MISSING_NAME", message: "Name is required." });
         }
 
-        const { username, email, avatarFileId } = req.body ?? {};
+        const cleanUsername = (rawUsername ?? "")
+          .toString()
+          .trim()
+          .toLowerCase();
 
         if (!cleanUsername || !/^[a-z0-9_]{3,20}$/.test(cleanUsername)) {
           return res.status(400).json({
@@ -230,6 +316,7 @@ function registerRoutes() {
             { username: cleanUsername, uid: { $ne: uid } },
             { projection: { _id: 1 } },
           );
+
         if (conflict) {
           return res.status(409).json({
             code: "USERNAME_TAKEN",
@@ -240,16 +327,14 @@ function registerRoutes() {
         await db.collection("users").updateOne(
           { uid },
           {
-           $set: {
-  username: cleanUsername,
-  email,
-  ...(avatarFileId ? { avatarFileId } : {}),
-  hasProfile: true,
-  updatedAt: new Date(),
-},
-          
+            $set: {
+              username: cleanUsername,
+              name: name.trim(), // Save the name too
+              email,
+              ...(avatarFileId ? { avatarFileId } : {}),
+              hasProfile: true,
+              updatedAt: new Date(),
             },
-            $setOnInsert: { createdAt: new Date() },
           },
           { upsert: true },
         );
@@ -275,22 +360,20 @@ function registerRoutes() {
   // ── GET /api/users/profile ─────────────────────────────────────────────────
   app.get("/api/users/profile", verifyFirebaseToken, async (req, res) => {
     try {
-      const user = await db
-        .collection("users")
-        .findOne(
-          { uid: req.user.uid },
-          {
-            projection: {
-              _id: 0,
-              uid: 1,
-              email: 1,
-              name: 1,
-              username: 1,
-              avatarUrl: 1,
-              hasProfile: 1,
-            },
+      const user = await db.collection("users").findOne(
+        { uid: req.user.uid },
+        {
+          projection: {
+            _id: 0,
+            uid: 1,
+            email: 1,
+            name: 1,
+            username: 1,
+            avatarFileId: 1,
+            hasProfile: 1,
           },
-        );
+        },
+      );
       if (!user) return res.status(404).json({ message: "Profile not found" });
       res.json(user);
     } catch (e) {
@@ -316,7 +399,13 @@ function registerRoutes() {
             uid: { $ne: req.user.uid },
           },
           {
-            projection: { _id: 0, uid: 1, name: 1, username: 1, avatarUrl: 1 },
+            projection: {
+              _id: 0,
+              uid: 1,
+              name: 1,
+              username: 1,
+              avatarFileId: 1,
+            },
             limit: 20,
           },
         )
@@ -327,7 +416,7 @@ function registerRoutes() {
     }
   });
 
-  // ── GET /photos/:filename ──────────────────────────────────────────────────
+  // ─ GET /photos/:filename ──────────────────────────────────────────────────
   app.get("/photos/:filename", async (req, res) => {
     try {
       const files = await db

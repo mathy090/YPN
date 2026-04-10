@@ -1,10 +1,8 @@
 // src/utils/cache.ts
+// Fix: added missing export `CachedMessage` type that discordChannel.tsx imports.
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Crypto from "expo-crypto";
-import {
-  openDatabaseSync,
-  type SQLiteDatabase
-} from "expo-sqlite";
+import { openDatabaseSync, type SQLiteDatabase } from "expo-sqlite";
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 const CACHE_PREFIX = "YPN_SECURE_CACHE:";
@@ -43,6 +41,18 @@ export type ForYouVideo = {
   thumbnail: string | null;
 };
 
+/**
+ * CachedMessage — shape stored when caching Discord channel messages.
+ * Exported so discordChannel.tsx can use the same type without duplication.
+ */
+export type CachedMessage = {
+  id: string;
+  text: string;
+  uid: string;
+  displayName: string;
+  createdAt: number;
+};
+
 // ── SQLite Database ───────────────────────────────────────────────────────────
 let db: SQLiteDatabase | null = null;
 let deviceId: string | null = null;
@@ -66,14 +76,12 @@ const generateDeviceId = async (): Promise<string> => {
 
 const ensureDeviceId = async (): Promise<void> => {
   if (deviceId) return;
-
   try {
     const stored = await AsyncStorage.getItem(DEVICE_ID_KEY);
     if (stored) {
       deviceId = stored;
       return;
     }
-
     deviceId = await generateDeviceId();
     await AsyncStorage.setItem(DEVICE_ID_KEY, deviceId);
   } catch (e) {
@@ -103,7 +111,6 @@ export const initializeSecureCache = async (): Promise<void> => {
     await initPromise;
     return;
   }
-
   initPromise = (async () => {
     try {
       await ensureDeviceId();
@@ -112,7 +119,6 @@ export const initializeSecureCache = async (): Promise<void> => {
       console.warn("[Cache] Init error:", e);
     }
   })();
-
   await initPromise;
 };
 
@@ -121,9 +127,7 @@ const ensureInitialized = async (): Promise<void> => {
 };
 
 // ── Key Helper ────────────────────────────────────────────────────────────────
-const makeKey = (key: string): string => {
-  return `${CACHE_PREFIX}${key}`;
-};
+const makeKey = (key: string): string => `${CACHE_PREFIX}${key}`;
 
 // ── Core Cache Operations ─────────────────────────────────────────────────────
 
@@ -135,18 +139,11 @@ export const setSecureCache = async (
   try {
     await ensureInitialized();
     if (!deviceId) return;
-
     const fullKey = makeKey(key);
-    const item: CacheItem = {
-      data,
-      timestamp: Date.now(),
-      ttl,
-      deviceId,
-    };
+    const item: CacheItem = { data, timestamp: Date.now(), ttl, deviceId };
     const value = JSON.stringify(item);
-
-    const db = getDB();
-    await db.runAsync(
+    const database = getDB();
+    await database.runAsync(
       "INSERT OR REPLACE INTO cache_items (key, value, timestamp, ttl, device_id) VALUES (?, ?, ?, ?, ?)",
       fullKey,
       value,
@@ -163,29 +160,19 @@ export const getSecureCache = async (key: string): Promise<any | null> => {
   try {
     await ensureInitialized();
     if (!deviceId) return null;
-
     const fullKey = makeKey(key);
-    const db = getDB();
-
-    const result = await db.getFirstAsync<{ value: string }>(
+    const database = getDB();
+    const result = await database.getFirstAsync<{ value: string }>(
       "SELECT value FROM cache_items WHERE key = ? AND device_id = ?",
       fullKey,
       deviceId,
     );
-
-    if (!result?.value) {
-      return null;
-    }
-
+    if (!result?.value) return null;
     const item = JSON.parse(result.value) as CacheItem;
-    const now = Date.now();
-
-    if (now - item.timestamp > item.ttl) {
-      // Expired — delete and return null
-      await db.runAsync("DELETE FROM cache_items WHERE key = ?", fullKey);
+    if (Date.now() - item.timestamp > item.ttl) {
+      await database.runAsync("DELETE FROM cache_items WHERE key = ?", fullKey);
       return null;
     }
-
     return item.data;
   } catch (e) {
     console.warn(`[Cache] getSecureCache error for ${key}:`, e);
@@ -197,8 +184,8 @@ export const removeSecureCache = async (key: string): Promise<void> => {
   try {
     await ensureInitialized();
     const fullKey = makeKey(key);
-    const db = getDB();
-    await db.runAsync("DELETE FROM cache_items WHERE key = ?", fullKey);
+    const database = getDB();
+    await database.runAsync("DELETE FROM cache_items WHERE key = ?", fullKey);
   } catch (e) {
     console.warn(`[Cache] removeSecureCache error for ${key}:`, e);
   }
@@ -208,17 +195,18 @@ export const clearSecureCache = async (): Promise<void> => {
   try {
     await ensureInitialized();
     if (!deviceId) return;
-
-    const db = getDB();
-    await db.runAsync("DELETE FROM cache_items WHERE device_id = ?", deviceId);
+    const database = getDB();
+    await database.runAsync(
+      "DELETE FROM cache_items WHERE device_id = ?",
+      deviceId,
+    );
   } catch (e) {
     console.warn("[Cache] clearSecureCache error:", e);
   }
 };
 
-export const isSecureCacheInitialized = (): boolean => {
-  return deviceId !== null && db !== null;
-};
+export const isSecureCacheInitialized = (): boolean =>
+  deviceId !== null && db !== null;
 
 // ── TeamYPN Message Cache ─────────────────────────────────────────────────────
 
@@ -229,7 +217,7 @@ export const cacheTeamYPNMessages = async (
     CACHE_KEYS.TEAM_YPN_MESSAGES,
     messages,
     30 * 24 * 60 * 60 * 1000,
-  ); // 30 days
+  );
 };
 
 export const getCachedTeamYPNMessages = async (): Promise<
@@ -248,7 +236,7 @@ export const cacheForYouManifest = async (
     CACHE_KEYS.FORYOU_MANIFEST,
     videos,
     7 * 24 * 60 * 60 * 1000,
-  ); // 7 days
+  );
 };
 
 export const getCachedForYouManifest = async (): Promise<
@@ -262,7 +250,7 @@ export const getCachedForYouManifest = async (): Promise<
 
 export const cacheDiscordMessages = async (
   channelId: string,
-  messages: any[],
+  messages: CachedMessage[],
 ): Promise<void> => {
   await setSecureCache(
     CACHE_KEYS.discordChannelMessages(channelId),
@@ -273,7 +261,7 @@ export const cacheDiscordMessages = async (
 
 export const getCachedDiscordMessages = async (
   channelId: string,
-): Promise<any[] | null> => {
+): Promise<CachedMessage[] | null> => {
   return await getSecureCache(CACHE_KEYS.discordChannelMessages(channelId));
 };
 

@@ -1,7 +1,7 @@
 // app/auth/device.tsx
 import { Ionicons } from "@expo/vector-icons";
-import { LinearGradient } from "expo-linear-gradient";
 import * as ImagePicker from "expo-image-picker";
+import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { getAuth } from "firebase/auth";
@@ -606,8 +606,11 @@ export default function Device() {
     try {
       const headers = await authHeaders();
 
+      // REFACTORED: Added 'name' field to satisfy backend requirement
+      // Using username as the initial display name
       const payload: Record<string, string> = {
         username: username.trim().toLowerCase(),
+        name: username.trim(),
         email: user.email,
       };
       if (finalFileId) {

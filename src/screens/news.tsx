@@ -1,4 +1,5 @@
 // src/screens/news.tsx
+// Fix: writeCache was calling undefined `MK_TS` — replaced with `NEWS_TS`.
 import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import NetInfo from "@react-native-community/netinfo";
@@ -21,10 +22,8 @@ import { WebView } from "react-native-webview";
 // ── Config ─────────────────────────────────────────────────────────────────────
 const API_URL = process.env.EXPO_PUBLIC_API_URL;
 const NEWS_KEY = "zw_news_v3";
-const NEWS_TS = "zw_news_ts_v3";
+const NEWS_TS = "zw_news_ts_v3"; // ← was MK_TS (undefined) — now consistent
 const CACHE_TTL = 20 * 60 * 1000; // 20 minutes
-
-// ✅ REMOVED: SOURCE_FILTERS array (no longer needed)
 
 type NewsItem = {
   id: string;
@@ -37,7 +36,7 @@ type NewsItem = {
   description: string;
 };
 
-// ── AsyncStorage cache helpers ─────────────────────────────────────────────────
+// ── Cache helpers ──────────────────────────────────────────────────────────────
 async function readCache(): Promise<NewsItem[] | null> {
   try {
     const tsRaw = await AsyncStorage.getItem(NEWS_TS);
@@ -53,7 +52,7 @@ async function readCache(): Promise<NewsItem[] | null> {
 async function writeCache(items: NewsItem[]) {
   try {
     await AsyncStorage.setItem(NEWS_KEY, JSON.stringify(items));
-    await AsyncStorage.setItem(MK_TS, Date.now().toString());
+    await AsyncStorage.setItem(NEWS_TS, Date.now().toString()); // ← fixed
   } catch {}
 }
 
@@ -71,7 +70,7 @@ function relativeTime(ts: number): string {
   return `${Math.floor(d / 365)}y ago`;
 }
 
-// ── In-app reader ───────────────────────────────────────────────────────────────
+// ── In-app reader ──────────────────────────────────────────────────────────────
 function ArticleReader({
   url,
   title,
@@ -149,7 +148,7 @@ const r = StyleSheet.create({
   },
 });
 
-// ── News card ───────────────────────────────────────────────────────────────────
+// ── News card ──────────────────────────────────────────────────────────────────
 const NewsCard = React.memo(
   ({
     item,
@@ -204,20 +203,16 @@ const NewsCard = React.memo(
   ),
 );
 
-// ✅ REMOVED: FilterBar component entirely
-
-// ── Main screen ─────────────────────────────────────────────────────────────────
+// ── Main screen ────────────────────────────────────────────────────────────────
 export default function NewsScreen() {
   const [articles, setArticles] = useState<NewsItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  // ✅ REMOVED: filter state and logic
   const [error, setError] = useState(false);
   const [isOffline, setIsOffline] = useState(false);
   const [reading, setReading] = useState<NewsItem | null>(null);
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Network listener
   useEffect(() => {
     const unsub = NetInfo.addEventListener((state) => {
       setIsOffline(!state.isConnected);
@@ -279,7 +274,9 @@ export default function NewsScreen() {
         await writeCache(data);
         setArticles(data);
         scheduleRefresh();
-      } else setError(true);
+      } else {
+        setError(true);
+      }
     } catch {
       setError(true);
     } finally {
@@ -288,7 +285,6 @@ export default function NewsScreen() {
     }
   };
 
-  // ✅ Show all articles directly (no filtering)
   const openArticle = useCallback((item: NewsItem) => setReading(item), []);
 
   if (loading) {
@@ -304,9 +300,6 @@ export default function NewsScreen() {
     <View style={s.root}>
       <View style={{ height: TOP_OFFSET }} />
 
-      {/* ✅ REMOVED: <FilterBar active={filter} onSelect={setFilter} /> */}
-
-      {/* ✅ Article count badge (now at very top of content) */}
       {articles.length > 0 && (
         <View style={s.countRow}>
           <Text style={s.countText}>
@@ -336,7 +329,6 @@ export default function NewsScreen() {
           )}
         </View>
       ) : (
-        // ✅ ScrollView with all articles
         <ScrollView
           contentContainerStyle={s.list}
           showsVerticalScrollIndicator={false}
@@ -398,7 +390,6 @@ const s = StyleSheet.create({
     borderRadius: 20,
   },
   retryText: { color: "#000", fontWeight: "700", fontSize: 14 },
-  // ✅ REMOVED: filterRow, filterChip, filterText styles
   countRow: { paddingHorizontal: 16, paddingBottom: 6 },
   countText: { color: "#3A3A3A", fontSize: 11 },
   list: { paddingHorizontal: 12, paddingBottom: 120 },
