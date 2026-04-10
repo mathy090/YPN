@@ -1,38 +1,39 @@
 // src/firebase/auth.ts
+import ReactNativeAsyncStorage from "@react-native-async-storage/async-storage";
 import {
-  createUserWithEmailAndPassword,
   getAuth,
+  getReactNativePersistence,
+  initializeAuth,
   onAuthStateChanged,
-  sendEmailVerification,
-  signInWithEmailAndPassword,
   signOut,
   User,
 } from "firebase/auth";
-import { app } from "./firebase"; // Your firebase config file
+import { app } from "./firebase";
 
-// 1. Initialize Auth WITHOUT explicit persistence argument.
-// This is INSTANT and does NOT block on AsyncStorage.
-const auth = getAuth(app);
+// initializeAuth once — if already initialized grab the existing instance
+let auth: ReturnType<typeof getAuth>;
 
-// 2. Standard Helpers
-const subscribeToAuth = (cb: (user: User | null) => void) => {
-  return onAuthStateChanged(auth, cb);
-};
+try {
+  auth = initializeAuth(app, {
+    persistence: getReactNativePersistence(ReactNativeAsyncStorage),
+  });
+} catch (e: any) {
+  // Already initialized — grab existing instance with persistence intact
+  auth = getAuth(app);
+}
+
+const subscribeToAuth = (cb: (user: User | null) => void) =>
+  onAuthStateChanged(auth, cb);
 
 const logout = async () => {
-  try {
-    await signOut(auth);
-  } catch (e) {
-    console.warn("[Firebase] Sign out error:", e);
-  }
+  await signOut(auth);
 };
 
-export {
-  auth,
-  createUserWithEmailAndPassword,
-  logout,
-  sendEmailVerification,
-  signInWithEmailAndPassword,
-  subscribeToAuth
-};
+export { auth, logout, subscribeToAuth };
+
+  export {
+    createUserWithEmailAndPassword,
+    sendEmailVerification,
+    signInWithEmailAndPassword
+  } from "firebase/auth";
 

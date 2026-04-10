@@ -1,9 +1,7 @@
 // app/tabs/settings.tsx
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
-import { useState } from "react"; // Import useState
 import {
-  ActivityIndicator,
   Alert,
   Linking,
   Platform,
@@ -24,41 +22,30 @@ function openAdminEmail() {
   );
   Linking.openURL(
     `mailto:${ADMIN_EMAIL}?subject=${subject}&body=${body}`,
-  ).catch(() => Alert.alert("Error", "Could not open email client."));
+  ).catch(() => {
+    Alert.alert(
+      "Error",
+      "Could not open email client. Please contact admin manually.",
+    );
+  });
 }
 
 export default function SettingsScreen() {
   const { logout, user } = useAuth();
   const router = useRouter();
-  const [isSigningOut, setIsSigningOut] = useState(false); // Local loading state
 
   const handleSignOut = () => {
-    Alert.alert(
-      "Sign Out",
-      "Are you sure? All local session data will be cleared.",
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Sign Out",
-          style: "destructive",
-          onPress: async () => {
-            if (isSigningOut) return; // Prevent double tap
-            setIsSigningOut(true);
-            try {
-              await logout();
-              router.replace("/welcome");
-            } catch (e) {
-              console.error("[settings] logout error:", e);
-              Alert.alert(
-                "Sign Out Failed",
-                "Could not sign out. Please try again.",
-              );
-              setIsSigningOut(false); // Only reset if failed
-            }
-          },
+    Alert.alert("Sign Out", "Are you sure you want to sign out?", [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Sign Out",
+        style: "destructive",
+        onPress: async () => {
+          await logout(); // wipes Firebase, SecureStore, AsyncStorage, SQLite
+          router.replace("/welcome");
         },
-      ],
-    );
+      },
+    ]);
   };
 
   const displayName = user?.displayName ?? "YPN Member";
@@ -84,7 +71,6 @@ export default function SettingsScreen() {
         <Text style={s.title}>Settings</Text>
       </View>
 
-      {/* Profile card */}
       <View style={s.profileCard}>
         <View style={s.avatarCircle}>
           <Text style={s.avatarText}>{avatarChar}</Text>
@@ -95,7 +81,6 @@ export default function SettingsScreen() {
         </View>
       </View>
 
-      {/* Admin contact */}
       <TouchableOpacity
         style={s.banner}
         onPress={openAdminEmail}
@@ -113,21 +98,13 @@ export default function SettingsScreen() {
 
       <View style={s.divider} />
 
-      {/* Sign out */}
       <TouchableOpacity
-        style={[s.logoutBtn, isSigningOut && s.logoutBtnDisabled]}
+        style={s.logoutBtn}
         onPress={handleSignOut}
-        disabled={isSigningOut}
         activeOpacity={0.8}
       >
-        {isSigningOut ? (
-          <ActivityIndicator size="small" color="#FF453A" />
-        ) : (
-          <Ionicons name="log-out-outline" size={20} color="#FF453A" />
-        )}
-        <Text style={s.logoutText}>
-          {isSigningOut ? "Signing Out..." : "Sign Out"}
-        </Text>
+        <Ionicons name="log-out-outline" size={20} color="#FF453A" />
+        <Text style={s.logoutText}>Sign Out</Text>
       </TouchableOpacity>
 
       <Text style={s.version}>YPN © 2026</Text>
@@ -136,14 +113,9 @@ export default function SettingsScreen() {
 }
 
 const s = StyleSheet.create({
-  root: {
-    flex: 1,
-    backgroundColor: "#000",
-    paddingHorizontal: 20,
-  },
+  root: { flex: 1, backgroundColor: "#000", paddingHorizontal: 20 },
   header: { paddingBottom: 24 },
   title: { color: "#fff", fontSize: 32, fontWeight: "800" },
-
   profileCard: {
     flexDirection: "row",
     alignItems: "center",
@@ -168,7 +140,6 @@ const s = StyleSheet.create({
   profileInfo: { flex: 1 },
   profileName: { color: "#fff", fontSize: 17, fontWeight: "600" },
   profileEmail: { color: "#8E8E93", fontSize: 13, marginTop: 2 },
-
   banner: {
     flexDirection: "row",
     alignItems: "center",
@@ -191,17 +162,10 @@ const s = StyleSheet.create({
   bannerText: { flex: 1 },
   bannerTitle: { color: "#FFA500", fontSize: 14, fontWeight: "600" },
   bannerSub: { color: "#B3B3B3", fontSize: 12, marginTop: 2 },
-
-  divider: {
-    height: 1,
-    backgroundColor: "#222",
-    marginVertical: 24,
-  },
-
+  divider: { height: 1, backgroundColor: "#222", marginVertical: 24 },
   logoutBtn: {
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "center", // Center content when loading
     gap: 12,
     backgroundColor: "#FF453A18",
     borderWidth: 1,
@@ -209,11 +173,7 @@ const s = StyleSheet.create({
     borderRadius: 14,
     padding: 16,
   },
-  logoutBtnDisabled: {
-    opacity: 0.7,
-  },
   logoutText: { color: "#FF453A", fontSize: 16, fontWeight: "600" },
-
   version: {
     color: "#333",
     fontSize: 12,

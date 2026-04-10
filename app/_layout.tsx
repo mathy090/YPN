@@ -1,42 +1,48 @@
 // app/_layout.tsx
-import { Stack, useRouter, useSegments } from "expo-router";
-import { useEffect } from "react";
+import { Stack, useRootNavigationState, useRouter } from "expo-router";
+import { useEffect, useRef, useState } from "react";
+import { ActivityIndicator, StyleSheet, View } from "react-native";
 import { useAuth } from "../src/store/authStore";
 
-function AuthGuard() {
-  const { isLoggedIn, hasAgreed, initialized } = useAuth();
-  const segments = useSegments();
+export default function RootLayout() {
   const router = useRouter();
+  const navState = useRootNavigationState();
+  const { boot, silentVerify } = useAuth();
+  const [booting, setBooting] = useState(true);
+  const didBoot = useRef(false);
 
   useEffect(() => {
-    if (!initialized) return;
+    // navState.key is only set once the navigator is fully mounted.
+    // Without this guard, router.replace() fires before the stack
+    // exists and silently does nothing — this is the Expo Router bug.
+    if (!navState?.key) return;
 
-    const inAuthGroup = segments[0] === "auth";
-    const isWelcome = segments[0] === "welcome";
-    const isIndex = segments[0] === undefined || segments[0] === "index";
+    // Prevent double-run on fast refresh
+    if (didBoot.current) return;
+    didBoot.current = true;
 
-    const isPublic = inAuthGroup || isWelcome || isIndex;
+    (async () => {
+      const result = await boot();
 
-    if (!isPublic) {
-      if (!hasAgreed) {
-        router.replace("/welcome");
-      } else if (!isLoggedIn) {
-        router.replace("/auth/otp");
-      }
-    } else if (isLoggedIn && hasAgreed) {
-      if ((inAuthGroup || isWelcome) && !isIndex) {
+      if (result === "cached") {
+        // Show tabs immediately from whatever route was restored,
+        // then silently verify in background
         router.replace("/tabs/discord");
+        setBooting(false);
+        silentVerify(() => {
+          router.replace("/welcome?kicked=true");
+        });
+      } else {
+        // No cache or logged out — always force welcome,
+        // overriding any restored navigation state
+        router.replace("/welcome");
+        setBooting(false);
       }
-    }
-  }, [isLoggedIn, hasAgreed, initialized, segments]);
+    })();
+  }, [navState?.key]);
 
-  return null;
-}
-
-export default function RootLayout() {
   return (
     <>
-      <AuthGuard />
       <Stack
         screenOptions={{
           headerShown: false,
@@ -44,9 +50,18 @@ export default function RootLayout() {
           gestureEnabled: true,
         }}
       >
+        <Stack.Screen name="index" options={{ headerShown: false }} />
         <Stack.Screen
           name="tabs"
           options={{ headerShown: false, animation: "none" }}
+        />
+        <Stack.Screen
+          name="discord"
+          options={{
+            headerShown: false,
+            animation: "slide_from_bottom",
+            presentation: "fullScreenModal",
+          }}
         />
         <Stack.Screen
           name="discordChannel"
@@ -62,6 +77,26 @@ export default function RootLayout() {
         />
         <Stack.Screen name="auth" options={{ headerShown: false }} />
       </Stack>
+
+      {/*
+        Black overlay while booting — covers any flash of a wrong
+        restored route (discord showing for 1 frame before redirect).
+        Removed the instant boot finishes and navigation is dispatched.
+      */}
+      {booting && (
+        <View style={styles.splash}>
+          <ActivityIndicator size="large" color="#1DB954" />
+        </View>
+      )}
     </>
   );
 }
+
+const styles = StyleSheet.create({
+  splash: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "#000",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+});

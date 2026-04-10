@@ -210,7 +210,7 @@ export default function OTP() {
               {/* Forgot password link */}
               <TouchableOpacity
                 style={s.forgotLink}
-                onPress={openResetEmail}
+                onPress={() => router.push("/auth/forgot-password")}
                 activeOpacity={0.7}
               >
                 <Text style={s.forgotText}>Forgot password?</Text>
