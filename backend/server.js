@@ -26,10 +26,11 @@ const {
   initNewsArchive,
 } = require("./src/routes/newsRoutes");
 const mediaRoutes = require("./src/routes/mediaRoutes");
+const avatarRoutes = require("./src/routes/avatarRoutes");
 
-// ── Firebase Admin ──────────────────────────────────────────────────────────
+// ── Firebase Admin ────────────────────────────────────────────────────────────
 if (!process.env.FIREBASE_ADMIN_KEY) {
-  console.error("❌  FIREBASE_ADMIN_KEY env var is not set. Exiting.");
+  console.error("FIREBASE_ADMIN_KEY not set");
   process.exit(1);
 }
 
@@ -37,56 +38,57 @@ let serviceAccount;
 try {
   serviceAccount = JSON.parse(process.env.FIREBASE_ADMIN_KEY);
 } catch {
-  console.error("❌  FIREBASE_ADMIN_KEY is not valid JSON. Exiting.");
+  console.error("FIREBASE_ADMIN_KEY is not valid JSON");
   process.exit(1);
 }
 
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
-// ── Express ─────────────────────────────────────────────────────────────────
+// ── Express ───────────────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
 const jsonBody = express.json();
 
-// ── Firebase token middleware ────────────────────────────────────────────────
+// ── Firebase token middleware ─────────────────────────────────────────────────
 async function verifyFirebaseToken(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer ")) {
-    return res.status(401).json({
-      message: "Unauthorized: No token provided",
-      code: "NO_TOKEN",
-    });
+    return res
+      .status(401)
+      .json({ message: "No token provided", code: "NO_TOKEN" });
   }
   const idToken = authHeader.split("Bearer ")[1];
   try {
     req.user = await admin.auth().verifyIdToken(idToken);
     next();
   } catch (err) {
-    console.error("Token verification failed:", err.code, err.message);
     if (err.code === "auth/id-token-expired") {
-      return res.status(401).json({
-        message: "Token expired. Please sign in again.",
-        code: "TOKEN_EXPIRED",
-      });
+      return res
+        .status(401)
+        .json({
+          message: "Token expired. Please sign in again.",
+          code: "TOKEN_EXPIRED",
+        });
     }
-    return res.status(401).json({
-      message: "Unauthorized: Invalid token",
-      code: "INVALID_TOKEN",
-    });
+    return res
+      .status(401)
+      .json({ message: "Invalid token", code: "INVALID_TOKEN" });
   }
 }
 
-// ── Health check ─────────────────────────────────────────────────────────────
+// ── Health ────────────────────────────────────────────────────────────────────
 app.get("/", (_req, res) =>
-  res.status(200).json({
-    status: "ok",
-    service: "YPN Backend",
-    time: new Date().toISOString(),
-  }),
+  res
+    .status(200)
+    .json({
+      status: "ok",
+      service: "YPN Backend",
+      time: new Date().toISOString(),
+    }),
 );
 app.head("/", (_req, res) => res.status(200).end());
 
-// ── MongoDB ──────────────────────────────────────────────────────────────────
+// ── MongoDB ───────────────────────────────────────────────────────────────────
 const client = new MongoClient(process.env.MONGO_URI);
 let db;
 let bucket;
@@ -95,6 +97,14 @@ let upload;
 async function connectDB() {
   await client.connect();
   db = client.db("ypn_users");
+
+  // Unique sparse index on username — sparse means docs without username are ignored
+  await db
+    .collection("users")
+    .createIndex({ username: 1 }, { unique: true, sparse: true });
+
+  // Index on email for fast lookup
+  await db.collection("users").createIndex({ email: 1 }, { sparse: true });
 
   initUserVideos(db);
   initDiscordChannels(db);
@@ -118,14 +128,14 @@ async function connectDB() {
 }
 
 function registerRoutes() {
-  // ── POST /api/auth/verify ────────────────────────────────────────────────
+  // ── POST /api/auth/verify ──────────────────────────────────────────────────
   app.post(
     "/api/auth/verify",
     jsonBody,
     verifyFirebaseToken,
     async (req, res) => {
       try {
-        const { uid, email, email_verified, name } = req.user;
+        const { uid, email, email_verified } = req.user;
         if (!email_verified) {
           return res.status(403).json({
             message: "Please verify your email before signing in.",
@@ -136,15 +146,11 @@ function registerRoutes() {
           { uid },
           {
             $set: { uid, email, updatedAt: new Date() },
-            $setOnInsert: {
-              createdAt: new Date(),
-              name: name ?? "",
-              hasProfile: false,
-            },
+            $setOnInsert: { createdAt: new Date(), hasProfile: false },
           },
           { upsert: true, returnDocument: "after" },
         );
-        res.json({ uid, email, hasProfile: !!result?.name?.trim() });
+        res.json({ uid, email, hasProfile: !!result?.username });
       } catch (err) {
         console.error("/api/auth/verify error:", err);
         res.status(500).json({ message: "Internal server error" });
@@ -152,102 +158,146 @@ function registerRoutes() {
     },
   );
 
-  // ── POST /api/users/profile ──────────────────────────────────────────────
-  // Handles both JSON (name only, from device.tsx) and
-  // multipart/form-data (name + photo upload)
-  app.post("/api/users/profile", verifyFirebaseToken, (req, res) => {
-    const contentType = req.headers["content-type"] ?? "";
+  // ── GET /api/auth/check-username ───────────────────────────────────────────
+  // No auth needed — called before profile is created
+  app.get("/api/auth/check-username", async (req, res) => {
+    try {
+      const raw = (req.query.username ?? "").toString().trim().toLowerCase();
 
-    if (contentType.includes("application/json")) {
-      // JSON path — device.tsx sends name as JSON, no file
-      jsonBody(req, res, async () => {
-        try {
-          const { uid } = req.user;
-          const { name } = req.body ?? {};
-          if (!name?.trim()) {
-            return res.status(400).json({ message: "name is required" });
-          }
-          await db.collection("users").updateOne(
-            { uid },
-            {
-              $set: {
-                name: name.trim(),
-                hasProfile: true,
-                updatedAt: new Date(),
-              },
-            },
-            { upsert: true },
-          );
-          res.json({ success: true });
-        } catch (e) {
-          console.error("/api/users/profile JSON error:", e);
-          res.status(500).json({ message: e.message });
-        }
-      });
-    } else {
-      // Multipart path — photo upload included
-      if (!upload) {
-        return res.status(503).json({
-          message: "Server still starting, try again shortly.",
+      if (!raw) {
+        return res
+          .status(400)
+          .json({ code: "MISSING", message: "Username required." });
+      }
+
+      if (!/^[a-z0-9_]{3,20}$/.test(raw)) {
+        return res.status(400).json({
+          code: "INVALID_FORMAT",
+          message: "3–20 characters. Letters, numbers and underscores only.",
         });
       }
-      upload.single("photo")(req, res, async (err) => {
-        if (err) return res.status(500).json({ message: err.message });
-        try {
-          const { uid } = req.user;
-          const { name } = req.body ?? {};
-          if (!name?.trim()) {
-            return res.status(400).json({ message: "name is required" });
-          }
-          await db.collection("users").updateOne(
-            { uid },
-            {
-              $set: {
-                name: name.trim(),
-                hasProfile: true,
-                updatedAt: new Date(),
-                ...(req.file
-                  ? { photoPath: `/photos/${req.file.filename}` }
-                  : {}),
-              },
-            },
-            { upsert: true },
-          );
-          res.json({ success: true });
-        } catch (e) {
-          console.error("/api/users/profile multipart error:", e);
-          res.status(500).json({ message: e.message });
-        }
+
+      const existing = await db
+        .collection("users")
+        .findOne({ username: raw }, { projection: { _id: 1 } });
+
+      if (existing) {
+        return res.json({
+          available: false,
+          message: "Username already taken.",
+        });
+      }
+
+      res.json({ available: true, message: "Username is available." });
+    } catch (err) {
+      console.error("[check-username]", err.message);
+      res.status(500).json({
+        code: "SERVER_ERROR",
+        message: "Sorry, this is on our side. Please try again.",
       });
     }
   });
 
-  // ── GET /api/users/profile ───────────────────────────────────────────────
+  // ── POST /api/users/profile ────────────────────────────────────────────────
+  app.post(
+    "/api/users/profile",
+    verifyFirebaseToken,
+    jsonBody,
+    async (req, res) => {
+      try {
+        const { uid, email } = req.user;
+        const { name, username, avatarUrl } = req.body ?? {};
+
+        if (!name?.trim()) {
+          return res
+            .status(400)
+            .json({ code: "MISSING_NAME", message: "Name is required." });
+        }
+
+        const cleanUsername = (username ?? "").trim().toLowerCase();
+
+        if (!cleanUsername || !/^[a-z0-9_]{3,20}$/.test(cleanUsername)) {
+          return res.status(400).json({
+            code: "INVALID_USERNAME",
+            message: "3–20 characters. Letters, numbers and underscores only.",
+          });
+        }
+
+        // Final race-condition safety check at write time
+        const conflict = await db
+          .collection("users")
+          .findOne(
+            { username: cleanUsername, uid: { $ne: uid } },
+            { projection: { _id: 1 } },
+          );
+        if (conflict) {
+          return res.status(409).json({
+            code: "USERNAME_TAKEN",
+            message: "Username just got taken. Please choose another.",
+          });
+        }
+
+        await db.collection("users").updateOne(
+          { uid },
+          {
+            $set: {
+              name: name.trim(),
+              username: cleanUsername,
+              email,
+              ...(avatarUrl ? { avatarUrl } : {}),
+              hasProfile: true,
+              updatedAt: new Date(),
+            },
+            $setOnInsert: { createdAt: new Date() },
+          },
+          { upsert: true },
+        );
+
+        res.json({ success: true });
+      } catch (err) {
+        console.error("/api/users/profile error:", err);
+        // Duplicate key from MongoDB (race condition)
+        if (err.code === 11000) {
+          return res.status(409).json({
+            code: "USERNAME_TAKEN",
+            message: "Username already taken. Please choose another.",
+          });
+        }
+        res.status(500).json({
+          code: "SERVER_ERROR",
+          message: "Sorry, this is on our side. Please try again later.",
+        });
+      }
+    },
+  );
+
+  // ── GET /api/users/profile ─────────────────────────────────────────────────
   app.get("/api/users/profile", verifyFirebaseToken, async (req, res) => {
     try {
-      const user = await db.collection("users").findOne(
-        { uid: req.user.uid },
-        {
-          projection: {
-            _id: 0,
-            uid: 1,
-            email: 1,
-            name: 1,
-            photoPath: 1,
-            hasProfile: 1,
+      const user = await db
+        .collection("users")
+        .findOne(
+          { uid: req.user.uid },
+          {
+            projection: {
+              _id: 0,
+              uid: 1,
+              email: 1,
+              name: 1,
+              username: 1,
+              avatarUrl: 1,
+              hasProfile: 1,
+            },
           },
-        },
-      );
-      if (!user) {
-        return res.status(404).json({ message: "Profile not found" });
-      }
+        );
+      if (!user) return res.status(404).json({ message: "Profile not found" });
       res.json(user);
     } catch (e) {
       res.status(500).json({ message: e.message });
     }
   });
 
-  // ── GET /api/users/search?q=name ────────────────────────────────────────
+  // ── GET /api/users/search ──────────────────────────────────────────────────
   app.get("/api/users/search", verifyFirebaseToken, async (req, res) => {
     try {
       const q = (req.query.q ?? "").toString().trim();
@@ -258,11 +308,14 @@ function registerRoutes() {
         .collection("users")
         .find(
           {
-            name: { $regex: q, $options: "i" },
+            $or: [
+              { name: { $regex: q, $options: "i" } },
+              { username: { $regex: q, $options: "i" } },
+            ],
             uid: { $ne: req.user.uid },
           },
           {
-            projection: { _id: 0, uid: 1, name: 1, photoPath: 1 },
+            projection: { _id: 0, uid: 1, name: 1, username: 1, avatarUrl: 1 },
             limit: 20,
           },
         )
@@ -273,7 +326,7 @@ function registerRoutes() {
     }
   });
 
-  // ── GET /photos/:filename ────────────────────────────────────────────────
+  // ── GET /photos/:filename ──────────────────────────────────────────────────
   app.get("/photos/:filename", async (req, res) => {
     try {
       const files = await db
@@ -287,33 +340,23 @@ function registerRoutes() {
     }
   });
 
-  // ── Google Drive video feed ──────────────────────────────────────────────
+  // ── Routes ─────────────────────────────────────────────────────────────────
+  app.use("/api/avatar", verifyFirebaseToken, avatarRoutes);
   app.use("/api/videos/drive", verifyFirebaseToken, driveVideoRoutes);
-
-  // ── YouTube RSS video feed ───────────────────────────────────────────────
   app.use("/api/videos", videoRoutes);
-
-  // ── Discord community channels ───────────────────────────────────────────
   app.use("/api/discord", discordRoutes);
-
-  // ── News feed ────────────────────────────────────────────────────────────
   app.use("/api/news", newsRoutes);
-
-  // ── E2E public key server ────────────────────────────────────────────────
   app.use("/api/keys", verifyFirebaseToken, keyRoutes);
-
-  // ── Google Drive encrypted media proxy ──────────────────────────────────
   app.use("/api/media", verifyFirebaseToken, mediaRoutes);
 
-  // ── 404 catch-all ────────────────────────────────────────────────────────
   app.use((_req, res) => res.status(404).json({ message: "Not found" }));
 }
 
-// ── Boot ─────────────────────────────────────────────────────────────────────
+// ── Boot ──────────────────────────────────────────────────────────────────────
 connectDB().catch((err) => {
-  console.error("❌ MongoDB connection failed:", err.message);
+  console.error("MongoDB connection failed:", err.message);
   process.exit(1);
 });
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
-app.listen(PORT, () => console.log(`🚀 YPN backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`YPN backend running on port ${PORT}`));
