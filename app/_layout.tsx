@@ -11,14 +11,22 @@ function AuthGuard() {
   useEffect(() => {
     if (!initialized) return;
 
-    // These routes are always accessible
-    const isPublic =
-      segments[0] === "welcome" ||
-      segments[0] === "auth" ||
-      segments[0] === undefined;
+    const inAuthGroup = segments[0] === "auth";
+    const isWelcome = segments[0] === "welcome";
+    const isIndex = segments[0] === undefined || segments[0] === "index";
 
-    if (!isPublic && (!hasAgreed || !isLoggedIn)) {
-      router.replace("/welcome");
+    const isPublic = inAuthGroup || isWelcome || isIndex;
+
+    if (!isPublic) {
+      if (!hasAgreed) {
+        router.replace("/welcome");
+      } else if (!isLoggedIn) {
+        router.replace("/auth/otp");
+      }
+    } else if (isLoggedIn && hasAgreed) {
+      if ((inAuthGroup || isWelcome) && !isIndex) {
+        router.replace("/tabs/discord");
+      }
     }
   }, [isLoggedIn, hasAgreed, initialized, segments]);
 

@@ -1,17 +1,9 @@
 // app/tabs/settings.tsx
-//
-// Logout calls authStore.logout() which:
-//   1. Firebase signOut
-//   2. AsyncStorage.clear()
-//   3. SecureStore key deletes
-//   4. expo-sqlite dbWipe() — videos, news, kv
-//   5. Store reset (initialized:false, hasAgreed:false)
-// Then navigates to /welcome.
-// On next cold start, index.tsx finds no session anywhere → welcome.
-
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
+import { useState } from "react"; // Import useState
 import {
+  ActivityIndicator,
   Alert,
   Linking,
   Platform,
@@ -38,6 +30,7 @@ function openAdminEmail() {
 export default function SettingsScreen() {
   const { logout, user } = useAuth();
   const router = useRouter();
+  const [isSigningOut, setIsSigningOut] = useState(false); // Local loading state
 
   const handleSignOut = () => {
     Alert.alert(
@@ -49,12 +42,10 @@ export default function SettingsScreen() {
           text: "Sign Out",
           style: "destructive",
           onPress: async () => {
+            if (isSigningOut) return; // Prevent double tap
+            setIsSigningOut(true);
             try {
-              // Single call — wipes Firebase, AsyncStorage,
-              // SecureStore, and expo-sqlite (ypn.db)
               await logout();
-              // Navigate immediately — index gate is now bypassed
-              // because we're going directly to /welcome, not /
               router.replace("/welcome");
             } catch (e) {
               console.error("[settings] logout error:", e);
@@ -62,6 +53,7 @@ export default function SettingsScreen() {
                 "Sign Out Failed",
                 "Could not sign out. Please try again.",
               );
+              setIsSigningOut(false); // Only reset if failed
             }
           },
         },
@@ -123,12 +115,19 @@ export default function SettingsScreen() {
 
       {/* Sign out */}
       <TouchableOpacity
-        style={s.logoutBtn}
+        style={[s.logoutBtn, isSigningOut && s.logoutBtnDisabled]}
         onPress={handleSignOut}
+        disabled={isSigningOut}
         activeOpacity={0.8}
       >
-        <Ionicons name="log-out-outline" size={20} color="#FF453A" />
-        <Text style={s.logoutText}>Sign Out</Text>
+        {isSigningOut ? (
+          <ActivityIndicator size="small" color="#FF453A" />
+        ) : (
+          <Ionicons name="log-out-outline" size={20} color="#FF453A" />
+        )}
+        <Text style={s.logoutText}>
+          {isSigningOut ? "Signing Out..." : "Sign Out"}
+        </Text>
       </TouchableOpacity>
 
       <Text style={s.version}>YPN © 2026</Text>
@@ -202,12 +201,16 @@ const s = StyleSheet.create({
   logoutBtn: {
     flexDirection: "row",
     alignItems: "center",
+    justifyContent: "center", // Center content when loading
     gap: 12,
     backgroundColor: "#FF453A18",
     borderWidth: 1,
     borderColor: "#FF453A33",
     borderRadius: 14,
     padding: 16,
+  },
+  logoutBtnDisabled: {
+    opacity: 0.7,
   },
   logoutText: { color: "#FF453A", fontSize: 16, fontWeight: "600" },
 
