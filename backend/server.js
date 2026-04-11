@@ -96,13 +96,9 @@ async function connectDB() {
     db = client.db("ypn_users");
     console.log("✅ Connected to MongoDB");
 
-    // Create Indexes
-    // Unique sparse index: ensures usernames are unique but allows docs without usernames
-    await db
-      .collection("users")
-      .createIndex({ username: 1 }, { unique: true, sparse: true });
-    await db.collection("users").createIndex({ email: 1 }, { sparse: true });
-    await db.collection("users").createIndex({ uid: 1 }, { unique: true });
+    // ⚠️ INDEX CREATION REMOVED TO PREVENT CONFLICTS
+    // We rely on the indexes already existing in your database.
+    // Do not add createIndex() here unless you plan to handle errors explicitly.
 
     // Initialize other modules
     initUserVideos(db);
@@ -121,7 +117,6 @@ async function connectDB() {
 // ── Route Definitions ────────────────────────────────────────────────────────
 function registerRoutes() {
   // ── POST /api/auth/login ───────────────────────────────────────────────────
-  // Custom login using Firebase Web API Key to verify password.
   app.post("/api/auth/login", async (req, res) => {
     const { email, password } = req.body;
 
@@ -178,7 +173,6 @@ function registerRoutes() {
       const idToken = restData.idToken;
       const uid = restData.localId;
 
-      // Verify email verification status via Admin SDK
       const userRecord = await admin.auth().getUser(uid);
       if (!userRecord.emailVerified) {
         return res.status(403).json({
@@ -187,7 +181,7 @@ function registerRoutes() {
         });
       }
 
-      // Upsert user document in MongoDB (creates if missing, updates email/timestamp if exists)
+      // Upsert user document
       await db.collection("users").updateOne(
         { uid },
         {
@@ -197,7 +191,6 @@ function registerRoutes() {
         { upsert: true },
       );
 
-      // Check if user has already set a username (profile complete)
       const userProfile = await db
         .collection("users")
         .findOne({ uid }, { projection: { username: 1 } });
@@ -215,13 +208,12 @@ function registerRoutes() {
   });
 
   // ── GET /api/auth/verify-username-ownership ────────────────────────────────
-  // Checks if the requested username belongs to the logged-in user.
   app.get(
     "/api/auth/verify-username-ownership",
     verifyFirebaseToken,
     async (req, res) => {
       try {
-        const { uid } = req.user; // Trusted identity from Token
+        const { uid } = req.user;
         const requestedUsername = (req.query.username ?? "")
           .toString()
           .trim()
@@ -233,21 +225,17 @@ function registerRoutes() {
             .json({ message: "Username parameter required." });
         }
 
-        // Find who owns this username in DB
         const userWithThisName = await db
           .collection("users")
           .findOne({ username: requestedUsername }, { projection: { uid: 1 } });
 
         if (!userWithThisName) {
-          // Case: Username is free. Anyone can claim it.
           return res.json({ owned: true, message: "Username available." });
         }
 
-        // Username exists. Does it belong to the current user?
         if (userWithThisName.uid === uid) {
           return res.json({ owned: true, message: "Username verified." });
         } else {
-          // Case: Username belongs to someone else.
           return res.status(403).json({
             owned: false,
             message: "This username belongs to another account.",
@@ -262,13 +250,11 @@ function registerRoutes() {
   );
 
   // ── POST /api/users/profile ────────────────────────────────────────────────
-  // Sets username (once) and updates profile details (name, avatarUrl).
   app.post("/api/users/profile", verifyFirebaseToken, async (req, res) => {
     try {
       const { uid, email } = req.user;
       const { name, username: rawUsername, avatarUrl } = req.body ?? {};
 
-      // Validation
       if (!name?.trim()) {
         return res
           .status(400)
@@ -283,24 +269,16 @@ function registerRoutes() {
         });
       }
 
-      // Atomic Update: Only succeeds if 'username' field does not exist yet (prevents changes)
-      // If avatarUrl is provided, we update it regardless of username lock status (for settings page)
       const updatePayload = {
         name: name.trim(),
         email,
         updatedAt: new Date(),
       };
 
-      // If avatarUrl is present, include it in the update
       if (avatarUrl !== undefined) {
         updatePayload.avatarUrl = avatarUrl;
       }
 
-      // We need two steps:
-      // 1. Try to set username if it doesn't exist.
-      // 2. Always allow updating name/avatar.
-
-      // Check current state
       const currentUser = await db.collection("users").findOne({ uid });
       if (!currentUser) {
         return res
@@ -309,7 +287,6 @@ function registerRoutes() {
       }
 
       if (!currentUser.username) {
-        // User hasn't set a username yet. Try to set it now.
         const result = await db
           .collection("users")
           .findOneAndUpdate(
@@ -325,14 +302,11 @@ function registerRoutes() {
           );
 
         if (!result) {
-          // Race condition: someone else took it or it was set concurrently
           return res
             .status(409)
             .json({ code: "USERNAME_TAKEN", message: "Username taken." });
         }
       } else {
-        // User already has a username. Just update name/avatar.
-        // Ensure they aren't trying to change the username to something else
         if (rawUsername && rawUsername.toLowerCase() !== currentUser.username) {
           return res.status(409).json({
             code: "USERNAME_LOCKED",
@@ -414,7 +388,7 @@ function registerRoutes() {
   });
 
   // ── Mount External Routes ──────────────────────────────────────────────────
-  // Avatar routes (POST /upload, DELETE /remove)
+  // Avatar routes (Handles POST /upload and DELETE /remove)
   app.use("/api/avatar", verifyFirebaseToken, avatarRoutes);
 
   app.use("/api/videos/drive", verifyFirebaseToken, driveVideoRoutes);
