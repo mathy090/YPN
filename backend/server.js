@@ -1,4 +1,3 @@
-// backend/server.js
 "use strict";
 require("dotenv").config();
 
@@ -97,28 +96,10 @@ async function connectDB() {
     db = client.db("ypn_users");
     console.log("✅ Connected to MongoDB");
 
-    // Safe Index Creation: Prevents crash if indexes already exist on Render
-    const createIndexSafe = async (collection, fields, options) => {
-      try {
-        await db.collection(collection).createIndex(fields, options);
-      } catch (err) {
-        if (
-          err.codeName === "IndexOptionsConflict" ||
-          err.message.includes("already exists")
-        ) {
-          return; // Ignore, index exists
-        }
-        throw err; // Re-throw real errors
-      }
-    };
-
-    await createIndexSafe(
-      "users",
-      { username: 1 },
-      { unique: true, sparse: true },
-    );
-    await createIndexSafe("users", { email: 1 }, { sparse: true });
-    await createIndexSafe("users", { uid: 1 }, { unique: true });
+    // ⚠️ INDEX CREATION REMOVED
+    // We are relying on the indexes that already exist in your database.
+    // This prevents the "IndexOptionsConflict" crash on Render.
+    // Your existing indexes (username, email, uid) are preserved exactly as they are.
 
     // Initialize modules
     initUserVideos(db);
@@ -137,7 +118,6 @@ async function connectDB() {
 // ── Route Definitions ────────────────────────────────────────────────────────
 function registerRoutes() {
   // ── POST /api/auth/login ───────────────────────────────────────────────────
-  // RESTORED: Handles email/password login and returns hasProfile flag
   app.post("/api/auth/login", async (req, res) => {
     const { email, password } = req.body;
 
@@ -202,7 +182,7 @@ function registerRoutes() {
         });
       }
 
-      // Upsert user document (create if missing, update email/timestamp if exists)
+      // Upsert user document
       await db.collection("users").updateOne(
         { uid },
         {
@@ -220,7 +200,7 @@ function registerRoutes() {
 
       res.json({
         token: idToken,
-        hasProfile, // Frontend uses this to decide routing
+        hasProfile, // Frontend uses this to decide routing (skip device.tsx if true)
         user: { uid, email: userRecord.email },
       });
     } catch (err) {
@@ -230,7 +210,6 @@ function registerRoutes() {
   });
 
   // ── GET /api/auth/verify-username-ownership ────────────────────────────────
-  // Checks if the requested username belongs to the logged-in user
   app.get(
     "/api/auth/verify-username-ownership",
     verifyFirebaseToken,
@@ -273,7 +252,6 @@ function registerRoutes() {
   );
 
   // ── POST /api/users/profile ────────────────────────────────────────────────
-  // Sets username (once) and updates profile details
   app.post("/api/users/profile", verifyFirebaseToken, async (req, res) => {
     try {
       const { uid, email } = req.user;
@@ -414,9 +392,7 @@ function registerRoutes() {
   });
 
   // ── Mount External Routes ──────────────────────────────────────────────────
-  // Avatar routes (Handles POST /upload and DELETE /remove via Supabase)
   app.use("/api/avatar", verifyFirebaseToken, avatarRoutes);
-
   app.use("/api/videos/drive", verifyFirebaseToken, driveVideoRoutes);
   app.use("/api/videos", videoRoutes);
   app.use("/api/discord", discordRoutes);
