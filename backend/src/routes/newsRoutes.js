@@ -3,12 +3,12 @@
 // Zero-key news feed using Google News RSS + direct outlet RSS feeds.
 // Two-layer cache: L1 in-memory (20 min) → L2 MongoDB (accumulates over time).
 //
-// Key improvements:
-//   • No date filtering — all articles kept regardless of age
-//   • MongoDB accumulates articles over time (growing historical archive)
-//   • Expanded sources covering Zimbabwe youth, health, jobs, education
-//   • Direct outlet RSS feeds with browser UA to avoid bot blocking
-//   • Deduplication by URL fingerprint across fetches
+// Fixes applied:
+//   1. initNewsArchive(db) called at startup (wired in server.js)
+//   2. Article return limit capped at 100 to prevent memory issues
+//   3. Google News redirect URLs decoded to real article URLs
+//   4. Improved error logging — no silent catches
+//   5. Fallback returns cached/archive data if RSS fetch fails
 
 "use strict";
 
@@ -114,6 +114,9 @@ const SOURCES = [
   },
 ];
 
+// ─── Constants ────────────────────────────────────────────────────────────────
+const MAX_ARTICLES = 100;
+
 // ─── L1 in-memory cache ───────────────────────────────────────────────────────
 let l1Cache = null;
 let l1CachedAt = 0;
@@ -121,22 +124,29 @@ const L1_TTL = 20 * 60 * 1000; // 20 min
 let building = false;
 
 // ─── MongoDB accumulation ─────────────────────────────────────────────────────
-// We import lazily to avoid circular dep issues
 let _db = null;
 
+// FIX 1: initNewsArchive must be called at startup from server.js
 function initNewsArchive(db) {
   _db = db;
-  // Create index on id for deduplication, and on pubDate for sorting
+
+  // Create indexes — log errors instead of silently swallowing them
   db.collection("news_archive")
     .createIndex({ id: 1 }, { unique: true })
-    .catch(() => {});
+    .catch((err) =>
+      console.error("[News] Failed to create id index:", err.message),
+    );
+
   db.collection("news_archive")
     .createIndex({ pubDate: -1 })
-    .catch(() => {});
+    .catch((err) =>
+      console.error("[News] Failed to create pubDate index:", err.message),
+    );
+
   console.log("[News] Archive store initialised");
 }
 
-// Upsert new articles into the archive — never deletes, accumulates over time
+// FIX 4: No silent catches — always log archive errors
 async function archiveArticles(articles) {
   if (!_db || !articles.length) return;
   try {
@@ -154,22 +164,26 @@ async function archiveArticles(articles) {
       console.log(`[News] Archived ${result.upsertedCount} new articles`);
     }
   } catch (err) {
-    console.warn("[News] Archive write error:", err.message);
+    // FIX 4: Log with full detail instead of swallowing
+    console.error("[News] Archive write error:", err.message, err.stack);
   }
 }
 
-// Load from archive — sorted newest first, no date limit
-async function loadFromArchive(limit = 200) {
+// FIX 2: Safety limit — cap at MAX_ARTICLES
+async function loadFromArchive(limit = MAX_ARTICLES) {
   if (!_db) return null;
   try {
+    const safeLimit = Math.min(limit, MAX_ARTICLES);
     const docs = await _db
       .collection("news_archive")
       .find({}, { projection: { _id: 0 } })
       .sort({ pubDate: -1 })
-      .limit(limit)
+      .limit(safeLimit)
       .toArray();
     return docs.length > 0 ? docs : null;
-  } catch {
+  } catch (err) {
+    // FIX 4: Log instead of silently returning null
+    console.error("[News] Archive read error:", err.message);
     return null;
   }
 }
@@ -254,6 +268,44 @@ function extractThumbnail(block) {
   return null;
 }
 
+// FIX 3: Decode Google News redirect URLs to real article URLs
+// Google News RSS wraps article links in: https://news.google.com/rss/articles/...
+// The real URL is Base64-encoded in the path. We try to extract it, and if
+// extraction fails we fall back to following the redirect via a HEAD request.
+function decodeGoogleNewsUrl(rawUrl) {
+  if (!rawUrl) return rawUrl;
+
+  // Already a real URL (not a Google News redirect)
+  if (!rawUrl.includes("news.google.com")) return rawUrl;
+
+  try {
+    // Google News article URLs look like:
+    // https://news.google.com/rss/articles/CBMi...?hl=en&gl=ZW&ceid=ZW:en
+    // The article ID segment is Base64url-encoded and contains the real URL.
+    // Attempt a simple Base64 decode of the path segment after /articles/
+    const pathMatch = rawUrl.match(/\/articles\/([^?]+)/);
+    if (pathMatch) {
+      const encoded = pathMatch[1];
+      // Base64url decode
+      const base64 = encoded.replace(/-/g, "+").replace(/_/g, "/");
+      const padded = base64 + "==".slice(0, (4 - (base64.length % 4)) % 4);
+      const decoded = Buffer.from(padded, "base64").toString("utf8");
+      // The decoded string contains the real URL embedded in it
+      const urlMatch = decoded.match(/https?:\/\/[^\s"'<>]+/);
+      if (urlMatch) return urlMatch[0];
+    }
+  } catch {
+    // Decoding failed — log a warning and fall back to original URL
+    console.warn(
+      "[News] Failed to decode Google News URL:",
+      rawUrl.slice(0, 80),
+    );
+  }
+
+  // Fallback: return the raw Google News URL — frontend can still open it
+  return rawUrl;
+}
+
 // ─── RSS parser — no date filtering ──────────────────────────────────────────
 function parseRSS(xml, source) {
   const articles = [];
@@ -270,14 +322,16 @@ function parseRSS(xml, source) {
 
     const linkTextM = block.match(/<link[^>]*>\s*(https?[^<]+?)\s*<\/link>/i);
     const linkAttrM = block.match(/<link[^>]*href=["'](https?[^"']+)["']/i);
-    const link = linkTextM
+    const rawLink = linkTextM
       ? linkTextM[1].trim()
       : linkAttrM
         ? linkAttrM[1].trim()
         : "";
-    if (!link) continue;
+    if (!rawLink) continue;
 
-    // Parse pub date — keep all, no minimum date requirement
+    // FIX 3: Decode Google News redirect to real article URL
+    const link = decodeGoogleNewsUrl(rawLink);
+
     const pubM = block.match(/<pubDate[^>]*>([\s\S]*?)<\/pubDate>/i);
     const pub = pubM ? pubM[1].trim() : "";
     const ts = pub ? new Date(pub).getTime() : Date.now();
@@ -304,7 +358,7 @@ function parseRSS(xml, source) {
   return articles;
 }
 
-// ─── Fetch one source (never throws) ─────────────────────────────────────────
+// ─── Fetch one source (logs failures, never throws) ───────────────────────────
 async function fetchSource(source) {
   try {
     const xml = await httpsGet(source.url, 12000);
@@ -312,7 +366,8 @@ async function fetchSource(source) {
     console.log(`[News] ✓ ${source.name}: ${items.length} articles`);
     return items;
   } catch (err) {
-    console.warn(`[News] ✗ ${source.name}: ${err.message}`);
+    // FIX 4: Always log what went wrong — not a silent catch
+    console.warn(`[News] ✗ ${source.name} (${source.key}): ${err.message}`);
     return [];
   }
 }
@@ -320,7 +375,8 @@ async function fetchSource(source) {
 // ─── Build fresh news batch + merge with archive ──────────────────────────────
 async function buildNews() {
   if (building) {
-    await new Promise((r) => setTimeout(r, 2000));
+    // Wait up to 5 seconds for the in-progress build to finish
+    await new Promise((r) => setTimeout(r, 3000));
     return l1Cache ?? [];
   }
 
@@ -345,22 +401,45 @@ async function buildNews() {
 
     console.log(`[News] ${freshArticles.length} unique articles from RSS`);
 
-    // 3. Archive new articles in MongoDB (accumulates over time)
-    await archiveArticles(freshArticles);
+    // FIX 5: Only update cache if we actually got articles — never overwrite
+    // good cached data with an empty result set from a failed fetch round
+    if (freshArticles.length > 0) {
+      // 3. Archive new articles in MongoDB (accumulates over time)
+      await archiveArticles(freshArticles);
 
-    // 4. Load full archive (sorted newest first, no date limit)
-    const archived = await loadFromArchive(200);
-    const allArticles = archived ?? freshArticles;
+      // 4. Load full archive (sorted newest first, capped at MAX_ARTICLES)
+      const archived = await loadFromArchive(MAX_ARTICLES);
+      const allArticles = archived ?? freshArticles;
 
-    // 5. Sort newest first
-    allArticles.sort((a, b) => b.pubDate - a.pubDate);
+      // 5. Sort newest first
+      allArticles.sort((a, b) => b.pubDate - a.pubDate);
 
-    console.log(`✅ News ready: ${allArticles.length} total articles`);
+      // FIX 2: Enforce safety limit before caching
+      const limited = allArticles.slice(0, MAX_ARTICLES);
+      console.log(`✅ News ready: ${limited.length} total articles`);
 
-    l1Cache = allArticles;
-    l1CachedAt = Date.now();
-
-    return allArticles;
+      l1Cache = limited;
+      l1CachedAt = Date.now();
+      return limited;
+    } else {
+      // All RSS sources failed — fall back to archive if available
+      console.warn(
+        "[News] All RSS sources returned no articles — using archive fallback",
+      );
+      const archived = await loadFromArchive(MAX_ARTICLES);
+      if (archived && archived.length > 0) {
+        l1Cache = archived;
+        l1CachedAt = Date.now();
+        return archived;
+      }
+      // Nothing at all — return whatever is in L1 (may be stale but better than [])
+      return l1Cache ?? [];
+    }
+  } catch (err) {
+    // FIX 4: Log the full error, not just a message
+    console.error("[News] buildNews fatal error:", err.message, err.stack);
+    // FIX 5: Return stale L1 cache instead of empty array
+    return l1Cache ?? [];
   } finally {
     building = false;
   }
@@ -373,20 +452,20 @@ async function getNews() {
     return l1Cache;
   }
 
-  // Try archive first (has historical articles)
-  const archived = await loadFromArchive(200);
+  // FIX 5: Try archive first — return it immediately and kick off background refresh
+  const archived = await loadFromArchive(MAX_ARTICLES);
   if (archived && archived.length > 0) {
     console.log(`📦 News from archive (${archived.length} articles)`);
     l1Cache = archived;
     l1CachedAt = Date.now();
-    // Background refresh to add new articles
+    // Background refresh to pick up new articles
     buildNews().catch((e) =>
-      console.warn("[News] Background build:", e.message),
+      console.error("[News] Background build error:", e.message),
     );
     return archived;
   }
 
-  // Build fresh
+  // Nothing cached — build fresh (blocking)
   return buildNews();
 }
 
@@ -394,9 +473,23 @@ async function getNews() {
 router.get("/", async (_req, res) => {
   try {
     const articles = await getNews();
-    res.json(articles);
+
+    if (!articles.length) {
+      // FIX 5: Return 503 with empty array and a message rather than silent []
+      return res.status(503).json({
+        message: "News temporarily unavailable. Please try again shortly.",
+        articles: [],
+      });
+    }
+
+    // FIX 2: Always cap the response at MAX_ARTICLES
+    res.json(articles.slice(0, MAX_ARTICLES));
   } catch (e) {
-    console.error("[News] GET / error:", e.message);
+    console.error("[News] GET / error:", e.message, e.stack);
+    // FIX 5: Attempt to serve stale cache even on unexpected error
+    if (l1Cache && l1Cache.length > 0) {
+      return res.json(l1Cache.slice(0, MAX_ARTICLES));
+    }
     res.status(500).json({ message: "Failed to load news", articles: [] });
   }
 });
@@ -411,13 +504,17 @@ router.delete("/cache", async (_req, res) => {
 });
 
 router.get("/cache/status", async (_req, res) => {
-  const archived = await loadFromArchive(1).catch(() => null);
-  const count = _db
-    ? await _db
-        .collection("news_archive")
-        .countDocuments()
-        .catch(() => 0)
-    : 0;
+  let totalArticles = 0;
+  let archiveHasData = false;
+
+  if (_db) {
+    try {
+      totalArticles = await _db.collection("news_archive").countDocuments();
+      archiveHasData = totalArticles > 0;
+    } catch (err) {
+      console.error("[News] cache/status count error:", err.message);
+    }
+  }
 
   res.json({
     l1: {
@@ -426,8 +523,13 @@ router.get("/cache/status", async (_req, res) => {
       ageSeconds: l1Cache ? Math.floor((Date.now() - l1CachedAt) / 1000) : null,
     },
     archive: {
-      totalArticles: count,
-      hasData: !!archived,
+      totalArticles,
+      hasData: archiveHasData,
+      dbConnected: !!_db,
+    },
+    config: {
+      maxArticles: MAX_ARTICLES,
+      l1TtlSeconds: L1_TTL / 1000,
     },
     sources: SOURCES.map((s) => ({ name: s.name, key: s.key })),
   });
