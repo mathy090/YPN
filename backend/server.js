@@ -8,7 +8,6 @@ const multer = require("multer");
 const { GridFsStorage } = require("multer-gridfs-storage");
 const admin = require("firebase-admin");
 
-// Import routes
 const {
   router: keyRoutes,
   init: initKeyStore,
@@ -28,7 +27,7 @@ const {
 const mediaRoutes = require("./src/routes/mediaRoutes");
 const avatarRoutes = require("./src/routes/avatarRoutes");
 
-// ── Firebase Admin ───────────────────────────────────────────────────────────
+// ── Firebase Admin ────────────────────────────────────────────────────────────
 if (!process.env.FIREBASE_ADMIN_KEY) {
   console.error("FIREBASE_ADMIN_KEY not set");
   process.exit(1);
@@ -49,13 +48,11 @@ const app = express();
 app.use(cors());
 const jsonBody = express.json();
 
-// ── Firebase token middleware ─────────────────────────────────────────────────
+// ── Firebase token middleware ──────────────────────────────────────────────────
 async function verifyFirebaseToken(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer ")) {
-    return res
-      .status(401)
-      .json({ message: "No token provided", code: "NO_TOKEN" });
+    return res.status(401).json({ message: "No token provided", code: "NO_TOKEN" });
   }
   const idToken = authHeader.split("Bearer ")[1];
   try {
@@ -68,9 +65,7 @@ async function verifyFirebaseToken(req, res, next) {
         code: "TOKEN_EXPIRED",
       });
     }
-    return res
-      .status(401)
-      .json({ message: "Invalid token", code: "INVALID_TOKEN" });
+    return res.status(401).json({ message: "Invalid token", code: "INVALID_TOKEN" });
   }
 }
 
@@ -94,11 +89,10 @@ async function connectDB() {
   await client.connect();
   db = client.db("ypn_users");
 
-  // Unique sparse index on username
+  // Unique sparse index: one username per document, nulls excluded
   await db
     .collection("users")
     .createIndex({ username: 1 }, { unique: true, sparse: true });
-  // Index on email for fast lookup
   await db.collection("users").createIndex({ email: 1 }, { sparse: true });
 
   initUserVideos(db);
@@ -123,69 +117,20 @@ async function connectDB() {
 }
 
 function registerRoutes() {
-  // ── NEW: GET /api/auth/verify-username-ownership ───────────────────────
-  // LOGIC:
-  // 1. If username DOES NOT exist in DB -> Allow (New User claiming name).
-  // 2. If username EXISTS and belongs to THIS user -> Allow (Returning User).
-  // 3. If username EXISTS but belongs to SOMEONE ELSE -> Deny (Taken).
-  app.get(
-    "/api/auth/verify-username-ownership",
-    verifyFirebaseToken,
-    async (req, res) => {
-      try {
-        const { uid } = req.user; // From the logged-in token
-        const requestedUsername = (req.query.username ?? "")
-          .toString()
-          .trim()
-          .toLowerCase();
 
-        if (!requestedUsername) {
-          return res.status(400).json({ message: "Username required." });
-        }
-
-        // Find the user document that HAS this username
-        const userWithThisName = await db
-          .collection("users")
-          .findOne({ username: requestedUsername }, { projection: { uid: 1 } });
-
-        if (!userWithThisName) {
-          // CASE C: Username doesn't exist yet.
-          // It's free for anyone (including this user) to claim.
-          return res.json({ owned: true, message: "Username available." });
-        }
-
-        // Username exists. Check if it belongs to the current user.
-        if (userWithThisName.uid === uid) {
-          // CASE A: Match! This user already owns this name.
-          return res.json({ owned: true, message: "Username verified." });
-        } else {
-          // CASE B: Mismatch! Someone else owns this name.
-          return res.status(403).json({
-            owned: false,
-            message: "This username is already taken by another user.",
-            code: "NOT_OWNER",
-          });
-        }
-      } catch (err) {
-        console.error("[verify-ownership]", err);
-        res.status(500).json({ message: "Internal server error." });
-      }
-    },
-  );
-
-  // ── POST /api/auth/login ─────────────────────────────────────────────
+  // ── POST /api/auth/login ───────────────────────────────────────────────────
+  // Verifies email + password via Firebase REST API.
+  // Creates user doc in MongoDB if it doesn't exist (upsert).
+  // Returns hasProfile so client can route correctly.
   app.post("/api/auth/login", jsonBody, async (req, res) => {
     const { email, password } = req.body;
 
     if (!email || !password) {
-      return res
-        .status(400)
-        .json({ message: "Email and password are required." });
+      return res.status(400).json({ message: "Email and password are required." });
     }
 
     try {
       const FIREBASE_WEB_API_KEY = process.env.FIREBASE_WEB_API_KEY;
-
       if (!FIREBASE_WEB_API_KEY) {
         console.error("FIREBASE_WEB_API_KEY missing in env");
         return res.status(500).json({ message: "Server configuration error." });
@@ -203,20 +148,13 @@ function registerRoutes() {
 
       if (!restResponse.ok) {
         if (restData.error?.message === "EMAIL_NOT_FOUND") {
-          return res
-            .status(404)
-            .json({ message: "Account not found.", code: "ACCOUNT_NOT_FOUND" });
+          return res.status(404).json({ message: "Account not found.", code: "ACCOUNT_NOT_FOUND" });
         }
         if (restData.error?.message === "INVALID_PASSWORD") {
-          return res.status(401).json({
-            message: "Invalid password.",
-            code: "INVALID_CREDENTIALS",
-          });
+          return res.status(401).json({ message: "Invalid password.", code: "INVALID_CREDENTIALS" });
         }
         if (restData.error?.message === "USER_DISABLED") {
-          return res
-            .status(403)
-            .json({ message: "Account disabled.", code: "USER_DISABLED" });
+          return res.status(403).json({ message: "Account disabled.", code: "USER_DISABLED" });
         }
         return res.status(401).json({
           message: "Invalid email or password.",
@@ -236,12 +174,28 @@ function registerRoutes() {
         });
       }
 
-      const userProfile = await db.collection("users").findOne({ uid });
+      // ── Ensure user doc exists in MongoDB ──────────────────────────────────
+      // Safe upsert: creates doc on first login, no-op on subsequent logins.
+      // Does NOT touch username — that field is locked separately.
+      await db.collection("users").updateOne(
+        { uid },
+        {
+          $set: { uid, email: userRecord.email, updatedAt: new Date() },
+          $setOnInsert: { createdAt: new Date() },
+        },
+        { upsert: true },
+      );
+
+      // hasProfile = username has been set and locked
+      const userProfile = await db
+        .collection("users")
+        .findOne({ uid }, { projection: { username: 1 } });
+
       const hasProfile = !!userProfile?.username;
 
       res.json({
         token: idToken,
-        hasProfile: hasProfile,
+        hasProfile,
         user: { uid, email: userRecord.email },
       });
     } catch (err) {
@@ -251,46 +205,38 @@ function registerRoutes() {
   });
 
   // ── POST /api/auth/verify ──────────────────────────────────────────────────
-  app.post(
-    "/api/auth/verify",
-    jsonBody,
-    verifyFirebaseToken,
-    async (req, res) => {
-      try {
-        const { uid, email, email_verified } = req.user;
-        if (!email_verified) {
-          return res.status(403).json({
-            message: "Please verify your email before signing in.",
-            code: "EMAIL_NOT_VERIFIED",
-          });
-        }
-        const result = await db.collection("users").findOneAndUpdate(
-          { uid },
-          {
-            $set: { uid, email, updatedAt: new Date() },
-            $setOnInsert: { createdAt: new Date(), hasProfile: false },
-          },
-          { upsert: true, returnDocument: "after" },
-        );
-        res.json({ uid, email, hasProfile: !!result?.username });
-      } catch (err) {
-        console.error("/api/auth/verify error:", err);
-        res.status(500).json({ message: "Internal server error" });
+  app.post("/api/auth/verify", jsonBody, verifyFirebaseToken, async (req, res) => {
+    try {
+      const { uid, email, email_verified } = req.user;
+      if (!email_verified) {
+        return res.status(403).json({
+          message: "Please verify your email before signing in.",
+          code: "EMAIL_NOT_VERIFIED",
+        });
       }
-    },
-  );
+      const result = await db.collection("users").findOneAndUpdate(
+        { uid },
+        {
+          $set: { uid, email, updatedAt: new Date() },
+          $setOnInsert: { createdAt: new Date() },
+        },
+        { upsert: true, returnDocument: "after" },
+      );
+      res.json({ uid, email, hasProfile: !!result?.username });
+    } catch (err) {
+      console.error("/api/auth/verify error:", err);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
 
-  // ── GET /api/auth/check-username ──────────────────────────────────────────
+  // ── GET /api/auth/check-username ───────────────────────────────────────────
   app.get("/api/auth/check-username", async (req, res) => {
     try {
       const raw = (req.query.username ?? "").toString().trim().toLowerCase();
 
       if (!raw) {
-        return res
-          .status(400)
-          .json({ code: "MISSING", message: "Username required." });
+        return res.status(400).json({ code: "MISSING", message: "Username required." });
       }
-
       if (!/^[a-z0-9_]{3,20}$/.test(raw)) {
         return res.status(400).json({
           code: "INVALID_FORMAT",
@@ -302,14 +248,10 @@ function registerRoutes() {
         .collection("users")
         .findOne({ username: raw }, { projection: { _id: 1 } });
 
-      if (existing) {
-        return res.json({
-          available: false,
-          message: "Username already taken.",
-        });
-      }
-
-      res.json({ available: true, message: "Username is available." });
+      res.json({
+        available: !existing,
+        message: existing ? "Username already taken." : "Username is available.",
+      });
     } catch (err) {
       console.error("[check-username]", err.message);
       res.status(500).json({
@@ -320,6 +262,10 @@ function registerRoutes() {
   });
 
   // ── POST /api/users/profile ────────────────────────────────────────────────
+  // Sets username ONCE using an atomic findOneAndUpdate.
+  // Filter: { uid, username: { $exists: false } } — only matches if no
+  // username is set yet. Subsequent calls are blocked at the DB level.
+  // Unique sparse index handles cross-user duplicate usernames (throws 11000).
   app.post(
     "/api/users/profile",
     verifyFirebaseToken,
@@ -330,16 +276,13 @@ function registerRoutes() {
         const { name, username: rawUsername, avatarFileId } = req.body ?? {};
 
         if (!name?.trim()) {
-          return res
-            .status(400)
-            .json({ code: "MISSING_NAME", message: "Name is required." });
+          return res.status(400).json({
+            code: "MISSING_NAME",
+            message: "Name is required.",
+          });
         }
 
-        const cleanUsername = (rawUsername ?? "")
-          .toString()
-          .trim()
-          .toLowerCase();
-
+        const cleanUsername = (rawUsername ?? "").toString().trim().toLowerCase();
         if (!cleanUsername || !/^[a-z0-9_]{3,20}$/.test(cleanUsername)) {
           return res.status(400).json({
             code: "INVALID_USERNAME",
@@ -347,39 +290,50 @@ function registerRoutes() {
           });
         }
 
-        const conflict = await db
-          .collection("users")
-          .findOne(
-            { username: cleanUsername, uid: { $ne: uid } },
-            { projection: { _id: 1 } },
-          );
-
-        if (conflict) {
-          return res.status(409).json({
-            code: "USERNAME_TAKEN",
-            message: "Username just got taken. Please choose another.",
-          });
-        }
-
-        await db.collection("users").updateOne(
-          { uid },
+        // ── Atomic lock ────────────────────────────────────────────────────
+        // Only succeeds if this uid has NO username field yet.
+        // upsert: false — we never create a new doc here (login does that).
+        const result = await db.collection("users").findOneAndUpdate(
+          { uid, username: { $exists: false } },
           {
             $set: {
               username: cleanUsername,
               name: name.trim(),
               email,
-              ...(avatarFileId ? { avatarFileId } : {}),
               hasProfile: true,
               updatedAt: new Date(),
+              ...(avatarFileId ? { avatarFileId } : {}),
             },
           },
-          { upsert: true },
+          { upsert: false, returnDocument: "after" },
         );
+
+        if (!result) {
+          // findOneAndUpdate matched nothing — check why
+          const existing = await db
+            .collection("users")
+            .findOne({ uid }, { projection: { username: 1 } });
+
+          if (existing?.username) {
+            // Username already locked for this user
+            return res.status(409).json({
+              code: "USERNAME_LOCKED",
+              message: "Username already set. It cannot be changed.",
+            });
+          }
+
+          // User doc doesn't exist — shouldn't happen after login creates it
+          return res.status(404).json({
+            code: "USER_NOT_FOUND",
+            message: "User record not found. Please try signing in again.",
+          });
+        }
 
         res.json({ success: true });
       } catch (err) {
         console.error("/api/users/profile error:", err);
         if (err.code === 11000) {
+          // Another user already owns this username (unique index violation)
           return res.status(409).json({
             code: "USERNAME_TAKEN",
             message: "Username already taken. Please choose another.",
@@ -400,13 +354,8 @@ function registerRoutes() {
         { uid: req.user.uid },
         {
           projection: {
-            _id: 0,
-            uid: 1,
-            email: 1,
-            name: 1,
-            username: 1,
-            avatarFileId: 1,
-            hasProfile: 1,
+            _id: 0, uid: 1, email: 1, name: 1,
+            username: 1, avatarFileId: 1, hasProfile: 1,
           },
         },
       );
@@ -421,8 +370,9 @@ function registerRoutes() {
   app.get("/api/users/search", verifyFirebaseToken, async (req, res) => {
     try {
       const q = (req.query.q ?? "").toString().trim();
-      if (!q || q.length < 2)
+      if (!q || q.length < 2) {
         return res.status(400).json({ message: "Query too short" });
+      }
 
       const users = await db
         .collection("users")
@@ -435,17 +385,12 @@ function registerRoutes() {
             uid: { $ne: req.user.uid },
           },
           {
-            projection: {
-              _id: 0,
-              uid: 1,
-              name: 1,
-              username: 1,
-              avatarFileId: 1,
-            },
+            projection: { _id: 0, uid: 1, name: 1, username: 1, avatarFileId: 1 },
             limit: 20,
           },
         )
         .toArray();
+
       res.json(users);
     } catch (e) {
       res.status(500).json({ message: e.message });
@@ -466,7 +411,7 @@ function registerRoutes() {
     }
   });
 
-  // ── Routes ─────────────────────────────────────────────────────────────────
+  // ── Mount routes ───────────────────────────────────────────────────────────
   app.use("/api/avatar", verifyFirebaseToken, avatarRoutes);
   app.use("/api/videos/drive", verifyFirebaseToken, driveVideoRoutes);
   app.use("/api/videos", videoRoutes);

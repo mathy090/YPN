@@ -1,11 +1,4 @@
 // app/auth/otp.tsx — Login
-//
-// Custom API Login Flow:
-// 1. Sends email/password to backend (/api/auth/login).
-// 2. Backend verifies via Firebase Admin + Web API Key.
-// 3. Backend returns Auth Token + User Details.
-// 4. Client saves token and pushes to /auth/device WITH user params.
-
 import { Ionicons } from "@expo/vector-icons";
 import NetInfo from "@react-native-community/netinfo";
 import { LinearGradient } from "expo-linear-gradient";
@@ -59,81 +52,48 @@ export default function OTP() {
     setLoading(true);
 
     try {
-      // Step 1: Check actual internet connectivity
       const netState = await NetInfo.fetch();
+      if (!netState.isConnected) throw new Error("NO_INTERNET");
 
-      if (!netState.isConnected) {
-        throw new Error("NO_INTERNET");
-      }
-
-      // Step 2: Attempt API Call
       let response;
       try {
         response = await fetch(`${API_URL}/api/auth/login`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            email: email.trim(),
-            password: password,
-          }),
+          body: JSON.stringify({ email: email.trim(), password }),
         });
-      } catch (fetchErr: any) {
-        // Fetch failed (Timeout, Connection Refused, DNS fail)
-        // Since we know internet IS connected, this means SERVER is down.
-        console.error("[OTP] Fetch failed:", fetchErr);
+      } catch {
         throw new Error("SERVER_DOWN");
       }
 
-      // Step 3: Handle HTTP Status Codes
       if (!response.ok) {
         const status = response.status;
-
-        if (status >= 500) {
-          throw new Error("SERVER_DOWN");
-        }
-
-        if (status === 404) {
-          throw new Error("ACCOUNT_NOT_FOUND");
-        }
-
-        if (status === 401) {
-          throw new Error("INVALID_CREDENTIALS");
-        }
-
-        if (status === 403) {
-          throw new Error("EMAIL_NOT_VERIFIED");
-        }
-
-        // Any other error defaults to server issue
+        if (status >= 500) throw new Error("SERVER_DOWN");
+        if (status === 404) throw new Error("ACCOUNT_NOT_FOUND");
+        if (status === 401) throw new Error("INVALID_CREDENTIALS");
+        if (status === 403) throw new Error("EMAIL_NOT_VERIFIED");
         throw new Error("SERVER_DOWN");
       }
 
-      // Step 4: Parse Response
       const data = await response.json();
       const { token, user } = data;
+      if (!token || !user) throw new Error("SERVER_DOWN");
 
-      if (!token || !user) {
-        throw new Error("SERVER_DOWN");
-      }
-
-      // Step 5: Save Token & Update Local State
       await saveToken(token);
       await login();
 
-      // Step 6: Push to Device Setup WITH User Params
-      // This fixes the "Session expired" issue by passing data directly
-      router.replace({
-        pathname: "/auth/device",
-        params: {
-          userEmail: user.email,
-          userUid: user.uid,
-        },
-      });
+      // ── Route based on profile status ────────────────────────────────────
+      // hasProfile true = username already locked → go straight to app
+      if (data.hasProfile) {
+        router.replace("/tabs/discord");
+      } else {
+        router.replace({
+          pathname: "/auth/device",
+          params: { userEmail: user.email, userUid: user.uid },
+        });
+      }
     } catch (e: any) {
-      console.error("[OTP] Login Error:", e);
-
       const message = e.message;
-
       if (message === "NO_INTERNET") {
         setError("Poor internet connection.");
       } else if (message === "ACCOUNT_NOT_FOUND") {
@@ -143,7 +103,6 @@ export default function OTP() {
       } else if (message === "EMAIL_NOT_VERIFIED") {
         setError("Email not verified. Please check your inbox.");
       } else {
-        // Covers SERVER_DOWN, Timeouts, or unknown errors
         setError("Our side is having a problem, try again later.");
       }
     } finally {

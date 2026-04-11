@@ -1,4 +1,6 @@
 // app/auth/device.tsx
+// Photo is stored locally on pick.
+// Upload + profile save both happen only when user presses "Get Started".
 import { Ionicons } from "@expo/vector-icons";
 import * as ImagePicker from "expo-image-picker";
 import { LinearGradient } from "expo-linear-gradient";
@@ -26,8 +28,10 @@ const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
 const TOAST_DURATION = 4000;
 const MAX_PHOTO_BYTES = 5 * 1024 * 1024;
 
+// ── Username availability cache (session-only) ─────────────────────────────
 const usernameCache = new Map<string, boolean>();
 
+// ── Types ──────────────────────────────────────────────────────────────────
 type UsernameStatus =
   | "idle"
   | "typing"
@@ -35,13 +39,17 @@ type UsernameStatus =
   | "available"
   | "taken"
   | "invalid"
-  | "error"
-  | "not_owned";
+  | "error";
 
-type PhotoState = "none" | "picked" | "uploading" | "uploaded" | "failed";
+// "none"   → no photo selected
+// "picked" → photo chosen locally, will upload on submit
+type PhotoState = "none" | "picked";
+
 type StepStatus = "idle" | "loading" | "done" | "error";
 type ToastType = "network" | "server" | null;
+type Step = { key: string; label: string; status: StepStatus };
 
+// ── Toast ──────────────────────────────────────────────────────────────────
 function Toast({
   type,
   message,
@@ -117,8 +125,7 @@ const ts = StyleSheet.create({
   text: { flex: 1, fontSize: 14, fontWeight: "500", lineHeight: 20 },
 });
 
-type Step = { key: string; label: string; status: StepStatus };
-
+// ── Progress overlay ───────────────────────────────────────────────────────
 function ProgressScreen({ steps }: { steps: Step[] }) {
   const allDone = steps.every((s) => s.status === "done");
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -186,45 +193,41 @@ function ProgressScreen({ steps }: { steps: Step[] }) {
           </Animated.View>
         )}
       </View>
+
       <Text style={ps.title}>
         {allDone ? "You're all set!" : "Setting up your account"}
       </Text>
       {allDone && (
         <Text style={ps.subtitle}>Redirecting to the community…</Text>
       )}
+
       <View style={ps.stepsWrap}>
-        {steps.map((step) => {
-          const isLoading = step.status === "loading";
-          const isDone = step.status === "done";
-          const isError = step.status === "error";
-          const isIdle = step.status === "idle";
-          return (
-            <View key={step.key} style={ps.stepRow}>
-              <View style={ps.stepIconWrap}>
-                {isLoading && (
-                  <ActivityIndicator size="small" color="#1DB954" />
-                )}
-                {isDone && (
-                  <Ionicons name="checkmark-circle" size={22} color="#1DB954" />
-                )}
-                {isError && (
-                  <Ionicons name="close-circle" size={22} color="#E91429" />
-                )}
-                {isIdle && <View style={ps.idleDot} />}
-              </View>
-              <Text
-                style={[
-                  ps.stepLabel,
-                  isDone && ps.stepDone,
-                  isError && ps.stepError,
-                  isIdle && ps.stepIdle,
-                ]}
-              >
-                {step.label}
-              </Text>
+        {steps.map((step) => (
+          <View key={step.key} style={ps.stepRow}>
+            <View style={ps.stepIconWrap}>
+              {step.status === "loading" && (
+                <ActivityIndicator size="small" color="#1DB954" />
+              )}
+              {step.status === "done" && (
+                <Ionicons name="checkmark-circle" size={22} color="#1DB954" />
+              )}
+              {step.status === "error" && (
+                <Ionicons name="close-circle" size={22} color="#E91429" />
+              )}
+              {step.status === "idle" && <View style={ps.idleDot} />}
             </View>
-          );
-        })}
+            <Text
+              style={[
+                ps.stepLabel,
+                step.status === "done" && ps.stepDone,
+                step.status === "error" && ps.stepError,
+                step.status === "idle" && ps.stepIdle,
+              ]}
+            >
+              {step.label}
+            </Text>
+          </View>
+        ))}
       </View>
     </View>
   );
@@ -306,34 +309,38 @@ const ps = StyleSheet.create({
   stepIdle: { color: "rgba(255,255,255,0.25)" },
 });
 
+// ── Main screen ────────────────────────────────────────────────────────────
 export default function Device() {
   const router = useRouter();
-  const params = useLocalSearchParams(); // ✅ Get passed params from otp.tsx
+  const params = useLocalSearchParams();
 
   const [username, setUsername] = useState("");
   const [usernameStatus, setUsernameStatus] = useState<UsernameStatus>("idle");
   const [usernameMsg, setUsernameMsg] = useState("");
+
+  // Photo: stored locally only until submit
   const [photoState, setPhotoState] = useState<PhotoState>("none");
   const [avatarLocalUri, setAvatarLocalUri] = useState<string | null>(null);
   const [avatarMime, setAvatarMime] = useState<string>("image/jpeg");
-  const [driveFileId, setDriveFileId] = useState<string | null>(null);
+
   const [showProgress, setShowProgress] = useState(false);
   const [steps, setSteps] = useState<Step[]>([
-    { key: "verify", label: "Checking username...", status: "idle" },
     { key: "photo", label: "Uploading photo...", status: "idle" },
     { key: "save", label: "Saving account...", status: "idle" },
   ]);
+
   const [toast, setToast] = useState<{ type: ToastType; message: string }>({
     type: null,
     message: "",
   });
   const [toastVisible, setToastVisible] = useState(false);
+
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Username available + not mid-submit
   const usernameReady = usernameStatus === "available";
-  const photoBlocking = photoState === "uploading" || photoState === "failed";
-  const canSubmit = usernameReady && !photoBlocking && !showProgress;
+  const canSubmit = usernameReady && !showProgress;
 
   useEffect(() => {
     return () => {
@@ -342,6 +349,7 @@ export default function Device() {
     };
   }, []);
 
+  // ── Toast helper ─────────────────────────────────────────────────────────
   const showToast = useCallback((type: ToastType, message: string) => {
     if (toastTimer.current) clearTimeout(toastTimer.current);
     setToast({ type, message });
@@ -352,6 +360,7 @@ export default function Device() {
     );
   }, []);
 
+  // ── Step helper ───────────────────────────────────────────────────────────
   const setStep = useCallback(
     (key: string, status: StepStatus, label?: string) => {
       setSteps((prev) =>
@@ -363,64 +372,43 @@ export default function Device() {
     [],
   );
 
+  // ── Pick photo — local preview only, no upload ────────────────────────────
   const handlePickAvatar = useCallback(async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== "granted") {
       showToast("server", "Please allow photo access.");
       return;
     }
+
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ImagePicker.MediaType.Images,
       allowsEditing: true,
       aspect: [1, 1],
       quality: 0.85,
     });
+
     if (result.canceled || !result.assets?.[0]) return;
+
     const asset = result.assets[0];
-    const mime = asset.mimeType ?? guessMime(asset.uri);
-    setAvatarLocalUri(asset.uri);
-    setAvatarMime(mime);
-    setDriveFileId(null);
-    setPhotoState("uploading");
-    try {
-      const id = await uploadAvatarToDrive(asset.uri, mime);
-      setDriveFileId(id);
-      setPhotoState("uploaded");
-    } catch (err: any) {
-      setPhotoState("failed");
-      if (err?.message === "network")
-        showToast("network", "No internet — photo upload failed.");
-      else if (err?.message === "size") {
-        showToast("server", "Photo must be under 5 MB.");
-        setAvatarLocalUri(null);
-        setPhotoState("none");
-      } else showToast("server", "Photo upload failed.");
+
+    if (asset.fileSize && asset.fileSize > MAX_PHOTO_BYTES) {
+      showToast("server", "Photo must be under 5 MB.");
+      return;
     }
+
+    // Store locally — upload happens in handleSubmit
+    setAvatarLocalUri(asset.uri);
+    setAvatarMime(asset.mimeType ?? guessMime(asset.uri));
+    setPhotoState("picked");
   }, [showToast]);
 
-  const handleRetryUpload = useCallback(async () => {
-    if (!avatarLocalUri) return;
-    setPhotoState("uploading");
-    setDriveFileId(null);
-    try {
-      const id = await uploadAvatarToDrive(avatarLocalUri, avatarMime);
-      setDriveFileId(id);
-      setPhotoState("uploaded");
-    } catch (err: any) {
-      setPhotoState("failed");
-      showToast(
-        err?.message === "network" ? "network" : "server",
-        err?.message === "network"
-          ? "Still no internet."
-          : "Upload failed again.",
-      );
-    }
-  }, [avatarLocalUri, avatarMime, showToast]);
-
+  // ── Username availability check ───────────────────────────────────────────
   const onUsernameChange = useCallback((raw: string) => {
     const cleaned = raw.toLowerCase().replace(/[^a-z0-9_]/g, "");
     setUsername(cleaned);
+
     if (debounceRef.current) clearTimeout(debounceRef.current);
+
     if (cleaned.length === 0) {
       setUsernameStatus("idle");
       setUsernameMsg("");
@@ -436,6 +424,8 @@ export default function Device() {
       setUsernameMsg("Maximum 20 characters.");
       return;
     }
+
+    // Cache hit
     if (usernameCache.has(cleaned)) {
       const available = usernameCache.get(cleaned)!;
       setUsernameStatus(available ? "available" : "taken");
@@ -444,14 +434,17 @@ export default function Device() {
       );
       return;
     }
+
     setUsernameStatus("checking");
     setUsernameMsg("Checking availability…");
+
     debounceRef.current = setTimeout(async () => {
       try {
         const res = await fetch(
           `${API_URL}/api/auth/check-username?username=${encodeURIComponent(cleaned)}`,
         );
         const data = await res.json().catch(() => ({}));
+
         if (!res.ok) {
           setUsernameStatus(
             data.code === "INVALID_FORMAT" ? "invalid" : "error",
@@ -459,6 +452,7 @@ export default function Device() {
           setUsernameMsg(data.message ?? "Could not check username.");
           return;
         }
+
         usernameCache.set(cleaned, data.available);
         setUsernameStatus(data.available ? "available" : "taken");
         setUsernameMsg(
@@ -471,88 +465,58 @@ export default function Device() {
     }, 600);
   }, []);
 
+  // ── Submit: upload photo then save profile ────────────────────────────────
   const handleSubmit = useCallback(async () => {
     if (!canSubmit) return;
 
     const authUser = getAuth().currentUser;
-
-    // ✅ FIX: Use params if Firebase user is not ready yet
     const userEmail = authUser?.email || (params.userEmail as string);
-    const userUid = authUser?.uid || (params.userUid as string);
 
     if (!userEmail) {
       showToast("server", "Session expired. Please sign in again.");
       return;
     }
 
+    // Reset steps for this attempt
     setSteps([
-      { key: "verify", label: "Checking username...", status: "idle" },
       { key: "photo", label: "Uploading photo...", status: "idle" },
       { key: "save", label: "Saving account...", status: "idle" },
     ]);
     setShowProgress(true);
 
-    // ── Step 1: Verify Ownership ───────────────────────────────
-    setStep("verify", "loading");
-    try {
-      const headers = await authHeaders();
-      const res = await fetch(
-        `${API_URL}/api/auth/verify-username-ownership?username=${encodeURIComponent(username)}`,
-        { method: "GET", headers },
-      );
-      const data = await res.json().catch(() => ({}));
+    // ── Step 1: Upload photo (only now, on submit) ──────────────────────────
+    let finalFileId: string | null = null;
 
-      if (!res.ok) {
-        // SPECIFIC FIX: Handle "Taken by someone else"
-        if (res.status === 403 && data.code === "NOT_OWNER") {
-          setStep("verify", "error", "Username taken");
-          setShowProgress(false);
-          setUsernameStatus("taken");
-          setUsernameMsg("This username is taken. Please try another.");
-          showToast("server", "Username taken. Try another.");
-          return;
-        }
-        // Generic Error
-        setStep("verify", "error", "Failed");
-        setShowProgress(false);
-        showToast("server", data.message || "Verification failed.");
-        return;
-      }
-
-      if (!data.owned) {
-        setStep("verify", "error", "Failed");
-        setShowProgress(false);
-        setUsernameMsg("Unable to verify username.");
-        return;
-      }
-      setStep("verify", "done", "Verified ✓");
-    } catch {
-      setStep("verify", "error", "Connection failed");
-      setShowProgress(false);
-      showToast("network", "Check internet connection.");
-      return;
-    }
-
-    // ── Step 2: Upload photo ───────────────────────────────────
-    let finalFileId = driveFileId;
     if (photoState === "none") {
       setStep("photo", "done", "Skipped");
-    } else if (photoState === "uploaded" && finalFileId) {
-      setStep("photo", "done", "Ready ✓");
     } else {
-      setStep("photo", "error", "Failed");
-      setShowProgress(false);
-      return;
+      // avatarLocalUri is guaranteed set when photoState === "picked"
+      setStep("photo", "loading", "Uploading photo...");
+      try {
+        finalFileId = await uploadAvatarToDrive(avatarLocalUri!, avatarMime);
+        setStep("photo", "done", "Uploaded ✓");
+      } catch (err: any) {
+        setStep("photo", "error", "Upload failed");
+        setShowProgress(false);
+        if (err?.message === "network") {
+          showToast("network", "No internet — photo upload failed.");
+        } else if (err?.message === "size") {
+          showToast("server", "Photo must be under 5 MB.");
+        } else {
+          showToast("server", "Photo upload failed. Try again.");
+        }
+        return;
+      }
     }
 
-    // ── Step 3: Save to MongoDB ────────────────────────────────
+    // ── Step 2: Save profile (backend atomic lock) ──────────────────────────
     setStep("save", "loading");
     try {
       const headers = await authHeaders();
       const payload: Record<string, string> = {
         username: username.trim().toLowerCase(),
         name: username.trim(),
-        email: userEmail, // ✅ Use the reliable variable
+        email: userEmail,
       };
       if (finalFileId) payload.avatarFileId = finalFileId;
 
@@ -566,19 +530,28 @@ export default function Device() {
       if (!res.ok) {
         setStep("save", "error", "Failed");
         setShowProgress(false);
+
         if (body.code === "USERNAME_TAKEN") {
           setUsernameStatus("taken");
-          setUsernameMsg("Just got taken.");
-          showToast("server", "Username taken.");
-        } else if (res.status >= 500) showToast("server", "Server error.");
-        else showToast("server", body.message ?? "Something went wrong.");
+          setUsernameMsg("Just got taken. Please choose another.");
+          showToast("server", "Username taken. Try another.");
+        } else if (body.code === "USERNAME_LOCKED") {
+          // Already has a username — just redirect
+          showToast("server", "Account already set up. Redirecting…");
+          setTimeout(() => router.replace("/tabs/discord"), 1800);
+        } else if (res.status >= 500) {
+          showToast("server", "Server error. Please try again.");
+        } else {
+          showToast("server", body.message ?? "Something went wrong.");
+        }
         return;
       }
+
       setStep("save", "done", "Saved ✓");
     } catch {
       setStep("save", "error", "Failed");
       setShowProgress(false);
-      showToast("network", "Check internet connection.");
+      showToast("network", "No internet. Check connection and retry.");
       return;
     }
 
@@ -587,13 +560,15 @@ export default function Device() {
     canSubmit,
     username,
     photoState,
-    driveFileId,
+    avatarLocalUri,
+    avatarMime,
     showToast,
     setStep,
     router,
     params,
-  ]); // ✅ Added params to deps
+  ]);
 
+  // ── Derived UI values ─────────────────────────────────────────────────────
   const uColor: Record<UsernameStatus, string> = {
     idle: "#555",
     typing: "#555",
@@ -602,8 +577,8 @@ export default function Device() {
     taken: "#E91429",
     invalid: "#E91429",
     error: "#FFA500",
-    not_owned: "#E91429",
   };
+
   const uIcon: Record<UsernameStatus, string> = {
     idle: "at-outline",
     typing: "at-outline",
@@ -612,8 +587,8 @@ export default function Device() {
     taken: "close-circle-outline",
     invalid: "alert-circle-outline",
     error: "wifi-outline",
-    not_owned: "lock-closed-outline",
   };
+
   const uBorder: Record<UsernameStatus, string> = {
     idle: "rgba(255,255,255,0.08)",
     typing: "rgba(255,255,255,0.08)",
@@ -622,40 +597,15 @@ export default function Device() {
     taken: "#E91429",
     invalid: "#E91429",
     error: "#FFA500",
-    not_owned: "#E91429",
   };
 
-  const avatarBadgeColor = photoState === "failed" ? "#E91429" : "#1DB954";
-  const avatarBadgeIcon =
-    photoState === "uploading"
-      ? null
-      : photoState === "failed"
-        ? "refresh"
-        : photoState === "uploaded"
-          ? "checkmark"
-          : "camera";
-  const avatarHint =
-    photoState === "uploading"
-      ? "Uploading…"
-      : photoState === "uploaded"
-        ? "Ready ✓"
-        : photoState === "failed"
-          ? "Tap to retry"
-          : avatarLocalUri
-            ? "Tap to change"
-            : "Add photo (optional)";
-  const avatarHintColor = photoState === "failed" ? "#E91429" : "#555";
   const disabledHint = !usernameReady
     ? usernameStatus === "checking"
-      ? "Checking…"
+      ? "Checking username…"
       : usernameStatus === "taken"
-        ? "Choose another."
-        : "Enter valid username."
-    : photoState === "uploading"
-      ? "Uploading…"
-      : photoState === "failed"
-        ? "Retry photo."
-        : "";
+        ? "Choose another username."
+        : "Enter a valid username first."
+    : "";
 
   return (
     <View style={s.root}>
@@ -666,6 +616,7 @@ export default function Device() {
       />
       <View style={[s.orb, s.orb1]} />
       <View style={[s.orb, s.orb2]} />
+
       <SafeAreaView style={s.safe}>
         <KeyboardAvoidingView
           style={{ flex: 1 }}
@@ -676,12 +627,10 @@ export default function Device() {
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator={false}
           >
+            {/* ── Avatar picker ─────────────────────────────────────────── */}
             <TouchableOpacity
               style={s.avatarWrap}
-              onPress={
-                photoState === "failed" ? handleRetryUpload : handlePickAvatar
-              }
-              disabled={photoState === "uploading"}
+              onPress={handlePickAvatar}
               activeOpacity={0.8}
             >
               {avatarLocalUri ? (
@@ -691,25 +640,25 @@ export default function Device() {
                   <Ionicons name="person-outline" size={36} color="#1DB954" />
                 </View>
               )}
-              <View
-                style={[s.avatarBadge, { backgroundColor: avatarBadgeColor }]}
-              >
-                {photoState === "uploading" ? (
-                  <ActivityIndicator size="small" color="#000" />
-                ) : (
-                  <Ionicons
-                    name={avatarBadgeIcon as any}
-                    size={14}
-                    color="#000"
-                  />
-                )}
+              <View style={s.avatarBadge}>
+                <Ionicons
+                  name={photoState === "picked" ? "checkmark" : "camera"}
+                  size={14}
+                  color="#000"
+                />
               </View>
             </TouchableOpacity>
-            <Text style={[s.avatarHint, { color: avatarHintColor }]}>
-              {avatarHint}
+
+            <Text style={s.avatarHint}>
+              {photoState === "picked"
+                ? "Tap to change · uploads on submit"
+                : "Add photo (optional)"}
             </Text>
+
             <Text style={s.title}>Choose your username</Text>
             <Text style={s.sub}>Enter a unique name to get started.</Text>
+
+            {/* ── Username input ────────────────────────────────────────── */}
             <View style={s.card}>
               <View style={s.cardEdge} />
               <Text style={s.label}>USERNAME</Text>
@@ -745,6 +694,8 @@ export default function Device() {
                 Letters, numbers, underscores · 3–20 chars
               </Text>
             </View>
+
+            {/* ── Submit ───────────────────────────────────────────────── */}
             <TouchableOpacity
               onPress={handleSubmit}
               disabled={!canSubmit}
@@ -753,24 +704,31 @@ export default function Device() {
             >
               <Text style={s.btnText}>Get Started →</Text>
             </TouchableOpacity>
+
             {!canSubmit && disabledHint ? (
               <Text style={s.disabledHint}>{disabledHint}</Text>
             ) : null}
           </ScrollView>
         </KeyboardAvoidingView>
       </SafeAreaView>
+
+      {/* Progress overlay */}
       {showProgress && <ProgressScreen steps={steps} />}
+
+      {/* Toast */}
       <Toast type={toast.type} message={toast.message} visible={toastVisible} />
     </View>
   );
 }
 
+// ── Avatar upload (called only from handleSubmit) ──────────────────────────
 async function uploadAvatarToDrive(
   localUri: string,
   mimeType: string,
 ): Promise<string> {
   const allowed = ["image/jpeg", "image/png", "image/webp"];
   const safeMime = allowed.includes(mimeType) ? mimeType : "image/jpeg";
+
   let blob: Blob;
   try {
     const r = await fetch(localUri);
@@ -778,7 +736,9 @@ async function uploadAvatarToDrive(
   } catch {
     throw new Error("network");
   }
+
   if (blob.size > MAX_PHOTO_BYTES) throw new Error("size");
+
   const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
   let headers: Record<string, string>;
   try {
@@ -787,6 +747,7 @@ async function uploadAvatarToDrive(
   } catch {
     throw new Error("network");
   }
+
   let res: Response;
   try {
     res = await fetch(`${API_URL}/api/avatar`, {
@@ -801,8 +762,11 @@ async function uploadAvatarToDrive(
   } catch {
     throw new Error("network");
   }
+
   if (!res.ok) throw new Error("server");
+
   const body = await res.json().catch(() => ({}));
+  // Extract Drive file ID from the returned avatarUrl
   const match = (body.avatarUrl ?? "").match(/[?&]id=([^&]+)/);
   if (!match?.[1]) throw new Error("server");
   return match[1];
@@ -815,6 +779,7 @@ function guessMime(uri: string): string {
   return "image/jpeg";
 }
 
+// ── Styles ─────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#000" },
   safe: { flex: 1 },
@@ -872,12 +837,13 @@ const s = StyleSheet.create({
     width: 28,
     height: 28,
     borderRadius: 14,
+    backgroundColor: "#1DB954",
     justifyContent: "center",
     alignItems: "center",
     borderWidth: 2,
     borderColor: "#000",
   },
-  avatarHint: { fontSize: 12, marginBottom: 16 },
+  avatarHint: { fontSize: 12, color: "#555", marginBottom: 20 },
   title: {
     color: "#fff",
     fontSize: 24,
