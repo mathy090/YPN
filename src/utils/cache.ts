@@ -1,5 +1,4 @@
 // src/utils/cache.ts
-// Fix: added missing export `CachedMessage` type that discordChannel.tsx imports.
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Crypto from "expo-crypto";
 import { openDatabaseSync, type SQLiteDatabase } from "expo-sqlite";
@@ -13,6 +12,7 @@ const DEFAULT_TTL = 24 * 60 * 60 * 1000; // 24 hours
 export const CACHE_KEYS = {
   TEAM_YPN_MESSAGES: "team_ypn_messages",
   FORYOU_MANIFEST: "foryou_manifest",
+  USER_PROFILE: "user_profile", // NEW: Key for settings page
   discordChannelMessages: (channelId: string) => `discord_msgs_${channelId}`,
   discordChannels: "discord_channels",
 };
@@ -41,16 +41,22 @@ export type ForYouVideo = {
   thumbnail: string | null;
 };
 
-/**
- * CachedMessage — shape stored when caching Discord channel messages.
- * Exported so discordChannel.tsx can use the same type without duplication.
- */
 export type CachedMessage = {
   id: string;
   text: string;
   uid: string;
   displayName: string;
   createdAt: number;
+};
+
+// NEW: Type for User Profile
+export type UserProfileCache = {
+  uid: string;
+  email?: string;
+  username?: string;
+  name?: string;
+  avatarUrl?: string | null;
+  hasProfile?: boolean | number;
 };
 
 // ── SQLite Database ───────────────────────────────────────────────────────────
@@ -60,6 +66,7 @@ let initPromise: Promise<void> | null = null;
 
 const getDB = (): SQLiteDatabase => {
   if (!db) {
+    // Uses synchronous-style API available in newer expo-sqlite
     db = openDatabaseSync("ypn_cache.db");
   }
   return db;
@@ -145,11 +152,7 @@ export const setSecureCache = async (
     const database = getDB();
     await database.runAsync(
       "INSERT OR REPLACE INTO cache_items (key, value, timestamp, ttl, device_id) VALUES (?, ?, ?, ?, ?)",
-      fullKey,
-      value,
-      item.timestamp,
-      item.ttl,
-      item.deviceId,
+      [fullKey, value, item.timestamp, item.ttl, item.deviceId],
     );
   } catch (e) {
     console.warn(`[Cache] setSecureCache error for ${key}:`, e);
@@ -164,13 +167,16 @@ export const getSecureCache = async (key: string): Promise<any | null> => {
     const database = getDB();
     const result = await database.getFirstAsync<{ value: string }>(
       "SELECT value FROM cache_items WHERE key = ? AND device_id = ?",
-      fullKey,
-      deviceId,
+      [fullKey, deviceId],
     );
     if (!result?.value) return null;
     const item = JSON.parse(result.value) as CacheItem;
-    if (Date.now() - item.timestamp > item.ttl) {
-      await database.runAsync("DELETE FROM cache_items WHERE key = ?", fullKey);
+
+    // Check TTL (unless TTL is extremely large, effectively permanent)
+    if (item.ttl > 0 && Date.now() - item.timestamp > item.ttl) {
+      await database.runAsync("DELETE FROM cache_items WHERE key = ?", [
+        fullKey,
+      ]);
       return null;
     }
     return item.data;
@@ -185,7 +191,7 @@ export const removeSecureCache = async (key: string): Promise<void> => {
     await ensureInitialized();
     const fullKey = makeKey(key);
     const database = getDB();
-    await database.runAsync("DELETE FROM cache_items WHERE key = ?", fullKey);
+    await database.runAsync("DELETE FROM cache_items WHERE key = ?", [fullKey]);
   } catch (e) {
     console.warn(`[Cache] removeSecureCache error for ${key}:`, e);
   }
@@ -196,19 +202,47 @@ export const clearSecureCache = async (): Promise<void> => {
     await ensureInitialized();
     if (!deviceId) return;
     const database = getDB();
-    await database.runAsync(
-      "DELETE FROM cache_items WHERE device_id = ?",
+    await database.runAsync("DELETE FROM cache_items WHERE device_id = ?", [
       deviceId,
-    );
+    ]);
+    // Also clear device ID to force regeneration on next login
+    await AsyncStorage.removeItem(DEVICE_ID_KEY);
+    deviceId = null;
   } catch (e) {
     console.warn("[Cache] clearSecureCache error:", e);
   }
 };
 
-export const isSecureCacheInitialized = (): boolean =>
-  deviceId !== null && db !== null;
+// ── NEW: User Profile Helpers (Settings Page) ────────────────────────────────
 
-// ── TeamYPN Message Cache ─────────────────────────────────────────────────────
+/** Save user profile to cache (TTL set to 30 days, effectively persistent until logout) */
+export const saveProfileToCache = async (
+  profile: UserProfileCache,
+): Promise<void> => {
+  // 30 Days TTL
+  await setSecureCache(
+    CACHE_KEYS.USER_PROFILE,
+    profile,
+    30 * 24 * 60 * 60 * 1000,
+  );
+};
+
+/** Get cached user profile */
+export const getCachedProfile = async (): Promise<UserProfileCache | null> => {
+  return await getSecureCache(CACHE_KEYS.USER_PROFILE);
+};
+
+/** Optimistically update just the avatar in cache */
+export const updateAvatarInCache = async (
+  avatarUrl: string | null,
+): Promise<void> => {
+  const current = await getCachedProfile();
+  if (current) {
+    await saveProfileToCache({ ...current, avatarUrl });
+  }
+};
+
+// ── Existing Helpers (TeamYPN, ForYou, Discord) ──────────────────────────────
 
 export const cacheTeamYPNMessages = async (
   messages: TeamYPNMessage[],
@@ -227,8 +261,6 @@ export const getCachedTeamYPNMessages = async (): Promise<
   return Array.isArray(data) ? data : null;
 };
 
-// ── ForYou Manifest Cache ─────────────────────────────────────────────────────
-
 export const cacheForYouManifest = async (
   videos: ForYouVideo[],
 ): Promise<void> => {
@@ -245,8 +277,6 @@ export const getCachedForYouManifest = async (): Promise<
   const data = await getSecureCache(CACHE_KEYS.FORYOU_MANIFEST);
   return Array.isArray(data) ? data : null;
 };
-
-// ── Discord Cache ─────────────────────────────────────────────────────────────
 
 export const cacheDiscordMessages = async (
   channelId: string,

@@ -2,13 +2,14 @@
 import { Ionicons } from "@expo/vector-icons";
 import * as ImagePicker from "expo-image-picker";
 import { LinearGradient } from "expo-linear-gradient";
-import { useRouter } from "expo-router";
+import { useFocusEffect, useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
   Image,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -18,37 +19,61 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useAuth } from "../../src/store/authStore";
 import { clearToken, getToken } from "../../src/utils/tokenManager";
+// Imports from our unified db layer
+import {
+  clearSecureCache,
+  getProfile,
+  initializeSecureCache,
+  saveProfile,
+  updateAvatarUrl,
+  UserProfile,
+} from "../../src/utils/db";
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
-
-type UserProfile = {
-  username?: string;
-  email?: string;
-  name?: string;
-  avatarUrl?: string | null;
-};
 
 export default function Settings() {
   const router = useRouter();
   const { logout: logoutStore } = useAuth();
 
-  const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<UserProfile | null>(null);
-  const [actionLoading, setActionLoading] = useState<"upload" | "delete" | null>(null);
-  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true); // Initial local load
+  const [syncing, setSyncing] = useState(false); // Background sync status
+  const [actionLoading, setActionLoading] = useState<
+    "upload" | "delete" | null
+  >(null);
 
+  // 1. Initialize Cache & Load Local Data Immediately
   useEffect(() => {
-    fetchProfile();
+    const init = async () => {
+      // Ensure SQLite is ready
+      await initializeSecureCache();
+
+      // Load from Cache (Instant UI)
+      const localProfile = await getProfile();
+      setProfile(localProfile);
+      setLoading(false);
+
+      // Silent Background Sync (If we have a token)
+      const token = await getToken();
+      if (token) {
+        fetchProfileFromBackend(false);
+      }
+    };
+    init();
   }, []);
 
-  const fetchProfile = async () => {
+  // Re-sync when screen comes into focus (optional freshness)
+  useFocusEffect(
+    useCallback(() => {
+      // Could trigger a silent sync here if needed
+    }, []),
+  );
+
+  const fetchProfileFromBackend = async (showLoading = false) => {
     try {
+      if (showLoading) setSyncing(true);
       const token = await getToken();
-      if (!token) {
-        setError("No session found");
-        setLoading(false);
-        return;
-      }
+      if (!token) return;
 
       const res = await fetch(`${API_URL}/api/users/profile`, {
         headers: { Authorization: `Bearer ${token}` },
@@ -56,18 +81,15 @@ export default function Settings() {
 
       if (res.ok) {
         const data = await res.json();
-        setProfile(data);
-      } else {
-        if (res.status === 401 || res.status === 404) {
-          await handleLogout();
-          return;
-        }
-        setError("Failed to load profile");
+        await saveProfile(data); // Update Cache
+        setProfile(data); // Update UI
+      } else if (res.status === 401 || res.status === 404) {
+        await handleLogout();
       }
     } catch (err) {
-      setError("Network error");
+      console.log("Sync failed, using cached profile");
     } finally {
-      setLoading(false);
+      if (showLoading) setSyncing(false);
     }
   };
 
@@ -80,19 +102,23 @@ export default function Settings() {
         return;
       }
       result = await ImagePicker.launchCameraAsync({
-        mediaTypes: ImagePicker.MediaType.Images,
+        mediaTypes: ["images"],
         allowsEditing: true,
         aspect: [1, 1],
         quality: 0.8,
       });
     } else {
-      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      const { status } =
+        await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (status !== "granted") {
-        Alert.alert("Permission Required", "Please allow photo library access.");
+        Alert.alert(
+          "Permission Required",
+          "Please allow photo library access.",
+        );
         return;
       }
       result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ImagePicker.MediaType.Images,
+        mediaTypes: ["images"],
         allowsEditing: true,
         aspect: [1, 1],
         quality: 0.8,
@@ -103,8 +129,9 @@ export default function Settings() {
 
     const uri = result.assets[0].uri;
     const mimeType = result.assets[0].mimeType || "image/jpeg";
-    
+
     setActionLoading("upload");
+
     try {
       const token = await getToken();
       const blob = await new Promise<Blob>((resolve, reject) => {
@@ -127,8 +154,11 @@ export default function Settings() {
 
       if (res.ok) {
         const data = await res.json();
-        // Update local state immediately
-        setProfile((prev) => prev ? { ...prev, avatarUrl: data.avatarUrl } : null);
+        // OPTIMISTIC UPDATE: Update Cache & UI immediately
+        await updateAvatarUrl(data.avatarUrl);
+        setProfile((prev) =>
+          prev ? { ...prev, avatarUrl: data.avatarUrl } : null,
+        );
         Alert.alert("Success", "Avatar updated successfully.");
       } else {
         const errData = await res.json().catch(() => ({}));
@@ -160,7 +190,11 @@ export default function Settings() {
               });
 
               if (res.ok) {
-                setProfile((prev) => prev ? { ...prev, avatarUrl: null } : null);
+                // OPTIMISTIC UPDATE: Clear Cache & UI immediately
+                await updateAvatarUrl(null);
+                setProfile((prev) =>
+                  prev ? { ...prev, avatarUrl: null } : null,
+                );
                 Alert.alert("Success", "Avatar removed.");
               } else {
                 Alert.alert("Error", "Failed to remove avatar.");
@@ -172,31 +206,38 @@ export default function Settings() {
             }
           },
         },
-      ]
+      ],
     );
   };
 
   const showAvatarOptions = () => {
     const options = [
       { text: "Take Photo", onPress: () => handlePickImage("camera") },
-      { text: "Choose from Library", onPress: () => handlePickImage("library") },
+      {
+        text: "Choose from Library",
+        onPress: () => handlePickImage("library"),
+      },
     ];
     if (profile?.avatarUrl) {
-      options.push({ text: "Remove Avatar", onPress: handleRemoveAvatar, style: "destructive" as const });
+      options.push({
+        text: "Remove Avatar",
+        onPress: handleRemoveAvatar,
+        style: "destructive" as const,
+      });
     }
     options.push({ text: "Cancel", style: "cancel" as const });
-
     Alert.alert("Profile Picture", "Choose an option", options);
   };
 
-  const handleLogout = () => {
-    Alert.alert("Sign Out", "Are you sure you want to sign out?", [
+  const handleLogout = async () => {
+    Alert.alert("Sign Out", "Are you sure?", [
       { text: "Cancel", style: "cancel" },
       {
         text: "Sign Out",
         style: "destructive",
         onPress: async () => {
           await clearToken();
+          await clearSecureCache(); // Wipes SQLite & Device ID
           logoutStore();
           router.replace("/welcome");
         },
@@ -208,7 +249,10 @@ export default function Settings() {
     return (
       <View style={s.root}>
         <StatusBar style="light" />
-        <LinearGradient colors={["#0a0a14", "#000000", "#0a0a14"]} style={StyleSheet.absoluteFill} />
+        <LinearGradient
+          colors={["#0a0a14", "#000000", "#0a0a14"]}
+          style={StyleSheet.absoluteFill}
+        />
         <View style={s.center}>
           <ActivityIndicator size="large" color="#1DB954" />
           <Text style={s.loadingText}>Loading settings...</Text>
@@ -220,10 +264,23 @@ export default function Settings() {
   return (
     <View style={s.root}>
       <StatusBar style="light" />
-      <LinearGradient colors={["#0a0a14", "#000000", "#0a0a14"]} style={StyleSheet.absoluteFill} />
+      <LinearGradient
+        colors={["#0a0a14", "#000000", "#0a0a14"]}
+        style={StyleSheet.absoluteFill}
+      />
 
       <SafeAreaView style={s.safe}>
-        <ScrollView contentContainerStyle={s.scroll}>
+        <ScrollView
+          contentContainerStyle={s.scroll}
+          refreshControl={
+            <RefreshControl
+              refreshing={syncing}
+              onRefresh={() => fetchProfileFromBackend(true)}
+              tintColor="#1DB954"
+              colors={["#1DB954"]}
+            />
+          }
+        >
           <View style={s.header}>
             <Text style={s.title}>Settings</Text>
             <Text style={s.subtitle}>Manage your account preferences</Text>
@@ -232,10 +289,17 @@ export default function Settings() {
           {/* Profile Card */}
           <View style={s.card}>
             <View style={s.cardHeader}>
-              <TouchableOpacity onPress={showAvatarOptions} disabled={!!actionLoading} activeOpacity={0.7}>
+              <TouchableOpacity
+                onPress={showAvatarOptions}
+                disabled={!!actionLoading}
+                activeOpacity={0.7}
+              >
                 <View style={s.avatarContainer}>
                   {profile?.avatarUrl ? (
-                    <Image source={{ uri: profile.avatarUrl }} style={s.avatar} />
+                    <Image
+                      source={{ uri: profile.avatarUrl }}
+                      style={s.avatar}
+                    />
                   ) : (
                     <View style={s.avatarPlaceholder}>
                       <Ionicons name="person" size={32} color="#1DB954" />
@@ -248,10 +312,12 @@ export default function Settings() {
                   )}
                 </View>
               </TouchableOpacity>
-              
+
               <View style={s.infoWrap}>
                 <Text style={s.userName}>{profile?.username || "User"}</Text>
-                <Text style={s.userEmail}>{profile?.email || "email@example.com"}</Text>
+                <Text style={s.userEmail}>
+                  {profile?.email || "email@example.com"}
+                </Text>
                 <Text style={s.editHint}>Tap avatar to change</Text>
               </View>
             </View>
@@ -276,7 +342,12 @@ export default function Settings() {
           </View>
 
           {/* Danger Zone */}
-          <TouchableOpacity style={s.logoutBtn} onPress={handleLogout} activeOpacity={0.8} disabled={!!actionLoading}>
+          <TouchableOpacity
+            style={s.logoutBtn}
+            onPress={handleLogout}
+            activeOpacity={0.8}
+            disabled={!!actionLoading}
+          >
             {actionLoading === "delete" ? (
               <ActivityIndicator size="small" color="#E91429" />
             ) : (
@@ -311,9 +382,20 @@ const s = StyleSheet.create({
     overflow: "hidden",
     marginBottom: 24,
   },
-  cardHeader: { flexDirection: "row", alignItems: "center", padding: 20, gap: 16 },
+  cardHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    padding: 20,
+    gap: 16,
+  },
   avatarContainer: { position: "relative" },
-  avatar: { width: 60, height: 60, borderRadius: 30, borderWidth: 2, borderColor: "#1DB954" },
+  avatar: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    borderWidth: 2,
+    borderColor: "#1DB954",
+  },
   avatarPlaceholder: {
     width: 60,
     height: 60,
@@ -327,7 +409,10 @@ const s = StyleSheet.create({
   },
   overlay: {
     position: "absolute",
-    top: 0, left: 0, right: 0, bottom: 0,
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
     borderRadius: 30,
     backgroundColor: "rgba(0,0,0,0.5)",
     justifyContent: "center",
@@ -337,7 +422,11 @@ const s = StyleSheet.create({
   userName: { color: "#fff", fontSize: 18, fontWeight: "700" },
   userEmail: { color: "#888", fontSize: 13, marginTop: 4 },
   editHint: { color: "#1DB954", fontSize: 11, marginTop: 6, fontWeight: "600" },
-  divider: { height: 1, backgroundColor: "rgba(255,255,255,0.08)", marginHorizontal: 20 },
+  divider: {
+    height: 1,
+    backgroundColor: "rgba(255,255,255,0.08)",
+    marginHorizontal: 20,
+  },
   row: { flexDirection: "row", alignItems: "center", padding: 16, gap: 14 },
   rowText: { flex: 1 },
   label: { color: "#888", fontSize: 12, marginBottom: 2 },
