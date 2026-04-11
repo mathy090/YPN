@@ -71,7 +71,7 @@ export async function pickAndUploadAvatar(): Promise<AvatarResult> {
     };
   }
 
-  // 4. Validate size (fileSize may be undefined on some devices)
+  // 4. Validate size
   if (asset.fileSize && asset.fileSize > MAX_BYTES) {
     return {
       ok: false,
@@ -124,7 +124,7 @@ export async function pickAndUploadAvatar(): Promise<AvatarResult> {
     };
   }
 
-  // 7. Upload
+  // 7. Upload to backend → Supabase Storage
   let uploadRes: Response;
   try {
     uploadRes = await fetch(`${API_URL}/api/avatar`, {
@@ -137,7 +137,6 @@ export async function pickAndUploadAvatar(): Promise<AvatarResult> {
       body: blob,
     });
   } catch {
-    // fetch threw = truly no network
     return {
       ok: false,
       error: {
@@ -168,6 +167,7 @@ export async function pickAndUploadAvatar(): Promise<AvatarResult> {
     };
   }
 
+  // avatarUrl is now a Supabase CDN public URL
   return { ok: true, avatarUrl: body.avatarUrl, localUri };
 }
 

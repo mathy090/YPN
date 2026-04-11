@@ -485,15 +485,17 @@ export default function Device() {
     setShowProgress(true);
 
     // ── Step 1: Upload photo (only now, on submit) ──────────────────────────
-    let finalFileId: string | null = null;
+    let finalAvatarUrl: string | null = null;
 
     if (photoState === "none") {
       setStep("photo", "done", "Skipped");
     } else {
-      // avatarLocalUri is guaranteed set when photoState === "picked"
       setStep("photo", "loading", "Uploading photo...");
       try {
-        finalFileId = await uploadAvatarToDrive(avatarLocalUri!, avatarMime);
+        finalAvatarUrl = await uploadAvatarToSupabase(
+          avatarLocalUri!,
+          avatarMime,
+        );
         setStep("photo", "done", "Uploaded ✓");
       } catch (err: any) {
         setStep("photo", "error", "Upload failed");
@@ -518,7 +520,8 @@ export default function Device() {
         name: username.trim(),
         email: userEmail,
       };
-      if (finalFileId) payload.avatarFileId = finalFileId;
+      // Store the full Supabase public URL as avatarFileId
+      if (finalAvatarUrl) payload.avatarFileId = finalAvatarUrl;
 
       const res = await fetch(`${API_URL}/api/users/profile`, {
         method: "POST",
@@ -536,7 +539,6 @@ export default function Device() {
           setUsernameMsg("Just got taken. Please choose another.");
           showToast("server", "Username taken. Try another.");
         } else if (body.code === "USERNAME_LOCKED") {
-          // Already has a username — just redirect
           showToast("server", "Account already set up. Redirecting…");
           setTimeout(() => router.replace("/tabs/discord"), 1800);
         } else if (res.status >= 500) {
@@ -721,8 +723,9 @@ export default function Device() {
   );
 }
 
-// ── Avatar upload (called only from handleSubmit) ──────────────────────────
-async function uploadAvatarToDrive(
+// ── Avatar upload via backend → Supabase Storage ───────────────────────────
+// Returns the full Supabase public URL (stored as avatarFileId in MongoDB)
+async function uploadAvatarToSupabase(
   localUri: string,
   mimeType: string,
 ): Promise<string> {
@@ -766,10 +769,11 @@ async function uploadAvatarToDrive(
   if (!res.ok) throw new Error("server");
 
   const body = await res.json().catch(() => ({}));
-  // Extract Drive file ID from the returned avatarUrl
-  const match = (body.avatarUrl ?? "").match(/[?&]id=([^&]+)/);
-  if (!match?.[1]) throw new Error("server");
-  return match[1];
+
+  // Supabase returns avatarUrl directly as a full public CDN URL
+  if (!body.avatarUrl) throw new Error("server");
+
+  return body.avatarUrl;
 }
 
 function guessMime(uri: string): string {

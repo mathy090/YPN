@@ -2,38 +2,34 @@
 "use strict";
 
 const express = require("express");
-const { google } = require("googleapis");
-const stream = require("stream");
+const { createClient } = require("@supabase/supabase-js");
 
 const router = express.Router();
 
 const MAX_BYTES = 5 * 1024 * 1024;
 const ALLOWED_MIME = ["image/jpeg", "image/png", "image/webp"];
 
-let _drive = null;
+// ── Supabase client (lazy singleton) ──────────────────────────────────────────
+let _supabase = null;
 
-function getDrive() {
-  if (_drive) return _drive;
-  if (!process.env.GOOGLE_SERVICE_ACCOUNT_KEY)
-    throw new Error("GOOGLE_SERVICE_ACCOUNT_KEY not set");
+function getSupabase() {
+  if (_supabase) return _supabase;
 
-  let credentials;
-  try {
-    credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
-  } catch {
-    throw new Error("GOOGLE_SERVICE_ACCOUNT_KEY is not valid JSON");
-  }
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ["https://www.googleapis.com/auth/drive"],
+  if (!url) throw new Error("SUPABASE_URL env var not set");
+  if (!key) throw new Error("SUPABASE_SERVICE_ROLE_KEY env var not set");
+
+  _supabase = createClient(url, key, {
+    auth: { persistSession: false },
   });
-  _drive = google.drive({ version: "v3", auth });
-  return _drive;
+
+  return _supabase;
 }
 
-// POST /api/avatar
-// Headers: Content-Type: image/jpeg|png|webp, Authorization: Bearer <token>
+// ── POST /api/avatar ───────────────────────────────────────────────────────────
+// Headers: Content-Type: image/jpeg|png|webp, Authorization: Bearer <firebase token>
 // Body: raw image bytes
 // Returns: { avatarUrl: string }
 router.post("/", async (req, res) => {
@@ -56,33 +52,52 @@ router.post("/", async (req, res) => {
       });
     }
 
-    const folderId = process.env.GOOGLE_DRIVE_AVATAR_FOLDER_ID;
-    if (!folderId) throw new Error("GOOGLE_DRIVE_AVATAR_FOLDER_ID not set");
+    // ── Read raw body into a Buffer ───────────────────────────────────────────
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    const buffer = Buffer.concat(chunks);
 
-    const drive = getDrive();
+    // Double-check actual body size (Content-Length can be spoofed)
+    if (buffer.length > MAX_BYTES) {
+      return res.status(400).json({
+        code: "FILE_TOO_LARGE",
+        message: "Photo must be under 5 MB.",
+      });
+    }
+
     const ext = mimeType.split("/")[1] ?? "jpg";
-    const filename = `avatar_${uid}_${Date.now()}.${ext}`;
+    // One file per user — always overwrite so old avatars don't pile up
+    const filePath = `${uid}/avatar.${ext}`;
 
-    const passThrough = new stream.PassThrough();
-    req.pipe(passThrough);
+    const supabase = getSupabase();
 
-    const uploaded = await drive.files.create({
-      requestBody: { name: filename, parents: [folderId] },
-      media: { mimeType, body: passThrough },
-      fields: "id",
-    });
+    // ── Upload to Supabase Storage (upsert = overwrite) ───────────────────────
+    const { error: uploadError } = await supabase.storage
+      .from("avatars")
+      .upload(filePath, buffer, {
+        contentType: mimeType,
+        upsert: true, // overwrite previous avatar for this user
+        cacheControl: "3600", // CDN caches for 1 hour
+      });
 
-    const fileId = uploaded.data.id;
+    if (uploadError) {
+      console.error("[Avatar] Supabase upload error:", uploadError.message);
+      return res.status(500).json({
+        code: "SERVER_ERROR",
+        message: "Sorry, this is on our side. Please try again later.",
+      });
+    }
 
-    // Make publicly readable so the URL works without auth
-    await drive.permissions.create({
-      fileId,
-      requestBody: { role: "reader", type: "anyone" },
-    });
+    // ── Get permanent public URL ───────────────────────────────────────────────
+    const { data: urlData } = supabase.storage
+      .from("avatars")
+      .getPublicUrl(filePath);
 
-    const avatarUrl = `https://drive.google.com/uc?export=view&id=${fileId}`;
+    const avatarUrl = urlData.publicUrl;
 
-    console.log(`[Avatar] uid=${uid} uploaded fileId=${fileId}`);
+    console.log(`[Avatar] uid=${uid} uploaded to Supabase: ${avatarUrl}`);
     res.status(201).json({ avatarUrl });
   } catch (err) {
     console.error("[Avatar] upload error:", err.message);
