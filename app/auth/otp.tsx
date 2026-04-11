@@ -1,9 +1,16 @@
 // app/auth/otp.tsx — Login
+//
+// Custom API Login Flow:
+// 1. Sends email/password to backend (/api/auth/login).
+// 2. Backend verifies via Firebase Admin + Web API Key.
+// 3. Backend returns Auth Token + User Details.
+// 4. Client saves token and pushes to /auth/device WITH user params.
+
 import { Ionicons } from "@expo/vector-icons";
+import NetInfo from "@react-native-community/netinfo";
 import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
-import { signInWithEmailAndPassword } from "firebase/auth";
 import { useEffect, useState } from "react";
 import {
   ActivityIndicator,
@@ -11,7 +18,6 @@ import {
   Image,
   Keyboard,
   KeyboardAvoidingView,
-  Linking,
   Platform,
   ScrollView,
   StyleSheet,
@@ -21,21 +27,10 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { auth } from "../../src/firebase/auth";
 import { useAuth } from "../../src/store/authStore";
-import { saveToken, verifyWithBackend } from "../../src/utils/tokenManager";
+import { saveToken } from "../../src/utils/tokenManager";
 
-const ADMIN_EMAIL = "tafadzwarunowanda@gmail.com";
-
-function openResetEmail() {
-  const subject = encodeURIComponent("Password Reset Request");
-  const body = encodeURIComponent(
-    "Hi,\n\nI would like to reset my password for my YPN account.\n\nMy email: \n\nThank you!",
-  );
-  Linking.openURL(
-    `mailto:${ADMIN_EMAIL}?subject=${subject}&body=${body}`,
-  ).catch(() => {});
-}
+const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
 
 export default function OTP() {
   const router = useRouter();
@@ -47,7 +42,7 @@ export default function OTP() {
   const [loading, setLoading] = useState(false);
   const [showPass, setShowPass] = useState(false);
 
-  const isValid = email.includes("@") && password.length >= 8;
+  const isValid = email.includes("@") && password.length >= 6;
 
   useEffect(() => {
     const sub = BackHandler.addEventListener("hardwareBackPress", () => {
@@ -55,7 +50,7 @@ export default function OTP() {
       return true;
     });
     return () => sub.remove();
-  }, []);
+  }, [router]);
 
   const submit = async () => {
     if (!isValid || loading) return;
@@ -64,66 +59,92 @@ export default function OTP() {
     setLoading(true);
 
     try {
-      // ── 1. Firebase sign-in ───────────────────────────────────────────────
-      const cred = await signInWithEmailAndPassword(auth, email, password);
-      const firebaseUser = cred.user;
+      // Step 1: Check actual internet connectivity
+      const netState = await NetInfo.fetch();
 
-      if (!firebaseUser.emailVerified) {
-        setError("Please verify your email before signing in.");
-        await auth.signOut();
-        return;
+      if (!netState.isConnected) {
+        throw new Error("NO_INTERNET");
       }
 
-      // ── 2. Get fresh token ────────────────────────────────────────────────
-      const idToken = await firebaseUser.getIdToken(true);
-      await saveToken(idToken);
-
-      // ── 3. Verify with backend — response contains hasProfile ─────────────
-      // verifyWithBackend returns { uid, email, hasProfile }
-      // hasProfile is true if the user has already set a username in MongoDB.
-      // We use this single round-trip to decide routing — no extra GET needed.
-      let hasProfile = false;
+      // Step 2: Attempt API Call
+      let response;
       try {
-        const verifyResult = await verifyWithBackend(idToken);
-        hasProfile = verifyResult.hasProfile ?? false;
-      } catch {
-        // Backend unreachable — allow login, assume no profile so we
-        // send them to device.tsx. If they already have one, device.tsx
-        // will get a USERNAME_ALREADY_SET 409 and can redirect gracefully.
-        hasProfile = false;
+        response = await fetch(`${API_URL}/api/auth/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            email: email.trim(),
+            password: password,
+          }),
+        });
+      } catch (fetchErr: any) {
+        // Fetch failed (Timeout, Connection Refused, DNS fail)
+        // Since we know internet IS connected, this means SERVER is down.
+        console.error("[OTP] Fetch failed:", fetchErr);
+        throw new Error("SERVER_DOWN");
       }
 
-      // ── 4. Update auth store ──────────────────────────────────────────────
+      // Step 3: Handle HTTP Status Codes
+      if (!response.ok) {
+        const status = response.status;
+
+        if (status >= 500) {
+          throw new Error("SERVER_DOWN");
+        }
+
+        if (status === 404) {
+          throw new Error("ACCOUNT_NOT_FOUND");
+        }
+
+        if (status === 401) {
+          throw new Error("INVALID_CREDENTIALS");
+        }
+
+        if (status === 403) {
+          throw new Error("EMAIL_NOT_VERIFIED");
+        }
+
+        // Any other error defaults to server issue
+        throw new Error("SERVER_DOWN");
+      }
+
+      // Step 4: Parse Response
+      const data = await response.json();
+      const { token, user } = data;
+
+      if (!token || !user) {
+        throw new Error("SERVER_DOWN");
+      }
+
+      // Step 5: Save Token & Update Local State
+      await saveToken(token);
       await login();
 
-      // ── 5. Route based on profile status ─────────────────────────────────
-      // Returning user (profile already set) → skip device.tsx entirely.
-      // New user (no username yet) → go set up their username.
-      if (hasProfile) {
-        router.replace("/tabs/discord");
-      } else {
-        router.replace("/auth/device");
-      }
+      // Step 6: Push to Device Setup WITH User Params
+      // This fixes the "Session expired" issue by passing data directly
+      router.replace({
+        pathname: "/auth/device",
+        params: {
+          userEmail: user.email,
+          userUid: user.uid,
+        },
+      });
     } catch (e: any) {
-      if (
-        e.code === "auth/network-request-failed" ||
-        e.code === "auth/too-many-requests"
-      ) {
-        setError("No internet connection. Please try again.");
-      } else if (
-        e.code === "auth/user-not-found" ||
-        e.code === "auth/wrong-password" ||
-        e.code === "auth/invalid-credential"
-      ) {
+      console.error("[OTP] Login Error:", e);
+
+      const message = e.message;
+
+      if (message === "NO_INTERNET") {
+        setError("Poor internet connection.");
+      } else if (message === "ACCOUNT_NOT_FOUND") {
+        setError("Account not found. Check your email and verify account.");
+      } else if (message === "INVALID_CREDENTIALS") {
         setError("Invalid email or password.");
-      } else if (e.code === "auth/user-disabled") {
-        setError("This account has been disabled.");
-      } else if (e.code === "EMAIL_NOT_VERIFIED") {
-        setError("Please verify your email before signing in.");
-      } else if (e.code === "TOKEN_EXPIRED" || e.code === "INVALID_TOKEN") {
-        setError("Session expired. Please sign in again.");
+      } else if (message === "EMAIL_NOT_VERIFIED") {
+        setError("Email not verified. Please check your inbox.");
       } else {
-        setError("Something went wrong. Please try again.");
+        // Covers SERVER_DOWN, Timeouts, or unknown errors
+        setError("Our side is having a problem, try again later.");
       }
     } finally {
       setLoading(false);
@@ -194,11 +215,11 @@ export default function OTP() {
               </View>
 
               <Text style={[s.label, { marginTop: 16 }]}>PASSWORD</Text>
-              <View style={[s.row, password.length >= 8 && s.rowActive]}>
+              <View style={[s.row, password.length >= 6 && s.rowActive]}>
                 <Ionicons
                   name="lock-closed-outline"
                   size={18}
-                  color={password.length >= 8 ? "#1DB954" : "#555"}
+                  color={password.length >= 6 ? "#1DB954" : "#555"}
                   style={s.icon}
                 />
                 <TextInput
@@ -345,16 +366,8 @@ const s = StyleSheet.create({
   rowActive: { borderColor: "#1DB954" },
   icon: { marginRight: 10 },
   input: { flex: 1, color: "#fff", fontSize: 15 },
-  forgotLink: {
-    alignSelf: "flex-end",
-    marginTop: 8,
-    paddingVertical: 4,
-  },
-  forgotText: {
-    color: "#1DB954",
-    fontSize: 12,
-    fontWeight: "600",
-  },
+  forgotLink: { alignSelf: "flex-end", marginTop: 8, paddingVertical: 4 },
+  forgotText: { color: "#1DB954", fontSize: 12, fontWeight: "600" },
   err: { color: "#E91429", fontSize: 12, marginTop: 10 },
   btn: {
     backgroundColor: "#1DB954",
