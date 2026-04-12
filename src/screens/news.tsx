@@ -20,14 +20,16 @@ import {
 import {
   getSecureCache,
   initializeSecureCache,
-  setSecureCache
+  setSecureCache,
 } from "../utils/cache";
 
 WebBrowser.maybeCompleteAuthSession();
 
+// ── Config ─────────────────────────────────────────────────────────────────────
 const API_URL = process.env.EXPO_PUBLIC_API_URL;
 const NEWS_CACHE_KEY = "news_manifest";
-const CACHE_TTL = 20 * 60 * 1000;
+// ✅ FIX 1: Match backend L1 TTL (10 minutes)
+const CACHE_TTL = 10 * 60 * 1000;
 
 type NewsItem = {
   id: string;
@@ -40,6 +42,7 @@ type NewsItem = {
   description: string;
 };
 
+// ── Cache Helpers ──────────────────────────────────────────────────────────────
 async function readNewsCache(): Promise<NewsItem[] | null> {
   try {
     const data = await getSecureCache(NEWS_CACHE_KEY);
@@ -206,10 +209,12 @@ export default function NewsScreen() {
     setError(false);
 
     try {
-      const res = await fetch(`${API_URL}/api/news`);
+      // ✅ FIX 2: Add ?refresh=true for manual pulls to bypass backend cache
+      const refreshParam = manual ? "?refresh=true" : "";
+      const res = await fetch(`${API_URL}/api/news${refreshParam}`);
+
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-      // ✅ FIX: Added variable name 'data'
       const data: NewsItem[] = await res.json();
 
       if (data.length > 0) {
