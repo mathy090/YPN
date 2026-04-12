@@ -151,24 +151,20 @@ function registerRoutes() {
             .json({ message: "Account not found.", code: "ACCOUNT_NOT_FOUND" });
         }
         if (restData.error?.message === "INVALID_PASSWORD") {
-          return res
-            .status(401)
-            .json({
-              message: "Invalid password.",
-              code: "INVALID_CREDENTIALS",
-            });
+          return res.status(401).json({
+            message: "Invalid password.",
+            code: "INVALID_CREDENTIALS",
+          });
         }
         if (restData.error?.message === "USER_DISABLED") {
           return res
             .status(403)
             .json({ message: "Account disabled.", code: "USER_DISABLED" });
         }
-        return res
-          .status(401)
-          .json({
-            message: "Invalid email or password.",
-            code: "INVALID_CREDENTIALS",
-          });
+        return res.status(401).json({
+          message: "Invalid email or password.",
+          code: "INVALID_CREDENTIALS",
+        });
       }
 
       const idToken = restData.idToken;
@@ -290,19 +286,17 @@ function registerRoutes() {
 
       if (!currentUser.username) {
         // User hasn't set a username yet. Try to set it now.
-        const result = await db
-          .collection("users")
-          .findOneAndUpdate(
-            { uid, username: { $exists: false } },
-            {
-              $set: {
-                ...updatePayload,
-                username: cleanUsername,
-                hasProfile: true,
-              },
+        const result = await db.collection("users").findOneAndUpdate(
+          { uid, username: { $exists: false } },
+          {
+            $set: {
+              ...updatePayload,
+              username: cleanUsername,
+              hasProfile: true,
             },
-            { returnDocument: "after" },
-          );
+          },
+          { returnDocument: "after" },
+        );
 
         if (!result) {
           return res
@@ -393,7 +387,7 @@ function registerRoutes() {
 
   // ── Mount External Routes ──────────────────────────────────────────────────
   app.use("/api/avatar", verifyFirebaseToken, avatarRoutes);
-  app.use("/api/videos/drive", verifyFirebaseToken, driveVideoRoutes);
+  app.use("/api/videos/drive", driveVideoRoutes);
   app.use("/api/videos", videoRoutes);
   app.use("/api/discord", discordRoutes);
   app.use("/api/news", newsRoutes);
