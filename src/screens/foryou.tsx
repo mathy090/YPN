@@ -1,9 +1,9 @@
 // src/screens/foryou.tsx
+// ✅ Requires: expo-video, expo-file-system (SDK 54+), custom dev build
 import { Ionicons } from "@expo/vector-icons";
-import { Audio, AVPlaybackStatus } from "expo-av";
-import * as FileSystem from "expo-file-system";
-import { Video } from "expo-video";
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import { Directory, File } from "expo-file-system";
+import { ResizeMode, Video, type VideoStatus } from "expo-video";
+import React, { memo, useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Dimensions,
@@ -24,6 +24,7 @@ const L1_TTL_MS = 60 * 60 * 1000;
 const { width: W, height: H } = Dimensions.get("window");
 const STATUS_H =
   Platform.OS === "android" ? (RNStatusBar.currentHeight ?? 24) : 0;
+const LOCAL_DIR = `${Directory.cacheDirectory}ypn_drive_v3/`;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 type DriveVideo = {
@@ -35,7 +36,7 @@ type DriveVideo = {
   streamUrl: string;
 };
 
-// ── Cache Helpers ─────────────────────────────────────────────────────────────
+// ── Cache Helpers (In-Memory Manifest) ─────────────────────────────────────────
 let _manifestCache: DriveVideo[] | null = null;
 let _manifestTs: number = 0;
 
@@ -44,30 +45,28 @@ function l1Read(): DriveVideo[] | null {
   return _manifestCache;
 }
 
-// ✅ FIX: Added 'data' variable name
 function l1Write(data: DriveVideo[]) {
   _manifestCache = data;
   _manifestTs = Date.now();
 }
 
-const LOCAL_DIR = FileSystem.cacheDirectory + "ypn_drive_v3/";
-
+// ── File System Helpers (New API) ──────────────────────────────────────────────
 async function ensureDir() {
-  const info = await FileSystem.getInfoAsync(LOCAL_DIR);
-  if (!info.exists) {
-    await FileSystem.makeDirectoryAsync(LOCAL_DIR, { intermediates: true });
+  const dir = new Directory(LOCAL_DIR);
+  if (!(await dir.exists())) {
+    await dir.createAsync({ intermediates: true });
   }
 }
 
-const filePath = (id: string) => LOCAL_DIR + id + ".mp4";
+const filePath = (id: string) => `${LOCAL_DIR}${id}.mp4`;
 const _cachedPaths = new Map<string, string>();
 
 async function isFileCached(id: string): Promise<boolean> {
   if (_cachedPaths.has(id)) return true;
-  const p = filePath(id);
-  const info = await FileSystem.getInfoAsync(p);
-  if (info.exists) {
-    _cachedPaths.set(id, p);
+  const file = new File(filePath(id));
+  const exists = await file.exists();
+  if (exists) {
+    _cachedPaths.set(id, file.path);
     return true;
   }
   return false;
@@ -81,24 +80,28 @@ function saveCachedPath(id: string, path: string) {
   _cachedPaths.set(id, path);
 }
 
-// ── Prefetch Logic ────────────────────────────────────────────────────────────
+// ── Prefetch Logic (New FileSystem API) ────────────────────────────────────────
 async function prefetch(videos: DriveVideo[]) {
   try {
     await ensureDir();
     for (const v of videos.slice(0, PREFETCH_COUNT)) {
       try {
         if (await isFileCached(v.fileId)) continue;
+
         const dest = filePath(v.fileId);
-        const dl = await FileSystem.downloadAsync(v.streamUrl, dest);
-        if (dl.status === 200) {
-          saveCachedPath(v.fileId, dest);
+        // New API: Directory.downloadAsync
+        await Directory.downloadAsync(v.streamUrl, dest);
+
+        const file = new File(dest);
+        if (await file.exists()) {
+          saveCachedPath(v.fileId, file.path);
         }
       } catch (e) {
-        /* Silent fail */
+        console.warn(`Prefetch failed for ${v.fileId}:`, e);
       }
     }
   } catch (e) {
-    console.warn("Prefetch error:", e);
+    console.warn("Prefetch manager error:", e);
   }
 }
 
@@ -109,7 +112,7 @@ const fmt = (ms: number) => {
 };
 
 // ── ProgressBar ───────────────────────────────────────────────────────────────
-const ProgressBar = React.memo(
+const ProgressBar = memo(
   ({
     pos,
     dur,
@@ -121,6 +124,7 @@ const ProgressBar = React.memo(
   }) => {
     const barRef = useRef<View>(null);
     const ratio = dur > 0 ? Math.min(pos / dur, 1) : 0;
+
     function handlePress(e: GestureResponderEvent) {
       if (!barRef.current) return;
       (barRef.current as any).measure((_x, _y, width: number) => {
@@ -128,6 +132,7 @@ const ProgressBar = React.memo(
         onSeek(r * dur);
       });
     }
+
     return (
       <Pressable
         ref={barRef as any}
@@ -161,8 +166,8 @@ const pb = StyleSheet.create({
   },
 });
 
-// ── Video Card ────────────────────────────────────────────────────────────────
-const VideoCard = React.memo(
+// ── Video Card (Using expo-video) ─────────────────────────────────────────────
+const VideoCard = memo(
   ({ item, isActive }: { item: DriveVideo; isActive: boolean }) => {
     const ref = useRef<Video>(null);
     const [paused, setPaused] = useState(false);
@@ -172,6 +177,7 @@ const VideoCard = React.memo(
     const [dur, setDur] = useState(0);
     const [localPath, setLocalPath] = useState<string | null>(null);
 
+    // Check local cache on mount
     useEffect(() => {
       let cancelled = false;
       isFileCached(item.fileId)
@@ -187,16 +193,17 @@ const VideoCard = React.memo(
       };
     }, [item.fileId]);
 
+    // Auto-play/pause based on visibility
     useEffect(() => {
       if (!ref.current) return;
       const timer = setTimeout(() => {
         if (isActive) {
           setPaused(false);
-          ref.current?.playAsync().catch(() => {});
+          ref.current?.play().catch(() => {});
         } else {
           setPaused(true);
-          ref.current?.pauseAsync().catch(() => {});
-          ref.current?.setPositionAsync(0).catch(() => {});
+          ref.current?.pause().catch(() => {});
+          ref.current?.seekTo(0).catch(() => {});
           setPos(0);
           setLoading(true);
           setHasError(false);
@@ -208,15 +215,15 @@ const VideoCard = React.memo(
     const togglePlay = useCallback(() => {
       if (!ref.current) return;
       if (paused) {
-        ref.current.playAsync().catch(() => {});
+        ref.current.play().catch(() => {});
         setPaused(false);
       } else {
-        ref.current.pauseAsync().catch(() => {});
+        ref.current.pause().catch(() => {});
         setPaused(true);
       }
     }, [paused]);
 
-    const onStatus = useCallback((status: AVPlaybackStatus) => {
+    const onStatus = useCallback((status: VideoStatus) => {
       if (!status.isLoaded) return;
       setLoading(false);
       setPos(status.positionMillis ?? 0);
@@ -224,7 +231,7 @@ const VideoCard = React.memo(
     }, []);
 
     const onSeek = useCallback((ms: number) => {
-      ref.current?.setPositionAsync(ms).catch(() => {});
+      ref.current?.seekTo(ms).catch(() => {});
       setPos(ms);
     }, []);
 
@@ -237,28 +244,32 @@ const VideoCard = React.memo(
           ref={ref}
           source={source}
           style={StyleSheet.absoluteFill}
-          contentFit="cover"
+          resizeMode={ResizeMode.COVER}
           shouldPlay={isActive && !paused}
           isLooping
           isMuted={false}
-          onPlaybackStatusUpdate={onStatus}
+          onStatusUpdate={onStatus}
           onError={() => {
             setLoading(false);
             setHasError(true);
           }}
         />
+
         <Pressable style={s.tapZone} onPress={togglePlay} />
+
         {loading && !hasError && (
           <View style={s.centre} pointerEvents="none">
             <ActivityIndicator size="large" color="#1DB954" />
           </View>
         )}
+
         {hasError && (
           <View style={s.centre} pointerEvents="none">
             <Ionicons name="alert-circle-outline" size={52} color="#FF453A" />
             <Text style={s.errorLabel}>Could not load video</Text>
           </View>
         )}
+
         {paused && !loading && !hasError && (
           <View style={s.pauseWrap} pointerEvents="none">
             <View style={s.pauseCircle}>
@@ -266,6 +277,7 @@ const VideoCard = React.memo(
             </View>
           </View>
         )}
+
         <View style={s.scrim} pointerEvents="none" />
         <View style={s.hud} pointerEvents="box-none">
           <Text style={s.title} numberOfLines={2}>
@@ -277,6 +289,7 @@ const VideoCard = React.memo(
           </View>
           <ProgressBar pos={pos} dur={dur} onSeek={onSeek} />
         </View>
+
         {localPath != null && (
           <View style={s.badge} pointerEvents="none">
             <Ionicons name="cloud-done-outline" size={12} color="#1DB954" />
@@ -297,10 +310,6 @@ export default function ForYouScreen() {
   const flatRef = useRef<FlatList>(null);
 
   useEffect(() => {
-    Audio.setAudioModeAsync({
-      playsInSilentModeIOS: true,
-      staysActiveInBackground: false,
-    }).catch(() => {});
     boot();
   }, []);
 
@@ -406,6 +415,7 @@ export default function ForYouScreen() {
   );
 }
 
+// ── Styles ────────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#000" },
   card: { width: W, height: H, backgroundColor: "#0a0a0a", overflow: "hidden" },
