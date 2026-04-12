@@ -12,7 +12,7 @@ const DEFAULT_TTL = 24 * 60 * 60 * 1000; // 24 hours
 export const CACHE_KEYS = {
   TEAM_YPN_MESSAGES: "team_ypn_messages",
   FORYOU_MANIFEST: "foryou_manifest",
-  USER_PROFILE: "user_profile", // NEW: Key for settings page
+  USER_PROFILE: "user_profile",
   discordChannelMessages: (channelId: string) => `discord_msgs_${channelId}`,
   discordChannels: "discord_channels",
 };
@@ -39,6 +39,7 @@ export type ForYouVideo = {
   mimeType: string;
   size: number | null;
   thumbnail: string | null;
+  id?: string; // Optional ID for mapping
 };
 
 export type CachedMessage = {
@@ -49,7 +50,6 @@ export type CachedMessage = {
   createdAt: number;
 };
 
-// NEW: Type for User Profile
 export type UserProfileCache = {
   uid: string;
   email?: string;
@@ -66,7 +66,6 @@ let initPromise: Promise<void> | null = null;
 
 const getDB = (): SQLiteDatabase => {
   if (!db) {
-    // Uses synchronous-style API available in newer expo-sqlite
     db = openDatabaseSync("ypn_cache.db");
   }
   return db;
@@ -172,7 +171,7 @@ export const getSecureCache = async (key: string): Promise<any | null> => {
     if (!result?.value) return null;
     const item = JSON.parse(result.value) as CacheItem;
 
-    // Check TTL (unless TTL is extremely large, effectively permanent)
+    // Check TTL
     if (item.ttl > 0 && Date.now() - item.timestamp > item.ttl) {
       await database.runAsync("DELETE FROM cache_items WHERE key = ?", [
         fullKey,
@@ -205,7 +204,6 @@ export const clearSecureCache = async (): Promise<void> => {
     await database.runAsync("DELETE FROM cache_items WHERE device_id = ?", [
       deviceId,
     ]);
-    // Also clear device ID to force regeneration on next login
     await AsyncStorage.removeItem(DEVICE_ID_KEY);
     deviceId = null;
   } catch (e) {
@@ -213,13 +211,12 @@ export const clearSecureCache = async (): Promise<void> => {
   }
 };
 
-// ── NEW: User Profile Helpers (Settings Page) ────────────────────────────────
+// ── Specialized Helpers ───────────────────────────────────────────────────────
 
-/** Save user profile to cache (TTL set to 30 days, effectively persistent until logout) */
+/** Save User Profile (30 Days TTL) */
 export const saveProfileToCache = async (
   profile: UserProfileCache,
 ): Promise<void> => {
-  // 30 Days TTL
   await setSecureCache(
     CACHE_KEYS.USER_PROFILE,
     profile,
@@ -227,12 +224,10 @@ export const saveProfileToCache = async (
   );
 };
 
-/** Get cached user profile */
 export const getCachedProfile = async (): Promise<UserProfileCache | null> => {
   return await getSecureCache(CACHE_KEYS.USER_PROFILE);
 };
 
-/** Optimistically update just the avatar in cache */
 export const updateAvatarInCache = async (
   avatarUrl: string | null,
 ): Promise<void> => {
@@ -242,8 +237,22 @@ export const updateAvatarInCache = async (
   }
 };
 
-// ── Existing Helpers (TeamYPN, ForYou, Discord) ──────────────────────────────
+/** Save Video Manifest (2 Hours TTL - Optimized for Pre-loading) */
+export const cacheForYouManifest = async (
+  videos: ForYouVideo[],
+): Promise<void> => {
+  // 2 Hours TTL
+  await setSecureCache(CACHE_KEYS.FORYOU_MANIFEST, videos, 2 * 60 * 60 * 1000);
+};
 
+export const getCachedForYouManifest = async (): Promise<
+  ForYouVideo[] | null
+> => {
+  const data = await getSecureCache(CACHE_KEYS.FORYOU_MANIFEST);
+  return Array.isArray(data) ? data : null;
+};
+
+/** Save TeamYPN Messages (30 Days) */
 export const cacheTeamYPNMessages = async (
   messages: TeamYPNMessage[],
 ): Promise<void> => {
@@ -261,23 +270,7 @@ export const getCachedTeamYPNMessages = async (): Promise<
   return Array.isArray(data) ? data : null;
 };
 
-export const cacheForYouManifest = async (
-  videos: ForYouVideo[],
-): Promise<void> => {
-  await setSecureCache(
-    CACHE_KEYS.FORYOU_MANIFEST,
-    videos,
-    7 * 24 * 60 * 60 * 1000,
-  );
-};
-
-export const getCachedForYouManifest = async (): Promise<
-  ForYouVideo[] | null
-> => {
-  const data = await getSecureCache(CACHE_KEYS.FORYOU_MANIFEST);
-  return Array.isArray(data) ? data : null;
-};
-
+/** Save Discord Messages (24 Hours) */
 export const cacheDiscordMessages = async (
   channelId: string,
   messages: CachedMessage[],
@@ -295,6 +288,7 @@ export const getCachedDiscordMessages = async (
   return await getSecureCache(CACHE_KEYS.discordChannelMessages(channelId));
 };
 
+/** Save Discord Channels (7 Days) */
 export const cacheDiscordChannels = async (channels: any[]): Promise<void> => {
   await setSecureCache(
     CACHE_KEYS.discordChannels,

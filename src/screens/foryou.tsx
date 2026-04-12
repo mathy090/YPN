@@ -1,443 +1,494 @@
 // src/screens/foryou.tsx
 import { Ionicons } from "@expo/vector-icons";
-import NetInfo from "@react-native-community/netinfo";
-import React, { useEffect, useRef, useState } from "react";
+import { Audio, AVPlaybackStatus } from "expo-av";
+import * as FileSystem from "expo-file-system";
+import { Video } from "expo-video";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
-  Alert,
+  Dimensions,
+  FlatList,
+  GestureResponderEvent,
   Platform,
-  RefreshControl,
+  Pressable,
   StatusBar as RNStatusBar,
-  ScrollView,
   StyleSheet,
   Text,
-  TouchableOpacity,
-  View
+  View,
 } from "react-native";
-// ✅ WebView is built into Expo Go
-import { WebView } from "react-native-webview";
-
-// Import Cache & Auth utilities
-import {
-  getSecureCache,
-  initializeSecureCache,
-  setSecureCache
-} from "../utils/cache";
-import { getToken } from "../utils/tokenManager"; // ✅ Import Token Helper
 
 // ── Config ─────────────────────────────────────────────────────────────────────
-const API_URL = process.env.EXPO_PUBLIC_API_URL;
-const VIDEO_CACHE_KEY = "foryou_manifest";
-const CACHE_TTL = 60 * 60 * 1000; // 60 minutes
+const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
+const PREFETCH_COUNT = 3;
+const L1_TTL_MS = 60 * 60 * 1000;
+const { width: W, height: H } = Dimensions.get("window");
+const STATUS_H =
+  Platform.OS === "android" ? (RNStatusBar.currentHeight ?? 24) : 0;
 
-type VideoItem = {
-  id: string;
+// ── Types ─────────────────────────────────────────────────────────────────────
+type DriveVideo = {
   fileId: string;
   name: string;
   mimeType: string;
   size: number | null;
   thumbnail: string | null;
-  duration?: number;
-  streamUrl?: string;
+  streamUrl: string;
 };
 
-// Helper to construct Google Drive Preview URL (Better for WebView than direct stream)
-const getDriveStreamUrl = (fileId: string) => {
-  return `https://drive.google.com/file/d/${fileId}/preview`;
-};
+// ── Cache Helpers ─────────────────────────────────────────────────────────────
+let _manifestCache: DriveVideo[] | null = null;
+let _manifestTs: number = 0;
 
-// ── Cache Helpers ──────────────────────────────────────────────────────────────
-async function readVideoCache(): Promise<VideoItem[] | null> {
+function l1Read(): DriveVideo[] | null {
+  if (!_manifestCache || Date.now() - _manifestTs > L1_TTL_MS) return null;
+  return _manifestCache;
+}
+
+// ✅ FIX: Added 'data' variable name
+function l1Write(data: DriveVideo[]) {
+  _manifestCache = data;
+  _manifestTs = Date.now();
+}
+
+const LOCAL_DIR = FileSystem.cacheDirectory + "ypn_drive_v3/";
+
+async function ensureDir() {
+  const info = await FileSystem.getInfoAsync(LOCAL_DIR);
+  if (!info.exists) {
+    await FileSystem.makeDirectoryAsync(LOCAL_DIR, { intermediates: true });
+  }
+}
+
+const filePath = (id: string) => LOCAL_DIR + id + ".mp4";
+const _cachedPaths = new Map<string, string>();
+
+async function isFileCached(id: string): Promise<boolean> {
+  if (_cachedPaths.has(id)) return true;
+  const p = filePath(id);
+  const info = await FileSystem.getInfoAsync(p);
+  if (info.exists) {
+    _cachedPaths.set(id, p);
+    return true;
+  }
+  return false;
+}
+
+function getCachedPath(id: string): string | null {
+  return _cachedPaths.get(id) || null;
+}
+
+function saveCachedPath(id: string, path: string) {
+  _cachedPaths.set(id, path);
+}
+
+// ── Prefetch Logic ────────────────────────────────────────────────────────────
+async function prefetch(videos: DriveVideo[]) {
   try {
-    const data = await getSecureCache(VIDEO_CACHE_KEY);
-    if (Array.isArray(data)) {
-      return data.map((item) => ({
-        ...item,
-        streamUrl: item.fileId ? getDriveStreamUrl(item.fileId) : undefined,
-      }));
+    await ensureDir();
+    for (const v of videos.slice(0, PREFETCH_COUNT)) {
+      try {
+        if (await isFileCached(v.fileId)) continue;
+        const dest = filePath(v.fileId);
+        const dl = await FileSystem.downloadAsync(v.streamUrl, dest);
+        if (dl.status === 200) {
+          saveCachedPath(v.fileId, dest);
+        }
+      } catch (e) {
+        /* Silent fail */
+      }
     }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-async function writeVideoCache(items: VideoItem[]) {
-  try {
-    await setSecureCache(VIDEO_CACHE_KEY, items, CACHE_TTL);
   } catch (e) {
-    console.warn("[Videos] Failed to write cache:", e);
+    console.warn("Prefetch error:", e);
   }
 }
 
-function formatBytes(bytes: number | null): string {
-  if (!bytes) return "Unknown size";
-  const gb = bytes / (1024 * 1024 * 1024);
-  if (gb >= 1) return `${gb.toFixed(2)} GB`;
-  const mb = bytes / (1024 * 1024);
-  return `${mb.toFixed(1)} MB`;
-}
+// ── Time Formatter ────────────────────────────────────────────────────────────
+const fmt = (ms: number) => {
+  const s = Math.floor(ms / 1000);
+  return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, "0")}`;
+};
 
-// ── Video Card / Player (Using WebView) ────────────────────────────────────────
-const VideoCard = React.memo(({ item }: { item: VideoItem }) => {
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState(false);
+// ── ProgressBar ───────────────────────────────────────────────────────────────
+const ProgressBar = React.memo(
+  ({
+    pos,
+    dur,
+    onSeek,
+  }: {
+    pos: number;
+    dur: number;
+    onSeek: (ms: number) => void;
+  }) => {
+    const barRef = useRef<View>(null);
+    const ratio = dur > 0 ? Math.min(pos / dur, 1) : 0;
+    function handlePress(e: GestureResponderEvent) {
+      if (!barRef.current) return;
+      (barRef.current as any).measure((_x, _y, width: number) => {
+        const r = Math.min(Math.max(e.nativeEvent.locationX / width, 0), 1);
+        onSeek(r * dur);
+      });
+    }
+    return (
+      <Pressable
+        ref={barRef as any}
+        onPress={handlePress}
+        hitSlop={{ top: 18, bottom: 18 }}
+        style={pb.track}
+      >
+        <View style={[pb.fill, { width: `${ratio * 100}%` }]} />
+        <View style={[pb.thumb, { left: `${ratio * 100}%` as any }]} />
+      </Pressable>
+    );
+  },
+);
 
-  if (!item.streamUrl) return null;
-
-  return (
-    <View style={s.card}>
-      <View style={s.videoContainer}>
-        {isLoading && !error && (
-          <View style={s.loadingOverlay}>
-            <ActivityIndicator size="small" color="#1DB954" />
-          </View>
-        )}
-
-        {error && (
-          <View style={s.errorOverlay}>
-            <Ionicons name="warning-outline" size={32} color="#E91429" />
-            <Text style={s.errorTextSmall}>Failed to load</Text>
-          </View>
-        )}
-
-        <WebView
-          source={{ uri: item.streamUrl }}
-          style={[s.videoPlayer, { opacity: isLoading || error ? 0 : 1 }]}
-          javaScriptEnabled={true}
-          domStorageEnabled={true}
-          allowsInlineMediaPlayback={true}
-          mediaPlaybackRequiresUserAction={false}
-          scrollEnabled={false}
-          showsHorizontalScrollIndicator={false}
-          showsVerticalScrollIndicator={false}
-          onLoadStart={() => setIsLoading(true)}
-          onLoadEnd={() => setIsLoading(false)}
-          onError={() => {
-            setError(true);
-            setIsLoading(false);
-          }}
-          // Inject CSS to hide Google Drive header/footer for a cleaner look
-          injectedStyles={`
-            body { overflow: hidden; background: #000; }
-            .drive-viewer-top-bar, .drive-viewer-bottom-bar, .drive-viewer-sidebar { display: none !important; }
-          `}
-        />
-      </View>
-
-      <View style={s.infoRow}>
-        <View style={s.textWrap}>
-          <Text style={s.title} numberOfLines={2}>
-            {item.name}
-          </Text>
-          <Text style={s.meta}>
-            {formatBytes(item.size)} • {item.mimeType}
-          </Text>
-        </View>
-        <TouchableOpacity style={s.downloadBtn}>
-          <Ionicons name="download-outline" size={20} color="#1DB954" />
-        </TouchableOpacity>
-      </View>
-    </View>
-  );
+const pb = StyleSheet.create({
+  track: {
+    height: 3,
+    backgroundColor: "rgba(255,255,255,0.22)",
+    borderRadius: 2,
+    justifyContent: "center",
+  },
+  fill: { height: 3, backgroundColor: "#1DB954", borderRadius: 2 },
+  thumb: {
+    position: "absolute",
+    width: 13,
+    height: 13,
+    borderRadius: 6.5,
+    backgroundColor: "#fff",
+    top: -5,
+    marginLeft: -6.5,
+  },
 });
 
-// ── Main Screen ────────────────────────────────────────────────────────────────
+// ── Video Card ────────────────────────────────────────────────────────────────
+const VideoCard = React.memo(
+  ({ item, isActive }: { item: DriveVideo; isActive: boolean }) => {
+    const ref = useRef<Video>(null);
+    const [paused, setPaused] = useState(false);
+    const [loading, setLoading] = useState(true);
+    const [hasError, setHasError] = useState(false);
+    const [pos, setPos] = useState(0);
+    const [dur, setDur] = useState(0);
+    const [localPath, setLocalPath] = useState<string | null>(null);
+
+    useEffect(() => {
+      let cancelled = false;
+      isFileCached(item.fileId)
+        .then((ok) => {
+          if (!cancelled && ok) {
+            const p = getCachedPath(item.fileId);
+            if (p) setLocalPath(p);
+          }
+        })
+        .catch(() => {});
+      return () => {
+        cancelled = true;
+      };
+    }, [item.fileId]);
+
+    useEffect(() => {
+      if (!ref.current) return;
+      const timer = setTimeout(() => {
+        if (isActive) {
+          setPaused(false);
+          ref.current?.playAsync().catch(() => {});
+        } else {
+          setPaused(true);
+          ref.current?.pauseAsync().catch(() => {});
+          ref.current?.setPositionAsync(0).catch(() => {});
+          setPos(0);
+          setLoading(true);
+          setHasError(false);
+        }
+      }, 100);
+      return () => clearTimeout(timer);
+    }, [isActive]);
+
+    const togglePlay = useCallback(() => {
+      if (!ref.current) return;
+      if (paused) {
+        ref.current.playAsync().catch(() => {});
+        setPaused(false);
+      } else {
+        ref.current.pauseAsync().catch(() => {});
+        setPaused(true);
+      }
+    }, [paused]);
+
+    const onStatus = useCallback((status: AVPlaybackStatus) => {
+      if (!status.isLoaded) return;
+      setLoading(false);
+      setPos(status.positionMillis ?? 0);
+      setDur(status.durationMillis ?? 0);
+    }, []);
+
+    const onSeek = useCallback((ms: number) => {
+      ref.current?.setPositionAsync(ms).catch(() => {});
+      setPos(ms);
+    }, []);
+
+    const source = localPath ? { uri: localPath } : { uri: item.streamUrl };
+    const displayName = item.name.replace(/\.[^.]+$/, "");
+
+    return (
+      <View style={s.card}>
+        <Video
+          ref={ref}
+          source={source}
+          style={StyleSheet.absoluteFill}
+          contentFit="cover"
+          shouldPlay={isActive && !paused}
+          isLooping
+          isMuted={false}
+          onPlaybackStatusUpdate={onStatus}
+          onError={() => {
+            setLoading(false);
+            setHasError(true);
+          }}
+        />
+        <Pressable style={s.tapZone} onPress={togglePlay} />
+        {loading && !hasError && (
+          <View style={s.centre} pointerEvents="none">
+            <ActivityIndicator size="large" color="#1DB954" />
+          </View>
+        )}
+        {hasError && (
+          <View style={s.centre} pointerEvents="none">
+            <Ionicons name="alert-circle-outline" size={52} color="#FF453A" />
+            <Text style={s.errorLabel}>Could not load video</Text>
+          </View>
+        )}
+        {paused && !loading && !hasError && (
+          <View style={s.pauseWrap} pointerEvents="none">
+            <View style={s.pauseCircle}>
+              <Ionicons name="pause" size={38} color="#fff" />
+            </View>
+          </View>
+        )}
+        <View style={s.scrim} pointerEvents="none" />
+        <View style={s.hud} pointerEvents="box-none">
+          <Text style={s.title} numberOfLines={2}>
+            {displayName}
+          </Text>
+          <View style={s.timeRow} pointerEvents="none">
+            <Text style={s.timeText}>{fmt(pos)}</Text>
+            {dur > 0 && <Text style={s.timeText}>{fmt(dur)}</Text>}
+          </View>
+          <ProgressBar pos={pos} dur={dur} onSeek={onSeek} />
+        </View>
+        {localPath != null && (
+          <View style={s.badge} pointerEvents="none">
+            <Ionicons name="cloud-done-outline" size={12} color="#1DB954" />
+          </View>
+        )}
+      </View>
+    );
+  },
+);
+
+// ── Main Screen ───────────────────────────────────────────────────────────────
 export default function ForYouScreen() {
-  const [videos, setVideos] = useState<VideoItem[]>([]);
+  const [videos, setVideos] = useState<DriveVideo[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState(false);
-  const [isOffline, setIsOffline] = useState(false);
-  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [fetchErr, setFetchErr] = useState(false);
+  const [activeIdx, setActiveIdx] = useState(0);
+  const flatRef = useRef<FlatList>(null);
 
   useEffect(() => {
-    const init = async () => {
-      await initializeSecureCache();
-      boot();
-    };
-    init();
-
-    return () => {
-      if (refreshTimer.current) clearTimeout(refreshTimer.current);
-    };
+    Audio.setAudioModeAsync({
+      playsInSilentModeIOS: true,
+      staysActiveInBackground: false,
+    }).catch(() => {});
+    boot();
   }, []);
 
-  useEffect(() => {
-    const unsub = NetInfo.addEventListener((state) => {
-      const connected = !!state.isConnected;
-      setIsOffline(!connected);
-      if (connected && error) {
-        fetchFromBackend(false);
-      }
-    });
-    return () => unsub();
-  }, [error]);
-
-  const scheduleRefresh = () => {
-    if (refreshTimer.current) clearTimeout(refreshTimer.current);
-    refreshTimer.current = setTimeout(() => fetchFromBackend(false), CACHE_TTL);
-  };
-
-  const boot = async () => {
-    const cached = await readVideoCache();
-
-    if (cached?.length) {
+  async function boot() {
+    const cached = l1Read();
+    if (cached && cached.length > 0) {
       setVideos(cached);
       setLoading(false);
-      if (isOffline) return;
-      scheduleRefresh();
-    } else {
-      setLoading(true);
-      if (!isOffline) {
-        await fetchFromBackend(false);
-      } else {
-        setLoading(false);
-        setError(true);
-      }
-    }
-  };
-
-  const fetchFromBackend = async (manual = true) => {
-    if (isOffline) {
-      if (manual) setError(true);
+      prefetch(cached);
+      refreshManifest(false);
       return;
     }
+    await refreshManifest(false);
+  }
 
+  async function refreshManifest(manual: boolean) {
     if (manual) setRefreshing(true);
     else if (!videos.length) setLoading(true);
-
-    setError(false);
+    setFetchErr(false);
 
     try {
-      // ✅ 1. GET AUTH TOKEN
-      const token = await getToken();
+      const res = await fetch(`${API_URL}/api/videos/drive/feed`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-      if (!token) {
-        console.warn("[Videos] No auth token found.");
-        if (manual) {
-          Alert.alert("Session Expired", "Please log in again to view videos.");
-        }
-        throw new Error("NO_TOKEN");
-      }
+      const data: DriveVideo[] = await res.json();
+      if (!data.length) throw new Error("Empty manifest");
 
-      // ✅ 2. FETCH WITH HEADER
-      const res = await fetch(`${API_URL}/api/videos/drive`, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
-      });
-
-      if (!res.ok) {
-        if (res.status === 401) {
-          console.error("[Videos] Auth Failed: Invalid or expired token.");
-        }
-        throw new Error(`HTTP ${res.status}`);
-      }
-
-      // ✅ 3. PARSE DATA (FIXED LINE BELOW)
-      const data: VideoItem[] = await res.json();
-
-      // Enhance data with stream URLs
-      const enrichedData = data.map((item) => ({
-        ...item,
-        streamUrl: item.fileId ? getDriveStreamUrl(item.fileId) : undefined,
-      }));
-
-      if (enrichedData.length > 0) {
-        await writeVideoCache(enrichedData);
-        setVideos(enrichedData);
-        scheduleRefresh();
-      } else {
-        if (manual) setError(true);
-      }
+      l1Write(data);
+      setVideos(data);
+      prefetch(data);
     } catch (e: any) {
-      console.warn("[Videos] Fetch failed:", e.message);
-      if (e.message !== "NO_TOKEN" && manual) {
-        setError(true);
-      }
+      console.warn("[ForYou] fetch error:", e.message);
+      const stale = l1Read();
+      if (stale && stale.length > 0) setVideos(stale);
+      else setFetchErr(true);
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  };
+  }
 
-  if (loading) {
+  const onViewable = useCallback(
+    ({ viewableItems }: { viewableItems: any[] }) => {
+      if (viewableItems.length > 0) setActiveIdx(viewableItems[0].index ?? 0);
+    },
+    [],
+  );
+
+  const viewCfg = useRef({
+    itemVisiblePercentThreshold: 60,
+    minimumViewTime: 100,
+  });
+
+  const renderItem = useCallback(
+    ({ item, index }: { item: DriveVideo; index: number }) => (
+      <VideoCard item={item} isActive={index === activeIdx} />
+    ),
+    [activeIdx],
+  );
+
+  if (loading)
     return (
-      <View style={s.centre}>
+      <View style={s.fullCentre}>
         <ActivityIndicator size="large" color="#1DB954" />
         <Text style={s.loadingText}>Loading videos…</Text>
       </View>
     );
-  }
+
+  if (fetchErr && !videos.length)
+    return (
+      <View style={s.fullCentre}>
+        <Ionicons name="wifi-outline" size={52} color="#333" />
+        <Text style={s.noVideoText}>Could not load videos</Text>
+        <Pressable style={s.retryBtn} onPress={() => refreshManifest(false)}>
+          <Text style={s.retryText}>Retry</Text>
+        </Pressable>
+      </View>
+    );
 
   return (
     <View style={s.root}>
-      <View
-        style={{
-          height:
-            Platform.OS === "android"
-              ? (RNStatusBar.currentHeight || 24) + 48
-              : 48,
-        }}
+      <FlatList
+        ref={flatRef}
+        data={videos}
+        keyExtractor={(v) => v.fileId}
+        renderItem={renderItem}
+        pagingEnabled
+        snapToInterval={H}
+        snapToAlignment="start"
+        decelerationRate="fast"
+        showsVerticalScrollIndicator={false}
+        onRefresh={() => refreshManifest(true)}
+        refreshing={refreshing}
+        onViewableItemsChanged={onViewable}
+        viewabilityConfig={viewCfg.current}
+        windowSize={4}
+        maxToRenderPerBatch={2}
+        initialNumToRender={1}
+        removeClippedSubviews={Platform.OS === "android"}
+        getItemLayout={(_, i) => ({ length: H, offset: H * i, index: i })}
       />
-
-      {videos.length > 0 && (
-        <View style={s.countRow}>
-          <Text style={s.countText}>
-            {videos.length} video{videos.length !== 1 ? "s" : ""} available
-          </Text>
-        </View>
-      )}
-
-      {(error || isOffline) && videos.length === 0 ? (
-        <View style={s.centre}>
-          <Ionicons
-            name={isOffline ? "wifi-off-outline" : "alert-circle-outline"}
-            size={48}
-            color="#333"
-          />
-          <Text style={s.errorText}>
-            {isOffline ? "No internet connection" : "Could not load videos"}
-          </Text>
-          {!isOffline && (
-            <TouchableOpacity
-              style={s.retryBtn}
-              onPress={() => fetchFromBackend(true)}
-            >
-              <Text style={s.retryText}>Retry</Text>
-            </TouchableOpacity>
-          )}
-        </View>
-      ) : (
-        <ScrollView
-          contentContainerStyle={s.list}
-          showsVerticalScrollIndicator={false}
-          refreshControl={
-            <RefreshControl
-              refreshing={refreshing}
-              onRefresh={() => !isOffline && fetchFromBackend(true)}
-              tintColor="#1DB954"
-              colors={["#1DB954"]}
-            />
-          }
-        >
-          {videos.length === 0 ? (
-            <View style={s.centre}>
-              <Text style={s.errorText}>No videos available</Text>
-            </View>
-          ) : (
-            videos.map((item) => <VideoCard key={item.id} item={item} />)
-          )}
-        </ScrollView>
-      )}
-
-      {isOffline && videos.length > 0 && (
-        <View style={s.offlineBanner}>
-          <Ionicons name="wifi-off-outline" size={16} color="#fff" />
-          <Text style={s.offlineText}>Offline • Showing cached videos</Text>
-        </View>
-      )}
     </View>
   );
 }
 
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#000" },
+  card: { width: W, height: H, backgroundColor: "#0a0a0a", overflow: "hidden" },
+  tapZone: { position: "absolute", top: 0, left: 0, right: 0, bottom: 88 },
   centre: {
-    flex: 1,
+    ...StyleSheet.absoluteFillObject,
     justifyContent: "center",
     alignItems: "center",
-    gap: 12,
-    padding: 24,
+    backgroundColor: "rgba(0,0,0,0.4)",
   },
-  loadingText: { color: "#555", fontSize: 14, marginTop: 8 },
-  errorText: { color: "#555", fontSize: 16, textAlign: "center" },
-  errorTextSmall: { color: "#E91429", fontSize: 12, fontWeight: "600" },
+  fullCentre: {
+    flex: 1,
+    backgroundColor: "#000",
+    justifyContent: "center",
+    alignItems: "center",
+    gap: 14,
+  },
+  loadingText: { color: "#555", fontSize: 14 },
+  noVideoText: { color: "#888", fontSize: 16, textAlign: "center" },
+  errorLabel: { color: "#FF453A", fontSize: 14, marginTop: 8 },
   retryBtn: {
-    marginTop: 8,
-    paddingHorizontal: 24,
-    paddingVertical: 10,
     backgroundColor: "#1DB954",
-    borderRadius: 20,
+    paddingHorizontal: 28,
+    paddingVertical: 12,
+    borderRadius: 24,
+    marginTop: 4,
   },
   retryText: { color: "#000", fontWeight: "700", fontSize: 14 },
-  countRow: { paddingHorizontal: 16, paddingBottom: 6 },
-  countText: { color: "#3A3A3A", fontSize: 11 },
-  list: { paddingHorizontal: 12, paddingBottom: 40 },
-  card: {
-    backgroundColor: "#111",
-    borderRadius: 12,
-    marginBottom: 16,
-    overflow: "hidden",
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#1E1E1E",
-  },
-  videoContainer: {
-    width: "100%",
-    aspectRatio: 16 / 9,
-    backgroundColor: "#000",
-    position: "relative",
-  },
-  videoPlayer: {
-    width: "100%",
-    height: "100%",
-    backgroundColor: "#000",
-  },
-  loadingOverlay: {
+  pauseWrap: {
     ...StyleSheet.absoluteFillObject,
     justifyContent: "center",
     alignItems: "center",
-    backgroundColor: "#111",
-    zIndex: 10,
   },
-  errorOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    justifyContent: "center",
-    alignItems: "center",
-    backgroundColor: "rgba(0,0,0,0.8)",
-    gap: 8,
-    zIndex: 10,
-  },
-  infoRow: {
-    flexDirection: "row",
-    padding: 12,
-    alignItems: "center",
-    gap: 12,
-  },
-  textWrap: { flex: 1 },
-  title: {
-    color: "#E8E8E8",
-    fontSize: 14,
-    fontWeight: "600",
-    lineHeight: 20,
-    marginBottom: 4,
-  },
-  meta: {
-    color: "#555",
-    fontSize: 11,
-  },
-  downloadBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: "rgba(29, 185, 84, 0.1)",
+  pauseCircle: {
+    width: 84,
+    height: 84,
+    borderRadius: 42,
+    backgroundColor: "rgba(0,0,0,0.55)",
+    borderWidth: 2,
+    borderColor: "rgba(255,255,255,0.3)",
     justifyContent: "center",
     alignItems: "center",
   },
-  offlineBanner: {
+  scrim: {
     position: "absolute",
-    bottom: 0,
     left: 0,
     right: 0,
-    backgroundColor: "#333",
-    flexDirection: "row",
-    alignItems: "center",
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    gap: 8,
+    bottom: 0,
+    height: 160,
+    backgroundColor: "rgba(0,0,0,0.55)",
   },
-  offlineText: { color: "#fff", fontSize: 12, fontWeight: "500" },
+  hud: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    paddingHorizontal: 16,
+    paddingBottom: 22,
+  },
+  title: {
+    color: "#fff",
+    fontSize: 15,
+    fontWeight: "700",
+    lineHeight: 22,
+    marginBottom: 10,
+    textShadowColor: "rgba(0,0,0,0.9)",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 6,
+  },
+  timeRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginBottom: 6,
+  },
+  timeText: { color: "#fff", fontSize: 11, fontWeight: "600" },
+  badge: {
+    position: "absolute",
+    top: 12 + STATUS_H,
+    right: 12,
+    padding: 6,
+    borderRadius: 14,
+    backgroundColor: "rgba(0,0,0,0.5)",
+    justifyContent: "center",
+    alignItems: "center",
+  },
 });
