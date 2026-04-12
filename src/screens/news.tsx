@@ -1,13 +1,12 @@
 // src/screens/news.tsx
-// Fix: writeCache was calling undefined `MK_TS` — replaced with `NEWS_TS`.
 import { Ionicons } from "@expo/vector-icons";
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import NetInfo from "@react-native-community/netinfo";
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import * as WebBrowser from "expo-web-browser";
+import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Alert,
   Image,
-  Modal,
   Platform,
   RefreshControl,
   StatusBar as RNStatusBar,
@@ -17,13 +16,18 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
-import { WebView } from "react-native-webview";
 
-// ── Config ─────────────────────────────────────────────────────────────────────
+import {
+  getSecureCache,
+  initializeSecureCache,
+  setSecureCache
+} from "../utils/cache";
+
+WebBrowser.maybeCompleteAuthSession();
+
 const API_URL = process.env.EXPO_PUBLIC_API_URL;
-const NEWS_KEY = "zw_news_v3";
-const NEWS_TS = "zw_news_ts_v3"; // ← was MK_TS (undefined) — now consistent
-const CACHE_TTL = 20 * 60 * 1000; // 20 minutes
+const NEWS_CACHE_KEY = "news_manifest";
+const CACHE_TTL = 20 * 60 * 1000;
 
 type NewsItem = {
   id: string;
@@ -36,24 +40,21 @@ type NewsItem = {
   description: string;
 };
 
-// ── Cache helpers ──────────────────────────────────────────────────────────────
-async function readCache(): Promise<NewsItem[] | null> {
+async function readNewsCache(): Promise<NewsItem[] | null> {
   try {
-    const tsRaw = await AsyncStorage.getItem(NEWS_TS);
-    const ts = tsRaw ? parseInt(tsRaw, 10) : 0;
-    if (!ts || Date.now() - ts > CACHE_TTL) return null;
-    const raw = await AsyncStorage.getItem(NEWS_KEY);
-    return raw ? JSON.parse(raw) : null;
+    const data = await getSecureCache(NEWS_CACHE_KEY);
+    return Array.isArray(data) ? data : null;
   } catch {
     return null;
   }
 }
 
-async function writeCache(items: NewsItem[]) {
+async function writeNewsCache(items: NewsItem[]) {
   try {
-    await AsyncStorage.setItem(NEWS_KEY, JSON.stringify(items));
-    await AsyncStorage.setItem(NEWS_TS, Date.now().toString()); // ← fixed
-  } catch {}
+    await setSecureCache(NEWS_CACHE_KEY, items, CACHE_TTL);
+  } catch (e) {
+    console.warn("[News] Failed to write cache:", e);
+  }
 }
 
 function relativeTime(ts: number): string {
@@ -70,85 +71,20 @@ function relativeTime(ts: number): string {
   return `${Math.floor(d / 365)}y ago`;
 }
 
-// ── In-app reader ──────────────────────────────────────────────────────────────
-function ArticleReader({
-  url,
-  title,
-  onClose,
-}: {
-  url: string;
-  title: string;
-  onClose: () => void;
-}) {
-  const [webLoading, setWebLoading] = useState(true);
-  return (
-    <Modal visible animationType="slide" onRequestClose={onClose}>
-      <View style={r.root}>
-        <View style={r.header}>
-          <TouchableOpacity
-            onPress={onClose}
-            style={r.closeBtn}
-            activeOpacity={0.7}
-          >
-            <Ionicons name="arrow-back" size={22} color="#fff" />
-          </TouchableOpacity>
-          <Text style={r.headerTitle} numberOfLines={1}>
-            {title}
-          </Text>
-        </View>
-        <WebView
-          source={{ uri: url }}
-          style={{ flex: 1, backgroundColor: "#111" }}
-          onLoadStart={() => setWebLoading(true)}
-          onLoadEnd={() => setWebLoading(false)}
-          javaScriptEnabled
-          domStorageEnabled
-          setSupportMultipleWindows={false}
-        />
-        {webLoading && (
-          <View style={r.loadingOverlay}>
-            <ActivityIndicator size="large" color="#1DB954" />
-          </View>
-        )}
-      </View>
-    </Modal>
-  );
-}
+const openArticleInApp = async (item: NewsItem) => {
+  try {
+    await WebBrowser.openBrowserAsync(item.link, {
+      toolbarColor: "#111111",
+      controlsColor: "#1DB954",
+      showTitle: true,
+      enableBarCollapsing: false,
+    });
+  } catch (err) {
+    Alert.alert("Error", "Could not open the article.");
+    console.error(err);
+  }
+};
 
-const STATUS_H =
-  Platform.OS === "android" ? (RNStatusBar.currentHeight ?? 24) : 0;
-const TOP_OFFSET = STATUS_H + 48;
-
-const r = StyleSheet.create({
-  root: { flex: 1, backgroundColor: "#000", paddingTop: TOP_OFFSET },
-  header: {
-    flexDirection: "row",
-    alignItems: "center",
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "#222",
-    backgroundColor: "#111",
-    gap: 10,
-  },
-  closeBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: "#222",
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  headerTitle: { flex: 1, color: "#fff", fontSize: 15, fontWeight: "600" },
-  loadingOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: "#000",
-    justifyContent: "center",
-    alignItems: "center",
-  },
-});
-
-// ── News card ──────────────────────────────────────────────────────────────────
 const NewsCard = React.memo(
   ({
     item,
@@ -203,30 +139,36 @@ const NewsCard = React.memo(
   ),
 );
 
-// ── Main screen ────────────────────────────────────────────────────────────────
 export default function NewsScreen() {
   const [articles, setArticles] = useState<NewsItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(false);
   const [isOffline, setIsOffline] = useState(false);
-  const [reading, setReading] = useState<NewsItem | null>(null);
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    const unsub = NetInfo.addEventListener((state) => {
-      setIsOffline(!state.isConnected);
-      if (state.isConnected && error) fetchFromBackend(false);
-    });
-    return () => unsub();
-  }, [error]);
+    const init = async () => {
+      await initializeSecureCache();
+      boot();
+    };
+    init();
 
-  useEffect(() => {
-    boot();
     return () => {
       if (refreshTimer.current) clearTimeout(refreshTimer.current);
     };
   }, []);
+
+  useEffect(() => {
+    const unsub = NetInfo.addEventListener((state) => {
+      const connected = !!state.isConnected;
+      setIsOffline(!connected);
+      if (connected && error) {
+        fetchFromBackend(false);
+      }
+    });
+    return () => unsub();
+  }, [error]);
 
   const scheduleRefresh = () => {
     if (refreshTimer.current) clearTimeout(refreshTimer.current);
@@ -234,58 +176,57 @@ export default function NewsScreen() {
   };
 
   const boot = async () => {
-    if (isOffline) {
-      const cached = await readCache();
-      if (cached?.length) {
-        setArticles(cached);
-        setLoading(false);
-        return;
-      }
-      setError(true);
-      setLoading(false);
-      return;
-    }
-    const cached = await readCache();
+    const cached = await readNewsCache();
+
     if (cached?.length) {
       setArticles(cached);
       setLoading(false);
-      const tsRaw = await AsyncStorage.getItem(NEWS_TS);
-      const ts = tsRaw ? parseInt(tsRaw, 10) : 0;
-      if (Date.now() - ts > CACHE_TTL) fetchFromBackend(false);
-      else scheduleRefresh();
+      if (isOffline) return;
+      scheduleRefresh();
     } else {
-      await fetchFromBackend(false);
+      setLoading(true);
+      if (!isOffline) {
+        await fetchFromBackend(false);
+      } else {
+        setLoading(false);
+        setError(true);
+      }
     }
   };
 
   const fetchFromBackend = async (manual = true) => {
     if (isOffline) {
-      setError(true);
+      if (manual) setError(true);
       return;
     }
+
     if (manual) setRefreshing(true);
     else if (!articles.length) setLoading(true);
+
     setError(false);
+
     try {
       const res = await fetch(`${API_URL}/api/news`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      // ✅ FIX: Added variable name 'data'
       const data: NewsItem[] = await res.json();
+
       if (data.length > 0) {
-        await writeCache(data);
+        await writeNewsCache(data);
         setArticles(data);
         scheduleRefresh();
       } else {
-        setError(true);
+        if (manual) setError(true);
       }
-    } catch {
-      setError(true);
+    } catch (e) {
+      console.warn("[News] Fetch failed:", e);
+      if (manual) setError(true);
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
   };
-
-  const openArticle = useCallback((item: NewsItem) => setReading(item), []);
 
   if (loading) {
     return (
@@ -298,7 +239,14 @@ export default function NewsScreen() {
 
   return (
     <View style={s.root}>
-      <View style={{ height: TOP_OFFSET }} />
+      <View
+        style={{
+          height:
+            Platform.OS === "android"
+              ? (RNStatusBar.currentHeight || 24) + 48
+              : 48,
+        }}
+      />
 
       {articles.length > 0 && (
         <View style={s.countRow}>
@@ -312,7 +260,7 @@ export default function NewsScreen() {
       {(error || isOffline) && articles.length === 0 ? (
         <View style={s.centre}>
           <Ionicons
-            name={isOffline ? "wifi-off-outline" : "wifi-outline"}
+            name={isOffline ? "wifi-off-outline" : "alert-circle-outline"}
             size={48}
             color="#333"
           />
@@ -347,18 +295,10 @@ export default function NewsScreen() {
             </View>
           ) : (
             articles.map((item) => (
-              <NewsCard key={item.id} item={item} onPress={openArticle} />
+              <NewsCard key={item.id} item={item} onPress={openArticleInApp} />
             ))
           )}
         </ScrollView>
-      )}
-
-      {reading && (
-        <ArticleReader
-          url={reading.link}
-          title={reading.title}
-          onClose={() => setReading(null)}
-        />
       )}
 
       {isOffline && articles.length > 0 && (
@@ -392,7 +332,7 @@ const s = StyleSheet.create({
   retryText: { color: "#000", fontWeight: "700", fontSize: 14 },
   countRow: { paddingHorizontal: 16, paddingBottom: 6 },
   countText: { color: "#3A3A3A", fontSize: 11 },
-  list: { paddingHorizontal: 12, paddingBottom: 120 },
+  list: { paddingHorizontal: 12, paddingBottom: 40 },
   card: {
     flexDirection: "row",
     backgroundColor: "#111",
