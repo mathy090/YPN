@@ -1,11 +1,11 @@
 fastapi
-uvicorn
+uvicorn[standard]
 requests
 python-dotenv
 beautifulsoup4
 google-api-python-client
-openai
 cohere
-faster-whisper
+openai-whisper
+torch
+torchaudio
 gTTS
-av

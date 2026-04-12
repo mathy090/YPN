@@ -1,136 +1,76 @@
 # ypn-ai-service/main.py
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+# YPN AI Service v2.0 — FastAPI + Cohere + Whisper STT + gTTS
+#
+# Voice pipeline:
+#   POST /voice  multipart audio file
+#     → Whisper STT  (transcript)
+#     → Cohere AI    (text reply)
+#     → gTTS         (mp3 bytes)
+#     ← audio/mpeg   (played directly by mobile)
+#
+# Fixes from logs:
+#   • HEAD / → 200  (Render health check was getting 405)
+#   • /voice → 404 gone
+#   • uvicorn[standard] → no more WebSocket warnings
+#   • Structured logging for Render log drain
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-import os
+import os, io, time, hashlib, json, logging, asyncio, tempfile, subprocess
 import cohere
-import asyncio
-import hashlib
-import json
-import base64
-import io
-import uuid
-import numpy as np
+import whisper
+from gtts import gTTS
 
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+log = logging.getLogger("ypn-ai")
+
+# ── Env ───────────────────────────────────────────────────────────────────────
 load_dotenv()
-
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 if not COHERE_API_KEY:
-    raise RuntimeError("COHERE_API_KEY is not set")
+    raise RuntimeError("COHERE_API_KEY is not set in environment")
 
+# ── Clients ───────────────────────────────────────────────────────────────────
 co = cohere.ClientV2(api_key=COHERE_API_KEY)
 MODEL = "command-r-plus-08-2024"
 
+# Whisper loaded once at startup — base model balances speed vs accuracy
+# on Render free tier (512 MB RAM).  Use "tiny" if you hit OOM.
+log.info("Loading Whisper base model…")
+_whisper = whisper.load_model("base")
+log.info("Whisper ready")
+
+# ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = (
-    "You are YPN AI, a warm and helpful assistant for Team YPN — "
+    "You are YPN AI, a warm and helpful voice assistant for Team YPN — "
     "a youth empowerment network based in Zimbabwe. "
-    "Be concise, helpful, and natural like ChatGPT. "
-    "Avoid long explanations unless asked."
+    "Keep replies SHORT (2-3 sentences max) because they will be read aloud. "
+    "Be conversational, kind and direct. "
+    "Never give medical or legal advice. "
+    "Use only verified public information about YPN Zimbabwe."
 )
 
-VOICE_SYSTEM_PROMPT = (
-    "You are YPN AI, a warm voice assistant for Team YPN in Zimbabwe. "
-    "IMPORTANT: Keep every response to 1-3 short sentences max — this is voice chat. "
-    "Speak naturally, no bullet points, no lists. "
-    "Be warm, supportive, and conversational."
-)
+# ── In-memory session store ───────────────────────────────────────────────────
+# { session_id: [ {"role": "user"|"assistant", "content": str} ] }
+sessions: dict[str, list] = {}
 
-# ── In-memory stores ───────────────────────────────────────────────────────────
-sessions: dict = {}
-cache: dict = {}
+# ── L1 reply cache ────────────────────────────────────────────────────────────
+# Keyed on hash(session_id + message + last 4 history messages)
+# Stores the TEXT reply — audio is re-synthesised each time (cheap with gTTS)
+_l1: dict[str, dict] = {}
+L1_TTL   = 10 * 60   # 10 minutes
+L1_MAX   = 400        # max entries before LRU eviction
 
-# ── Whisper model (lazy, loaded once, stays in memory) ────────────────────────
-_whisper_model = None
-
-def get_whisper_model():
-    global _whisper_model
-    if _whisper_model is None:
-        from faster_whisper import WhisperModel
-        print("[Voice] Loading faster-whisper tiny model (first load)...")
-        _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
-        print("[Voice] Whisper model ready")
-    return _whisper_model
-
-# ── Audio helpers ──────────────────────────────────────────────────────────────
-
-# Maps file extension → pyav format string
-_FORMAT_MAP = {
-    "m4a": "mp4", "mp4": "mp4", "caf": "caf",
-    "wav": "wav", "mp3": "mp3", "webm": "webm",
-    "3gp": "3gp", "aac": "aac",
-}
-
-def decode_audio(audio_bytes: bytes, file_ext: str = "m4a") -> np.ndarray:
-    """
-    Decode any audio format to 16 kHz mono float32 numpy array using PyAV.
-    PyAV bundles its own ffmpeg — no system ffmpeg required.
-    """
-    import av
-
-    ext = file_ext.lower().lstrip(".")
-    fmt = _FORMAT_MAP.get(ext, "mp4")
-    buf = io.BytesIO(audio_bytes)
-
-    try:
-        container = av.open(buf, format=fmt)
-    except Exception:
-        buf.seek(0)
-        container = av.open(buf)  # fallback: let pyav auto-detect
-
-    resampler = av.AudioResampler(format="fltp", layout="mono", rate=16000)
-    frames = []
-
-    try:
-        for frame in container.decode(audio=0):
-            for rf in resampler.resample(frame):
-                frames.append(rf.to_ndarray().flatten())
-        for rf in resampler.resample(None):   # flush resampler
-            frames.append(rf.to_ndarray().flatten())
-    finally:
-        container.close()
-
-    if not frames:
-        return np.zeros(1600, dtype=np.float32)   # 0.1 s of silence
-
-    return np.concatenate(frames).astype(np.float32)
-
-
-async def transcribe_audio(audio_bytes: bytes, file_ext: str) -> str:
-    """Run faster-whisper STT in a thread executor (non-blocking)."""
-    loop = asyncio.get_event_loop()
-
-    def _run():
-        audio_array = decode_audio(audio_bytes, file_ext)
-        model = get_whisper_model()
-        segments, _ = model.transcribe(
-            audio_array,
-            language="en",
-            beam_size=1,          # fastest setting
-        )
-        return " ".join(seg.text.strip() for seg in segments).strip()
-
-    return await loop.run_in_executor(None, _run)
-
-
-async def synthesise_speech(text: str) -> str:
-    """Convert text to MP3, return as base64 string (runs in thread)."""
-    from gtts import gTTS
-    loop = asyncio.get_event_loop()
-
-    def _run():
-        tts = gTTS(text=text, lang="en", slow=False)
-        buf = io.BytesIO()
-        tts.write_to_fp(buf)
-        buf.seek(0)
-        return base64.b64encode(buf.read()).decode("utf-8")
-
-    return await loop.run_in_executor(None, _run)
-
-# ── FastAPI app ────────────────────────────────────────────────────────────────
-app = FastAPI()
-
+# ── FastAPI ───────────────────────────────────────────────────────────────────
+app = FastAPI(title="YPN AI", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -138,296 +78,399 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Pydantic models ────────────────────────────────────────────────────────────
-class ChatRequest(BaseModel):
-    message: str
-    session_id: str = "default"
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-def trim_history(history, limit=6):
-    return history[-limit:]
+def _trim(history: list, keep: int = 10) -> list:
+    """Keep last `keep` turns (each turn = user + assistant message)."""
+    return history[-(keep * 2):]
 
-def build_messages(history, message):
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
-    msgs.extend(history)
-    msgs.append({"role": "user", "content": message})
-    return msgs
 
-def cache_key(session_id, message, history):
-    raw = session_id + message + json.dumps(history)
-    return hashlib.md5(raw.encode()).hexdigest()
+def _build_messages(history: list, user_msg: str) -> list:
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        *history,
+        {"role": "user", "content": user_msg},
+    ]
 
-# ── Health ─────────────────────────────────────────────────────────────────────
+
+def _cache_key(session_id: str, message: str, history: list) -> str:
+    payload = session_id + "|" + message + "|" + json.dumps(history[-4:])
+    return hashlib.md5(payload.encode()).hexdigest()
+
+
+def _l1_get(key: str) -> str | None:
+    entry = _l1.get(key)
+    if not entry:
+        return None
+    if time.time() - entry["ts"] > L1_TTL:
+        _l1.pop(key, None)
+        return None
+    return entry["reply"]
+
+
+def _l1_set(key: str, reply: str) -> None:
+    if len(_l1) >= L1_MAX:
+        # evict LRU
+        oldest = min(_l1, key=lambda k: _l1[k]["ts"])
+        _l1.pop(oldest, None)
+    _l1[key] = {"reply": reply, "ts": time.time()}
+
+
+def _append_session(sid: str, user_msg: str, ai_reply: str) -> None:
+    if sid not in sessions:
+        sessions[sid] = []
+    sessions[sid].append({"role": "user",      "content": user_msg})
+    sessions[sid].append({"role": "assistant",  "content": ai_reply})
+    sessions[sid] = sessions[sid][-40:]   # hard cap: 40 messages
+
+
+def _text_to_mp3(text: str) -> bytes:
+    """Convert text to mp3 bytes using gTTS (free, no API key)."""
+    buf = io.BytesIO()
+    tts = gTTS(text=text, lang="en", slow=False)
+    tts.write_to_fp(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+async def _cohere_reply(session_id: str, user_msg: str) -> tuple[str, bool]:
+    """
+    Returns (reply_text, was_cached).
+    Checks L1 cache first, then calls Cohere.
+    """
+    history  = _trim(sessions.get(session_id, []))
+    cache_k  = _cache_key(session_id, user_msg, history)
+    cached   = _l1_get(cache_k)
+
+    if cached:
+        log.info(f"[cohere] L1 hit session={session_id}")
+        return cached, True
+
+    t0 = time.time()
+    response = co.chat(
+        model=MODEL,
+        messages=_build_messages(history, user_msg),
+        temperature=0.7,
+        max_tokens=200,   # short — replies are spoken aloud
+    )
+    reply   = response.message.content[0].text.strip()
+    elapsed = round(time.time() - t0, 2)
+    log.info(f"[cohere] session={session_id} time={elapsed}s words={len(reply.split())}")
+
+    _append_session(session_id, user_msg, reply)
+    _l1_set(cache_k, reply)
+    return reply, False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Health / root
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.get("/")
+@app.head("/")           # ← fixes Render HEAD health check → was 405
 async def root():
-    return {"status": "⚡ YPN AI — text + voice"}
+    return {"status": "ok", "service": "YPN AI", "version": "2.0.0"}
+
 
 @app.get("/health")
+@app.head("/health")
 async def health():
     return {
         "status": "ok",
-        "model": MODEL,
-        "whisper_loaded": _whisper_model is not None,
-        "active_sessions": len(sessions),
-        "cache_size": len(cache),
+        "model":   MODEL,
+        "whisper": "base",
+        "sessions": len(sessions),
+        "l1_cache": len(_l1),
     }
 
-# ── Text chat ──────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chat (text, JSON response)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    message:    str
+    session_id: str = "default"
+
+
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    message = req.message.strip()
-    session_id = req.session_id.strip() or "default"
-    if not message:
-        raise HTTPException(400, "Message cannot be empty")
-
-    if session_id not in sessions:
-        sessions[session_id] = []
-
-    history = trim_history(sessions[session_id])
-    key = cache_key(session_id, message, history)
-
-    if key in cache:
-        return {"reply": cache[key], "cached": True}
+    msg = req.message.strip()
+    sid = (req.session_id or "default").strip()
+    if not msg:
+        raise HTTPException(400, "message cannot be empty")
 
     try:
-        response = co.chat(
-            model=MODEL,
-            messages=build_messages(history, message),
-            temperature=0.7,
-            max_tokens=200,
+        reply, cached = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: asyncio.run(_cohere_reply_sync(sid, msg))
         )
-        reply = response.message.content[0].text.strip()
-        sessions[session_id].append({"role": "user", "content": message})
-        sessions[session_id].append({"role": "assistant", "content": reply})
-        sessions[session_id] = sessions[session_id][-20:]
-        cache[key] = reply
-        return {"reply": reply, "cached": False}
     except Exception as e:
+        log.error(f"[chat] {e}")
         raise HTTPException(500, str(e))
 
+    return {"reply": reply, "cached": cached}
+
+
+# asyncio.run inside executor requires a sync wrapper
+def _cohere_reply_sync(sid: str, msg: str) -> tuple[str, bool]:
+    """Synchronous version of _cohere_reply for run_in_executor."""
+    history = _trim(sessions.get(sid, []))
+    cache_k = _cache_key(sid, msg, history)
+    cached  = _l1_get(cache_k)
+    if cached:
+        return cached, True
+
+    t0 = time.time()
+    response = co.chat(
+        model=MODEL,
+        messages=_build_messages(history, msg),
+        temperature=0.7,
+        max_tokens=200,
+    )
+    reply   = response.message.content[0].text.strip()
+    elapsed = round(time.time() - t0, 2)
+    log.info(f"[chat] session={sid} time={elapsed}s")
+
+    _append_session(sid, msg, reply)
+    _l1_set(cache_k, reply)
+    return reply, False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chat stream (SSE / text stream)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
-    message = req.message.strip()
-    session_id = req.session_id.strip() or "default"
-    if not message:
-        raise HTTPException(400, "Message cannot be empty")
+    msg = req.message.strip()
+    sid = (req.session_id or "default").strip()
+    if not msg:
+        raise HTTPException(400, "message cannot be empty")
 
-    if session_id not in sessions:
-        sessions[session_id] = []
-
-    history = trim_history(sessions[session_id])
+    history = _trim(sessions.get(sid, []))
 
     async def generate():
-        full_text = ""
+        full = ""
         try:
             stream = co.chat_stream(
                 model=MODEL,
-                messages=build_messages(history, message),
+                messages=_build_messages(history, msg),
                 temperature=0.7,
-                max_tokens=200,
+                max_tokens=300,
             )
             for event in stream:
                 if event.type == "content-delta":
                     chunk = event.delta.message.content.text
                     if chunk:
-                        full_text += chunk
+                        full += chunk
                         yield chunk
                         await asyncio.sleep(0.01)
-
-            sessions[session_id].append({"role": "user", "content": message})
-            sessions[session_id].append({"role": "assistant", "content": full_text})
-            sessions[session_id] = sessions[session_id][-20:]
+            _append_session(sid, msg, full)
+            _l1_set(_cache_key(sid, msg, history), full)
         except Exception as e:
-            yield "⚠️ Error: " + str(e)
+            log.error(f"[stream] {e}")
+            yield f"⚠️ {str(e)}"
 
     return StreamingResponse(generate(), media_type="text/plain")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Voice  —  full pipeline: audio → STT → Cohere → TTS → mp3
+# ─────────────────────────────────────────────────────────────────────────────
+# Mobile sends:
+#   POST /voice
+#   Content-Type: multipart/form-data
+#   Fields:
+#     file       — audio file (m4a / mp3 / wav / webm / ogg)
+#     session_id — optional string (default: "default")
+#
+# Returns:
+#   Content-Type: audio/mpeg
+#   Body:         mp3 bytes (AI voice reply, ready to play)
+#   Headers:
+#     X-Transcript — what the user said (for display in UI)
+#     X-Reply-Text — AI text reply    (for display in UI)
+#     X-Cached     — "true" | "false"
+#
+# Error responses are JSON so the mobile can show them in the UI.
+
+ALLOWED_AUDIO_EXTS   = {".mp3", ".m4a", ".wav", ".ogg", ".webm", ".mp4", ".aac"}
+ALLOWED_AUDIO_TYPES  = {
+    "audio/mpeg", "audio/mp3", "audio/mp4", "audio/m4a", "audio/aac",
+    "audio/wav", "audio/wave", "audio/ogg", "audio/webm",
+    "audio/x-m4a", "audio/x-wav", "application/octet-stream",
+}
+MAX_AUDIO_BYTES = 25 * 1024 * 1024   # 25 MB
+
+
+@app.post("/voice")
+async def voice_pipeline(
+    file:       UploadFile = File(...),
+    session_id: str        = Form(default="default"),
+):
+    sid = (session_id or "default").strip()
+
+    # ── Validate file type ────────────────────────────────────────────────────
+    fname   = (file.filename or "audio.mp3").lower()
+    ext     = os.path.splitext(fname)[1]
+    ctype   = (file.content_type or "").lower().split(";")[0].strip()
+
+    if ext not in ALLOWED_AUDIO_EXTS and ctype not in ALLOWED_AUDIO_TYPES:
+        raise HTTPException(
+            415,
+            detail={
+                "error": "unsupported_audio",
+                "message": f"Send mp3, m4a, wav, ogg, or webm. Got: {ctype or ext}",
+            },
+        )
+
+    # ── Read bytes ────────────────────────────────────────────────────────────
+    audio_bytes = await file.read()
+    if len(audio_bytes) < 500:
+        raise HTTPException(400, detail={"error": "empty_audio", "message": "Audio too short or empty"})
+    if len(audio_bytes) > MAX_AUDIO_BYTES:
+        raise HTTPException(413, detail={"error": "too_large", "message": "Audio file exceeds 25 MB"})
+
+    log.info(f"[voice] session={sid} size={len(audio_bytes)//1024}KB ext={ext}")
+
+    # ── Step 1: Whisper STT ───────────────────────────────────────────────────
+    # Write to a temp file — Whisper needs a real file path or numpy array.
+    # We use a named temp file so ffmpeg (inside whisper) can read the format.
+    try:
+        loop = asyncio.get_event_loop()
+        transcript = await loop.run_in_executor(None, _transcribe, audio_bytes, ext)
+    except Exception as e:
+        log.error(f"[voice] STT error: {e}")
+        raise HTTPException(
+            500,
+            detail={"error": "stt_failed", "message": "Could not transcribe audio. Please try again."},
+        )
+
+    if not transcript:
+        # Return a friendly audio response instead of an error
+        sorry_text = "Sorry, I couldn't hear that clearly. Please try speaking again."
+        mp3_bytes  = await loop.run_in_executor(None, _text_to_mp3, sorry_text)
+        return Response(
+            content=mp3_bytes,
+            media_type="audio/mpeg",
+            headers={
+                "X-Transcript":  "",
+                "X-Reply-Text":  sorry_text,
+                "X-Cached":      "false",
+            },
+        )
+
+    log.info(f"[voice] transcript='{transcript[:80]}'")
+
+    # ── Step 2: Cohere AI reply ───────────────────────────────────────────────
+    try:
+        reply_text, was_cached = _cohere_reply_sync(sid, transcript)
+    except Exception as e:
+        log.error(f"[voice] AI error: {e}")
+        raise HTTPException(
+            500,
+            detail={"error": "ai_failed", "message": "AI service error. Please try again."},
+        )
+
+    log.info(f"[voice] reply='{reply_text[:80]}' cached={was_cached}")
+
+    # ── Step 3: gTTS → mp3 ───────────────────────────────────────────────────
+    try:
+        loop       = asyncio.get_event_loop()
+        mp3_bytes  = await loop.run_in_executor(None, _text_to_mp3, reply_text)
+    except Exception as e:
+        log.error(f"[voice] TTS error: {e}")
+        raise HTTPException(
+            500,
+            detail={"error": "tts_failed", "message": "Could not generate voice reply."},
+        )
+
+    # ── Return mp3 audio ──────────────────────────────────────────────────────
+    return Response(
+        content=mp3_bytes,
+        media_type="audio/mpeg",
+        headers={
+            "X-Transcript":  transcript,
+            "X-Reply-Text":  reply_text,
+            "X-Cached":      "true" if was_cached else "false",
+            # Allow mobile to read these custom headers via CORS
+            "Access-Control-Expose-Headers": "X-Transcript, X-Reply-Text, X-Cached",
+        },
+    )
+
+
+def _transcribe(audio_bytes: bytes, ext: str) -> str:
+    """
+    Run Whisper transcription synchronously.
+    Called via run_in_executor so it doesn't block the event loop.
+    """
+    suffix = ext if ext else ".mp3"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+    try:
+        result = _whisper.transcribe(tmp_path, fp16=False, language="en")
+        return (result.get("text") or "").strip()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session management
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.delete("/chat/{session_id}")
 async def clear_session(session_id: str):
     sessions.pop(session_id, None)
-    return {"cleared": session_id}
-
-# ── Voice WebSocket ────────────────────────────────────────────────────────────
-# Protocol (all text frames, JSON):
-#
-# Client → Server:
-#   {"type": "audio_chunk", "data": "<base64-audio>"}
-#   {"type": "end_of_speech", "format": "m4a"}
-#   {"type": "end_call"}
-#   {"type": "ping"}
-#
-# Server → Client:
-#   {"type": "session_started"}
-#   {"type": "status", "status": "transcribing"|"thinking"|"speaking"|"ready"}
-#   {"type": "transcript", "text": "..."}
-#   {"type": "ai_response", "text": "..."}
-#   {"type": "audio", "data": "<base64-mp3>"}
-#   {"type": "error", "message": "..."}
-#   {"type": "call_ended"}
-#   {"type": "pong"}
-
-@app.websocket("/voice")
-async def voice_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    session_id = str(uuid.uuid4())
-    history: list = []
-    audio_chunks: list[bytes] = []
-
-    print(f"[Voice] Call started: {session_id}")
-
-    await websocket.send_text(json.dumps({
-        "type": "session_started",
-        "session_id": session_id,
-    }))
-
-    try:
-        while True:
-            try:
-                raw = await asyncio.wait_for(
-                    websocket.receive_text(),
-                    timeout=90.0,   # 90-second idle timeout per message
-                )
-            except asyncio.TimeoutError:
-                await websocket.send_text(json.dumps({"type": "call_ended"}))
-                break
-            except WebSocketDisconnect:
-                break
-
-            data = json.loads(raw)
-            msg_type = data.get("type", "")
-
-            # ── Ping keepalive ────────────────────────────────────────────────
-            if msg_type == "ping":
-                await websocket.send_text(json.dumps({"type": "pong"}))
-                continue
-
-            # ── Accumulate audio chunk ────────────────────────────────────────
-            if msg_type == "audio_chunk":
-                chunk_b64 = data.get("data", "")
-                if chunk_b64:
-                    audio_chunks.append(base64.b64decode(chunk_b64))
-                continue
-
-            # ── Process speech ────────────────────────────────────────────────
-            if msg_type == "end_of_speech":
-                if not audio_chunks:
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "message": "No audio received",
-                    }))
-                    continue
-
-                audio_data = b"".join(audio_chunks)
-                audio_chunks.clear()
-                file_ext = data.get("format", "m4a")
-
-                # 1. Transcribe
-                await websocket.send_text(json.dumps({
-                    "type": "status", "status": "transcribing"
-                }))
-                try:
-                    transcript = await transcribe_audio(audio_data, file_ext)
-                except Exception as e:
-                    print(f"[Voice] STT error: {e}")
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "message": "Could not understand audio — please try again",
-                    }))
-                    continue
-
-                if not transcript:
-                    await websocket.send_text(json.dumps({
-                        "type": "status", "status": "ready"
-                    }))
-                    continue
-
-                await websocket.send_text(json.dumps({
-                    "type": "transcript", "text": transcript
-                }))
-
-                # 2. AI response
-                await websocket.send_text(json.dumps({
-                    "type": "status", "status": "thinking"
-                }))
-                history.append({"role": "user", "content": transcript})
-                try:
-                    response = co.chat(
-                        model=MODEL,
-                        messages=[{"role": "system", "content": VOICE_SYSTEM_PROMPT}]
-                        + history[-8:],
-                        temperature=0.7,
-                        max_tokens=120,
-                    )
-                    reply = response.message.content[0].text.strip()
-                except Exception as e:
-                    print(f"[Voice] Cohere error: {e}")
-                    await websocket.send_text(json.dumps({
-                        "type": "error", "message": "AI response failed"
-                    }))
-                    continue
-
-                history.append({"role": "assistant", "content": reply})
-                history = history[-16:]   # keep last 8 turns
-
-                await websocket.send_text(json.dumps({
-                    "type": "ai_response", "text": reply
-                }))
-
-                # 3. TTS
-                await websocket.send_text(json.dumps({
-                    "type": "status", "status": "speaking"
-                }))
-                try:
-                    audio_b64 = await synthesise_speech(reply)
-                    await websocket.send_text(json.dumps({
-                        "type": "audio", "data": audio_b64
-                    }))
-                except Exception as e:
-                    print(f"[Voice] TTS error: {e}")
-                    # Fall back gracefully — client already has text
-                    await websocket.send_text(json.dumps({
-                        "type": "status", "status": "ready"
-                    }))
-                continue
-
-            # ── End call ──────────────────────────────────────────────────────
-            if msg_type == "end_call":
-                await websocket.send_text(json.dumps({"type": "call_ended"}))
-                break
-
-    except WebSocketDisconnect:
-        pass
-    except Exception as e:
-        print(f"[Voice] Unexpected error {session_id}: {e}")
-    finally:
-        print(f"[Voice] Call ended: {session_id}")
+    dropped = [k for k in list(_l1) if session_id in k]
+    for k in dropped:
+        _l1.pop(k, None)
+    return {"cleared": session_id, "cache_dropped": len(dropped)}
 
 
-# ── Background tasks ───────────────────────────────────────────────────────────
-async def _cleanup_cache():
+@app.get("/sessions")
+async def list_sessions():
+    """Debug: active sessions and message counts."""
+    return {sid: len(msgs) for sid, msgs in sessions.items()}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Background cache cleanup
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _cleanup_loop():
     while True:
-        await asyncio.sleep(600)
-        cache.clear()
-        print("🧹 Cache cleared")
+        await asyncio.sleep(10 * 60)
+        now     = time.time()
+        expired = [k for k, v in list(_l1.items()) if now - v["ts"] > L1_TTL]
+        for k in expired:
+            _l1.pop(k, None)
+        if expired:
+            log.info(f"[cache] evicted {len(expired)} stale L1 entries")
 
-async def _preload_whisper():
-    """Load Whisper model in background after server starts — avoids cold-start delay."""
-    await asyncio.sleep(3)
-    loop = asyncio.get_event_loop()
-    try:
-        await loop.run_in_executor(None, get_whisper_model)
-    except Exception as e:
-        print(f"[Voice] Whisper preload failed: {e}")
 
 @app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(_cleanup_cache())
-    asyncio.create_task(_preload_whisper())
+async def on_startup():
+    asyncio.create_task(_cleanup_loop())
+    log.info(f"YPN AI ready | model={MODEL} | whisper=base")
 
-# ── Entry ──────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 10000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+        # Single worker — keeps Whisper model in one process
+    )
