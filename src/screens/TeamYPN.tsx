@@ -51,7 +51,7 @@ import {
 } from "../utils/pendingAIReply";
 import {
   clearTeamYPNUnreadBadge,
-  incrementUnreadBadge
+  incrementUnreadBadge,
 } from "../utils/teamYPNBadge";
 
 // ---------------------------------------------------------------------------
@@ -550,6 +550,7 @@ export default function TeamYPNScreen() {
             <Text style={s.headerSub}>{aiTyping ? "typing..." : "Online"}</Text>
           </View>
 
+          {/* ✅ UPDATED: Call Icon now navigates to voice screen */}
           <View style={s.headerActions}>
             <Ionicons
               name="videocam-outline"
@@ -557,12 +558,13 @@ export default function TeamYPNScreen() {
               color="#25D366"
               style={s.headerIcon}
             />
-            <Ionicons
-              name="call-outline"
-              size={24}
-              color="#25D366"
-              style={s.headerIcon}
-            />
+            <TouchableOpacity
+              onPress={() => router.push("/voice")}
+              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+              activeOpacity={0.7}
+            >
+              <Ionicons name="call-outline" size={24} color="#25D366" />
+            </TouchableOpacity>
           </View>
         </View>
       </BlurView>
