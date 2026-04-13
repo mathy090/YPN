@@ -8,6 +8,7 @@
     "scheme": "ypn",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
+
     "android": {
       "package": "com.anonymous.YPN",
       "adaptiveIcon": {
@@ -20,11 +21,27 @@
         "android.permission.CAMERA",
         "android.permission.BLUETOOTH",
         "android.permission.BLUETOOTH_ADMIN",
-        "android.permission.BLUETOOTH_CONNECT"
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.POST_NOTIFICATIONS"
       ],
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "googleServicesFile": "./google-services.json"
     },
+
+    "ios": {
+      "bundleIdentifier": "com.anonymous.YPN",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "YPN needs microphone access to record your voice messages.",
+        "NSLocationWhenInUseUsageDescription": "YPN needs your location to provide local context.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "YPN needs your location for background features.",
+        "UIBackgroundModes": ["remote-notification"]
+      }
+    },
+
     "plugins": [
       "expo-router",
       [
@@ -50,7 +67,21 @@
         }
       ],
       "expo-web-browser",
-      "expo-audio"
+      "expo-audio",
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Allow YPN to use your location?"
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/images/notification-icon.png",
+          "color": "#E6F4FE",
+          "sounds": ["./assets/notification-sound.wav"]
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true,
@@ -61,9 +92,6 @@
       "eas": {
         "projectId": "a19cebbe-464a-48a4-a53d-a8bab9117154"
       }
-    },
-    "ios": {
-      "bundleIdentifier": "com.anonymous.YPN"
     }
   }
 }

@@ -1,14 +1,9 @@
 // src/screens/VoiceCallScreen.tsx
 //
-// Full-screen voice call UI for YPN AI.
-// Flow:
-//   idle → tap mic → recording (mic turns to send icon)
-//   → tap send → Listening → Processing → Thinking → Replying
-//   → AI reply text appears + server TTS plays (falls back to expo-speech)
-//   → idle (record button unlocks)
-//
-// Two-layer cache: in-memory L1 (session) + AsyncStorage L2 (persistent, 30 msgs)
-// Recording: expo-av Audio.Recording → m4a → multipart POST to /voice
+// REFACTORED FOR:
+// 1. WAV 16kHz Mono recording (Optimized for Vosk)
+// 2. Simultaneous Text Display + Native Speech (expo-speech)
+// 3. Zero Server-Side TTS dependency (Ultra-light backend)
 
 import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -38,12 +33,12 @@ const MAX_CACHED = 30;
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 type VoicePhase =
-  | "idle" // ready to record
-  | "recording" // mic active
-  | "listening" // audio sent, server received it
-  | "processing" // server converting audio
-  | "thinking" // Cohere generating reply
-  | "replying"; // TTS / text showing
+  | "idle"
+  | "recording"
+  | "listening"
+  | "processing"
+  | "thinking"
+  | "replying";
 
 type VoiceMessage = {
   id: string;
@@ -59,7 +54,7 @@ const PHASE_LABEL: Record<VoicePhase, string> = {
   listening: "Listening...",
   processing: "Processing your voice...",
   thinking: "Thinking...",
-  replying: "Replying...",
+  replying: "Speaking...", // Updated label
 };
 
 const PHASE_COLOR: Record<VoicePhase, string> = {
@@ -204,7 +199,6 @@ export default function VoiceCallScreen({
   const [errorMsg, setErrorMsg] = useState("");
 
   const recordingRef = useRef<Audio.Recording | null>(null);
-  const soundRef = useRef<Audio.Sound | null>(null);
   const scrollRef = useRef<ScrollView>(null);
   const mountedRef = useRef(true);
 
@@ -221,9 +215,9 @@ export default function VoiceCallScreen({
 
     return () => {
       mountedRef.current = false;
+      // Stop speech immediately on unmount
       Speech.stop();
       cleanupRecording();
-      cleanupSound();
     };
   }, []);
 
@@ -236,21 +230,11 @@ export default function VoiceCallScreen({
     } catch {}
   };
 
-  const cleanupSound = async () => {
-    try {
-      if (soundRef.current) {
-        await soundRef.current.stopAsync();
-        await soundRef.current.unloadAsync();
-        soundRef.current = null;
-      }
-    } catch {}
-  };
-
   const safeSetPhase = (p: VoicePhase) => {
     if (mountedRef.current) setPhase(p);
   };
 
-  // ── Start recording ────────────────────────────────────────────────────────
+  // ── Start recording (OPTIMIZED FOR VOSK: WAV 16kHz Mono) ─────────────────
   const startRecording = useCallback(async () => {
     if (isBusy) return;
     setErrorMsg("");
@@ -269,41 +253,59 @@ export default function VoiceCallScreen({
         playsInSilentModeIOS: true,
       });
 
-      const { recording } = await Audio.Recording.createAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY,
-      );
+      // CUSTOM PRESET: Force WAV 16kHz Mono for Vosk compatibility
+      const { recording } = await Audio.Recording.createAsync({
+        android: {
+          extension: ".wav",
+          outputFormat:
+            Audio.AndroidOutputFormat.WAVEFORM_AUDIO_ENCODING_PCM_16BIT,
+          audioEncoder: Audio.AndroidAudioEncoder.DEFAULT, // PCM doesn't need encoder
+          sampleRate: 16000,
+          numberOfChannels: 1,
+          bitRate: 256000, // Irrelevant for PCM but good practice
+        },
+        ios: {
+          extension: ".wav",
+          outputFormat: Audio.IOSOutputFormat.LINEAR_PCM,
+          audioEncoder: Audio.IOSAudioEncoding.LINEAR_PCM,
+          sampleRate: 16000,
+          numberOfChannels: 1,
+          bitRate: 256000,
+        },
+      });
+
       recordingRef.current = recording;
       safeSetPhase("recording");
-    } catch {
+    } catch (e) {
+      console.error(e);
       setErrorMsg("Could not start recording. Please try again.");
     }
   }, [isBusy]);
 
-  // ── Stop + send ────────────────────────────────────────────────────────────
+  // ── Stop + Send + SYNC REPLY ─────────────────────────────────────────────
   const stopAndSend = useCallback(async () => {
     if (phase !== "recording" || !recordingRef.current) return;
 
     safeSetPhase("listening");
 
-    // Stop recording and get URI
     let uri: string | null = null;
     try {
       await recordingRef.current.stopAndUnloadAsync();
       uri = recordingRef.current.getURI() ?? null;
       recordingRef.current = null;
     } catch {
-      setErrorMsg("Recording failed. Please try again.");
+      setErrorMsg("Recording failed.");
       safeSetPhase("idle");
       return;
     }
 
     if (!uri) {
-      setErrorMsg("No audio captured. Please try again.");
+      setErrorMsg("No audio captured.");
       safeSetPhase("idle");
       return;
     }
 
-    // Switch audio mode for playback
+    // Switch mode for playback (though expo-speech handles its own session usually)
     await Audio.setAudioModeAsync({
       allowsRecordingIOS: false,
       playsInSilentModeIOS: true,
@@ -311,12 +313,11 @@ export default function VoiceCallScreen({
 
     safeSetPhase("processing");
 
-    // Build multipart form — send raw m4a to server
     const formData = new FormData();
     formData.append("audio", {
       uri,
-      name: "voice.m4a",
-      type: "audio/m4a",
+      name: "voice.wav", // Explicitly tell server it's WAV
+      type: "audio/wav",
     } as any);
     formData.append("session_id", sessionId);
 
@@ -328,7 +329,6 @@ export default function VoiceCallScreen({
       const res = await fetch(VOICE_ENDPOINT, {
         method: "POST",
         body: formData,
-        // Do NOT manually set Content-Type — let fetch handle multipart boundary
       });
 
       if (!res.ok) {
@@ -342,62 +342,45 @@ export default function VoiceCallScreen({
 
       data = await res.json();
     } catch (e: any) {
-      setErrorMsg(e?.message ?? "Could not reach the AI. Please try again.");
+      setErrorMsg(e?.message ?? "Network error.");
       safeSetPhase("idle");
       return;
     }
 
-    // Show transcript immediately
+    // 1. Show Transcript Immediately
     setCurrentTranscript(data.transcript);
+
+    // 2. Prepare Reply
     safeSetPhase("replying");
     setCurrentReply(data.reply);
 
-    // ── Play TTS audio from server or fall back to expo-speech ────────────
-    let ttsPlayed = false;
+    // 3. SCROLL TO BOTTOM so user sees text appearing
+    setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 50);
 
-    if (data.tts_url) {
-      try {
-        const fullTtsUrl = `${AI_BASE_URL}${data.tts_url}`;
-        const { sound } = await Audio.Sound.createAsync(
-          { uri: fullTtsUrl },
-          { shouldPlay: true, volume: 1.0 },
-        );
-        soundRef.current = sound;
-
-        await new Promise<void>((resolve) => {
-          sound.setOnPlaybackStatusUpdate((status) => {
-            if (!status.isLoaded) return;
-            if (status.didJustFinish) {
-              resolve();
-            }
-          });
-        });
-
-        await sound.unloadAsync();
-        soundRef.current = null;
-        ttsPlayed = true;
-      } catch (e) {
-        console.warn(
-          "[VoiceCall] Server TTS playback failed, falling back to expo-speech:",
-          e,
-        );
-      }
-    }
-
-    // Fallback: expo-speech if server TTS failed or unavailable
-    if (!ttsPlayed) {
-      await new Promise<void>((resolve) => {
-        Speech.speak(data.reply, {
-          language: "en",
-          pitch: 1.0,
-          rate: Platform.OS === "ios" ? 0.52 : 0.9,
-          onDone: resolve,
-          onError: resolve,
-        });
+    // 4. TRIGGER SPEECH IMMEDIATELY (Simultaneous with text display)
+    // We ignore server tts_url because we removed server-side TTS for speed.
+    // We rely 100% on expo-speech.
+    try {
+      await Speech.speak(data.reply, {
+        language: "en-US",
+        pitch: 1.0,
+        rate: Platform.OS === "ios" ? 0.55 : 0.95, // Slightly slower for clarity
+        onStart: () => {
+          console.log("Speech started");
+        },
+        onDone: () => {
+          console.log("Speech finished");
+          // Optional: Auto-reset phase or keep it until user speaks
+        },
+        onError: (e) => {
+          console.warn("Speech error:", e);
+        },
       });
+    } catch (e) {
+      console.warn("Speech synthesis failed:", e);
     }
 
-    // Save to history
+    // 5. Save to History
     const msg: VoiceMessage = {
       id: Date.now().toString(),
       transcript: data.transcript,
@@ -408,16 +391,19 @@ export default function VoiceCallScreen({
     const updated = [...history, msg];
     if (mountedRef.current) {
       setHistory(updated);
-      setCurrentReply("");
-      setCurrentTranscript("");
+      // Clear current live view after a short delay to merge into history cleanly
+      setTimeout(() => {
+        if (mountedRef.current) {
+          setCurrentReply("");
+          setCurrentTranscript("");
+        }
+      }, 1000);
     }
     cacheSave(updated);
 
-    setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 100);
     safeSetPhase("idle");
   }, [phase, history, sessionId]);
 
-  // ── Button press ───────────────────────────────────────────────────────────
   const handlePress = useCallback(() => {
     if (isBusy) return;
     if (phase === "idle") startRecording();
@@ -427,7 +413,6 @@ export default function VoiceCallScreen({
   const STATUS_H =
     Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) : 0;
 
-  // ── Mic button icon + colours ──────────────────────────────────────────────
   const btnIcon = phase === "recording" ? "arrow-up" : "mic";
   const btnBgColor =
     phase === "recording"
@@ -446,7 +431,6 @@ export default function VoiceCallScreen({
 
   return (
     <View style={[s.root, { paddingTop: STATUS_H }]}>
-      {/* Dark background blur */}
       <BlurView intensity={100} tint="dark" style={StyleSheet.absoluteFill} />
       <View style={s.darken} />
 
@@ -474,7 +458,7 @@ export default function VoiceCallScreen({
         <View style={{ width: 44 }} />
       </View>
 
-      {/* Conversation history */}
+      {/* Conversation */}
       <ScrollView
         ref={scrollRef}
         style={s.scroll}
@@ -490,14 +474,13 @@ export default function VoiceCallScreen({
             />
             <Text style={s.emptyTitle}>Voice Assistant</Text>
             <Text style={s.emptySubtitle}>
-              Tap the mic, speak your question,{"\n"}then tap the arrow to send.
+              Tap the mic, speak clearly,{"\n"}then tap the arrow.
             </Text>
           </View>
         )}
 
         {history.map((item) => (
           <View key={item.id} style={s.msgPair}>
-            {/* User voice transcript */}
             <View style={s.userRow}>
               <View style={s.userBubble}>
                 <View style={s.micLabel}>
@@ -511,7 +494,6 @@ export default function VoiceCallScreen({
                 <Text style={s.userText}>{item.transcript}</Text>
               </View>
             </View>
-            {/* AI reply */}
             <View style={s.aiRow}>
               <View style={s.aiBubble}>
                 <Text style={s.aiText}>{item.reply}</Text>
@@ -520,7 +502,7 @@ export default function VoiceCallScreen({
           </View>
         ))}
 
-        {/* Live current exchange while processing / replying */}
+        {/* Live Exchange */}
         {currentTranscript !== "" && (
           <View style={s.userRow}>
             <View style={[s.userBubble, s.userBubbleLive]}>
@@ -542,7 +524,7 @@ export default function VoiceCallScreen({
         )}
       </ScrollView>
 
-      {/* Phase status bar */}
+      {/* Status Bar */}
       <View style={s.statusBar}>
         {showDots && (
           <View style={s.statusRow}>
@@ -552,47 +534,35 @@ export default function VoiceCallScreen({
             </Text>
           </View>
         )}
-
         {phase === "recording" && (
           <View style={s.statusRow}>
-            {/* Blinking red dot */}
             <RecDot />
             <Text style={[s.statusText, { color: "#FF453A" }]}>
               {PHASE_LABEL.recording}
             </Text>
           </View>
         )}
-
         {phase === "idle" && !errorMsg && (
           <Text style={s.statusIdle}>{PHASE_LABEL.idle}</Text>
         )}
-
         {errorMsg !== "" && <Text style={s.errorText}>{errorMsg}</Text>}
       </View>
 
-      {/* Mic / Send button */}
+      {/* Mic Button */}
       <View style={s.btnArea}>
-        {/* Pulse ring — only when recording */}
         <Animated.View
           style={[
             s.pulseRing,
-            {
-              transform: [{ scale: pulseScale }],
-              opacity: pulseOpacity,
-            },
+            { transform: [{ scale: pulseScale }], opacity: pulseOpacity },
           ]}
         />
-
         <TouchableOpacity
           onPress={handlePress}
           disabled={isBusy}
           activeOpacity={0.8}
           style={[
             s.micBtn,
-            {
-              backgroundColor: btnBgColor,
-              borderColor: btnBorderColor,
-            },
+            { backgroundColor: btnBgColor, borderColor: btnBorderColor },
           ]}
         >
           {isBusy ? (
@@ -612,10 +582,8 @@ export default function VoiceCallScreen({
   );
 }
 
-// ── Blinking recording dot ─────────────────────────────────────────────────────
 function RecDot() {
   const opacity = useRef(new Animated.Value(1)).current;
-
   useEffect(() => {
     const loop = Animated.loop(
       Animated.sequence([
@@ -634,31 +602,19 @@ function RecDot() {
     loop.start();
     return () => loop.stop();
   }, []);
-
   return <Animated.View style={[rd.dot, { opacity }]} />;
 }
 
 const rd = StyleSheet.create({
-  dot: {
-    width: 10,
-    height: 10,
-    borderRadius: 5,
-    backgroundColor: "#FF453A",
-  },
+  dot: { width: 10, height: 10, borderRadius: 5, backgroundColor: "#FF453A" },
 });
 
-// ── Styles ─────────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
-  root: {
-    flex: 1,
-    backgroundColor: "#0B141A",
-  },
+  root: { flex: 1, backgroundColor: "#0B141A" },
   darken: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: "rgba(11,20,26,0.78)",
   },
-
-  // Header
   header: {
     flexDirection: "row",
     alignItems: "center",
@@ -681,8 +637,6 @@ const s = StyleSheet.create({
   avatar: { width: 52, height: 52, borderRadius: 26 },
   headerName: { color: "#fff", fontSize: 17, fontWeight: "700" },
   headerSub: { color: "#8696A0", fontSize: 12 },
-
-  // Scroll
   scroll: { flex: 1 },
   scrollContent: {
     paddingHorizontal: 16,
@@ -691,8 +645,6 @@ const s = StyleSheet.create({
     gap: 8,
     flexGrow: 1,
   },
-
-  // Empty state
   emptyWrap: {
     flex: 1,
     alignItems: "center",
@@ -712,8 +664,6 @@ const s = StyleSheet.create({
     textAlign: "center",
     lineHeight: 21,
   },
-
-  // Message pairs
   msgPair: { gap: 6, marginBottom: 8 },
   userRow: { flexDirection: "row", justifyContent: "flex-end" },
   userBubble: {
@@ -725,10 +675,7 @@ const s = StyleSheet.create({
     maxWidth: "82%",
     gap: 3,
   },
-  userBubbleLive: {
-    borderWidth: 1,
-    borderColor: "rgba(29,185,84,0.4)",
-  },
+  userBubbleLive: { borderWidth: 1, borderColor: "rgba(29,185,84,0.4)" },
   micLabel: {
     flexDirection: "row",
     alignItems: "center",
@@ -741,7 +688,6 @@ const s = StyleSheet.create({
     fontWeight: "600",
   },
   userText: { color: "#E9EDEF", fontSize: 15, lineHeight: 21 },
-
   aiRow: { flexDirection: "row", justifyContent: "flex-start" },
   aiBubble: {
     backgroundColor: "#202C33",
@@ -751,13 +697,8 @@ const s = StyleSheet.create({
     paddingVertical: 9,
     maxWidth: "82%",
   },
-  aiBubbleLive: {
-    borderWidth: 1,
-    borderColor: "rgba(29,185,84,0.3)",
-  },
+  aiBubbleLive: { borderWidth: 1, borderColor: "rgba(29,185,84,0.3)" },
   aiText: { color: "#E9EDEF", fontSize: 15, lineHeight: 21 },
-
-  // Status bar
   statusBar: {
     minHeight: 56,
     alignItems: "center",
@@ -765,32 +706,16 @@ const s = StyleSheet.create({
     paddingHorizontal: 24,
     gap: 4,
   },
-  statusRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-  },
-  statusText: {
-    fontSize: 15,
-    fontWeight: "600",
-  },
-  statusIdle: {
-    color: "rgba(255,255,255,0.28)",
-    fontSize: 14,
-  },
+  statusRow: { flexDirection: "row", alignItems: "center", gap: 10 },
+  statusText: { fontSize: 15, fontWeight: "600" },
+  statusIdle: { color: "rgba(255,255,255,0.28)", fontSize: 14 },
   errorText: {
     color: "#FF453A",
     fontSize: 13,
     textAlign: "center",
     paddingHorizontal: 16,
   },
-
-  // Mic button area
-  btnArea: {
-    alignItems: "center",
-    justifyContent: "center",
-    height: 150,
-  },
+  btnArea: { alignItems: "center", justifyContent: "center", height: 150 },
   pulseRing: {
     position: "absolute",
     width: 144,
