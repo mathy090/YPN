@@ -4,8 +4,5 @@ httpx
 python-dotenv
 cohere
 vosk
-kokoro-onnx
-numpy
-soundfile
-websockets
 python-multipart
+websockets
