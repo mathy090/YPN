@@ -1,520 +1,830 @@
 // src/screens/VoiceCall.tsx
-// Meta AI-style voice call screen.
-// Flow: tap mic → record → send to /voice → play mp3 response → idle
 //
-// States: idle | recording | processing | speaking | error
-// Two-layer cache: L1 in-memory Map (10 min) + AsyncStorage (session)
+// YPN AI Voice Call
+// ─────────────────────────────────────────────────────────────────────────────
+// Flow:
+//   1. Open WebSocket to /voice on AI service
+//   2. Capture mic via expo-audio, stream 16kHz PCM chunks over WS
+//   3. Client-side VAD: detect silence → send "VAD_SILENCE" control frame
+//   4. Server: Vosk STT → Cohere → Kokoro TTS → stream WAV chunks back
+//   5. Client plays WAV chunks via expo-av Audio.Sound
+//   6. Barge-in: if user speaks while AI talking → send "INTERRUPT"
+//   7. Text transcript + AI reply shown on screen
+// ─────────────────────────────────────────────────────────────────────────────
 
 import { Ionicons } from "@expo/vector-icons";
-import { Audio, AVPlaybackStatus } from "expo-av";
+import { Audio } from "expo-av";
 import { useRouter } from "expo-router";
-import { useEffect, useRef, useState, useCallback } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
-  ActivityIndicator,
   Animated,
+  Easing,
+  Image,
   Platform,
+  StatusBar as RNStatusBar,
+  ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from "react-native";
-import { useSafeAreaInsets } from "react-native-safe-area-context";
-import AsyncStorage from "@react-native-async-storage/async-storage";
 
-// ── Config ────────────────────────────────────────────────────────────────────
-const AI_URL = process.env.EXPO_PUBLIC_AI_URL ?? "";
-const SESSION_KEY = "voice_session_id";
-const CACHE_KEY = "voice_l1_cache"; // AsyncStorage key for L2
-const L1_TTL_MS = 10 * 60 * 1000; // 10 min
+// ── Config ─────────────────────────────────────────────────────────────────────
+const AI_WS_URL = (() => {
+  const base = process.env.EXPO_PUBLIC_AI_URL ?? "";
+  // Replace http(s) with ws(s)
+  return base.replace(/^http/, "ws") + "/voice";
+})();
 
-// ── Types ─────────────────────────────────────────────────────────────────────
-type ScreenState = "idle" | "recording" | "processing" | "speaking" | "error";
+const SAMPLE_RATE = 16000;
+const RECORDING_INTERVAL_MS = 100; // how often we read audio chunks
+const SILENCE_DB_THRESHOLD = -35; // dB below which = silence
+const SILENCE_DURATION_MS = 1200; // ms of silence before sending VAD_SILENCE
+const SPEECH_DB_THRESHOLD = -28; // dB above which = user speaking (barge-in)
 
-type CacheEntry = {
-  reply: string;
-  transcript: string;
-  ts: number;
+// ── Types ──────────────────────────────────────────────────────────────────────
+type CallState =
+  | "connecting"
+  | "idle"
+  | "user_speaking"
+  | "ai_speaking"
+  | "error";
+
+type Transcript = {
+  id: string;
+  role: "user" | "ai";
+  text: string;
 };
 
-// ── In-memory L1 cache ────────────────────────────────────────────────────────
-const _memCache = new Map<string, CacheEntry>();
-
-function memCacheGet(transcript: string): CacheEntry | null {
-  const entry = _memCache.get(transcript.toLowerCase().trim());
-  if (!entry) return null;
-  if (Date.now() - entry.ts > L1_TTL_MS) {
-    _memCache.delete(transcript.toLowerCase().trim());
-    return null;
-  }
-  return entry;
-}
-
-function memCacheSet(transcript: string, entry: CacheEntry): void {
-  if (_memCache.size > 100) {
-    // evict oldest
-    const oldest = [..._memCache.entries()].sort(
-      (a, b) => a[1].ts - b[1].ts,
-    )[0];
-    if (oldest) _memCache.delete(oldest[0]);
-  }
-  _memCache.set(transcript.toLowerCase().trim(), entry);
-}
-
-// ── AsyncStorage L2 cache ─────────────────────────────────────────────────────
-async function l2Get(transcript: string): Promise<CacheEntry | null> {
-  try {
-    const raw = await AsyncStorage.getItem(CACHE_KEY);
-    if (!raw) return null;
-    const store: Record<string, CacheEntry> = JSON.parse(raw);
-    const entry = store[transcript.toLowerCase().trim()];
-    if (!entry) return null;
-    if (Date.now() - entry.ts > L1_TTL_MS) return null;
-    return entry;
-  } catch {
-    return null;
-  }
-}
-
-async function l2Set(transcript: string, entry: CacheEntry): Promise<void> {
-  try {
-    const raw = await AsyncStorage.getItem(CACHE_KEY);
-    const store: Record<string, CacheEntry> = raw ? JSON.parse(raw) : {};
-    // keep max 50 entries
-    const keys = Object.keys(store);
-    if (keys.length >= 50) {
-      const oldest = keys.sort((a, b) => store[a].ts - store[b].ts)[0];
-      delete store[oldest];
-    }
-    store[transcript.toLowerCase().trim()] = entry;
-    await AsyncStorage.setItem(CACHE_KEY, JSON.stringify(store));
-  } catch {}
-}
-
-// ── Component ─────────────────────────────────────────────────────────────────
+// ── Component ──────────────────────────────────────────────────────────────────
 export default function VoiceCallScreen() {
   const router = useRouter();
-  const insets = useSafeAreaInsets();
 
-  const [state, setState] = useState<ScreenState>("idle");
-  const [transcript, setTranscript] = useState("");
-  const [replyText, setReplyText] = useState("");
+  const [callState, setCallState] = useState<CallState>("connecting");
+  const [muted, setMuted] = useState(false);
+  const [transcripts, setTranscripts] = useState<Transcript[]>([]);
   const [errorMsg, setErrorMsg] = useState("");
-  const [sessionId, setSessionId] = useState("default");
+  const [callDuration, setCallDuration] = useState(0);
 
+  // Refs
+  const wsRef = useRef<WebSocket | null>(null);
   const recordingRef = useRef<Audio.Recording | null>(null);
+  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const durationTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const scrollRef = useRef<ScrollView>(null);
+  const isMountedRef = useRef(true);
+  const isAiSpeakingRef = useRef(false);
   const soundRef = useRef<Audio.Sound | null>(null);
+  // Accumulate WAV chunks while AI is streaming
+  const audioChunksRef = useRef<Uint8Array[]>([]);
+  const audioPlaybackActiveRef = useRef(false);
+
+  // Animation for AI speaking indicator
   const pulseAnim = useRef(new Animated.Value(1)).current;
-  const pulseLoop = useRef<Animated.CompositeAnimation | null>(null);
+  const pulseLoopRef = useRef<Animated.CompositeAnimation | null>(null);
 
-  // ── Session ID (persisted) ────────────────────────────────────────────────
-  useEffect(() => {
-    AsyncStorage.getItem(SESSION_KEY).then((sid) => {
-      if (sid) {
-        setSessionId(sid);
-      } else {
-        const newSid = `voice_${Date.now()}`;
-        setSessionId(newSid);
-        AsyncStorage.setItem(SESSION_KEY, newSid);
-      }
-    });
-    return () => {
-      stopPulse();
-      cleanupSound();
-    };
-  }, []);
-
-  // ── Pulse animation ───────────────────────────────────────────────────────
+  // ── Animations ────────────────────────────────────────────────────────────
   const startPulse = useCallback(() => {
-    pulseLoop.current = Animated.loop(
+    pulseLoopRef.current?.stop();
+    pulseLoopRef.current = Animated.loop(
       Animated.sequence([
         Animated.timing(pulseAnim, {
-          toValue: 1.25,
-          duration: 600,
+          toValue: 1.18,
+          duration: 500,
+          easing: Easing.inOut(Easing.ease),
           useNativeDriver: true,
         }),
         Animated.timing(pulseAnim, {
           toValue: 1,
-          duration: 600,
+          duration: 500,
+          easing: Easing.inOut(Easing.ease),
           useNativeDriver: true,
         }),
       ]),
     );
-    pulseLoop.current.start();
+    pulseLoopRef.current.start();
   }, [pulseAnim]);
 
   const stopPulse = useCallback(() => {
-    pulseLoop.current?.stop();
-    pulseAnim.setValue(1);
+    pulseLoopRef.current?.stop();
+    Animated.spring(pulseAnim, {
+      toValue: 1,
+      useNativeDriver: true,
+    }).start();
   }, [pulseAnim]);
 
-  // ── Audio permissions ─────────────────────────────────────────────────────
-  const requestPermissions = async (): Promise<boolean> => {
-    const { granted } = await Audio.requestPermissionsAsync();
-    return granted;
-  };
-
-  // ── Cleanup sound ─────────────────────────────────────────────────────────
-  const cleanupSound = async () => {
+  // ── Audio playback ────────────────────────────────────────────────────────
+  const stopCurrentSound = useCallback(async () => {
     if (soundRef.current) {
       try {
+        await soundRef.current.stopAsync();
         await soundRef.current.unloadAsync();
       } catch {}
       soundRef.current = null;
     }
-  };
+    audioChunksRef.current = [];
+    audioPlaybackActiveRef.current = false;
+  }, []);
 
-  // ── Start recording ───────────────────────────────────────────────────────
-  const startRecording = async () => {
-    const allowed = await requestPermissions();
-    if (!allowed) {
-      setErrorMsg("Microphone permission denied");
-      setState("error");
-      return;
+  /**
+   * Play accumulated WAV bytes using expo-av Audio.Sound.
+   * expo-av accepts a data URI with base64 WAV.
+   */
+  const playWavBytes = useCallback(
+    async (wavBytes: Uint8Array) => {
+      try {
+        await stopCurrentSound();
+
+        // Convert Uint8Array → base64
+        let binary = "";
+        const chunkSize = 8192;
+        for (let i = 0; i < wavBytes.length; i += chunkSize) {
+          binary += String.fromCharCode(...wavBytes.subarray(i, i + chunkSize));
+        }
+        const base64 = btoa(binary);
+        const uri = `data:audio/wav;base64,${base64}`;
+
+        const { sound } = await Audio.Sound.createAsync(
+          { uri },
+          { shouldPlay: true, volume: 1.0 },
+        );
+        soundRef.current = sound;
+
+        sound.setOnPlaybackStatusUpdate((status) => {
+          if (!status.isLoaded) return;
+          if (status.didJustFinish) {
+            sound.unloadAsync();
+            soundRef.current = null;
+            audioPlaybackActiveRef.current = false;
+            if (isMountedRef.current) {
+              isAiSpeakingRef.current = false;
+              setCallState("idle");
+              stopPulse();
+            }
+          }
+        });
+      } catch (e) {
+        console.warn("[VoiceCall] playWavBytes error:", e);
+        audioPlaybackActiveRef.current = false;
+        isAiSpeakingRef.current = false;
+        setCallState("idle");
+        stopPulse();
+      }
+    },
+    [stopCurrentSound, stopPulse],
+  );
+
+  // ── WebSocket setup ────────────────────────────────────────────────────────
+  const setupWebSocket = useCallback(() => {
+    if (wsRef.current) {
+      wsRef.current.close();
     }
 
-    await cleanupSound();
-    setTranscript("");
-    setReplyText("");
-    setErrorMsg("");
+    const ws = new WebSocket(AI_WS_URL);
+    ws.binaryType = "arraybuffer";
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      if (!isMountedRef.current) return;
+      console.log("[VoiceCall] WS connected");
+      setCallState("idle");
+      setErrorMsg("");
+      // Start call duration timer
+      durationTimerRef.current = setInterval(() => {
+        setCallDuration((d) => d + 1);
+      }, 1000);
+    };
+
+    ws.onmessage = async (event) => {
+      if (!isMountedRef.current) return;
+
+      // Binary = audio chunk from Kokoro TTS
+      if (event.data instanceof ArrayBuffer) {
+        const chunk = new Uint8Array(event.data);
+        audioChunksRef.current.push(chunk);
+        return;
+      }
+
+      // Text = control/data JSON
+      try {
+        const msg = JSON.parse(event.data as string);
+
+        switch (msg.type) {
+          case "transcript":
+            // What the user said
+            setTranscripts((prev) => [
+              ...prev,
+              { id: `u_${Date.now()}`, role: "user", text: msg.text },
+            ]);
+            setTimeout(
+              () => scrollRef.current?.scrollToEnd({ animated: true }),
+              100,
+            );
+            break;
+
+          case "reply":
+            // AI text reply
+            setTranscripts((prev) => [
+              ...prev,
+              { id: `a_${Date.now()}`, role: "ai", text: msg.text },
+            ]);
+            setTimeout(
+              () => scrollRef.current?.scrollToEnd({ animated: true }),
+              100,
+            );
+            isAiSpeakingRef.current = true;
+            setCallState("ai_speaking");
+            startPulse();
+            break;
+
+          case "audio_start":
+            audioChunksRef.current = [];
+            audioPlaybackActiveRef.current = true;
+            break;
+
+          case "audio_end":
+            // All audio chunks received — combine and play
+            if (audioChunksRef.current.length > 0) {
+              const total = audioChunksRef.current.reduce(
+                (acc, c) => acc + c.length,
+                0,
+              );
+              const combined = new Uint8Array(total);
+              let offset = 0;
+              for (const c of audioChunksRef.current) {
+                combined.set(c, offset);
+                offset += c.length;
+              }
+              audioChunksRef.current = [];
+              await playWavBytes(combined);
+            } else {
+              isAiSpeakingRef.current = false;
+              setCallState("idle");
+              stopPulse();
+            }
+            break;
+
+          case "error":
+            console.warn("[VoiceCall] Server error:", msg.message);
+            setErrorMsg(msg.message ?? "Unknown error");
+            isAiSpeakingRef.current = false;
+            setCallState("error");
+            stopPulse();
+            break;
+
+          default:
+            break;
+        }
+      } catch (e) {
+        console.warn("[VoiceCall] Failed to parse WS message:", e);
+      }
+    };
+
+    ws.onerror = (e) => {
+      console.warn("[VoiceCall] WS error:", e);
+      if (isMountedRef.current) {
+        setCallState("error");
+        setErrorMsg("Connection error. Please try again.");
+      }
+    };
+
+    ws.onclose = () => {
+      console.log("[VoiceCall] WS closed");
+    };
+  }, [startPulse, stopPulse, playWavBytes]);
+
+  // ── Microphone recording ───────────────────────────────────────────────────
+  const startRecording = useCallback(async () => {
+    if (muted) return;
 
     try {
+      const { granted } = await Audio.requestPermissionsAsync();
+      if (!granted) {
+        setErrorMsg("Microphone permission denied.");
+        return;
+      }
+
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
         playsInSilentModeIOS: true,
-        staysActiveInBackground: false,
-        shouldDuckAndroid: true,
+        staysActiveInBackground: true,
       });
 
-      const { recording } = await Audio.Recording.createAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY,
-      );
-      recordingRef.current = recording;
-      setState("recording");
-      startPulse();
-    } catch (e) {
-      setErrorMsg("Could not start recording");
-      setState("error");
-    }
-  };
+      const recording = new Audio.Recording();
+      await recording.prepareToRecordAsync({
+        android: {
+          extension: ".pcm",
+          outputFormat: Audio.AndroidOutputFormat.PCM_16BIT,
+          audioEncoder: Audio.AndroidAudioEncoder.DEFAULT,
+          sampleRate: SAMPLE_RATE,
+          numberOfChannels: 1,
+          bitRate: 256000,
+        },
+        ios: {
+          extension: ".caf",
+          audioQuality: Audio.IOSAudioQuality.HIGH,
+          sampleRate: SAMPLE_RATE,
+          numberOfChannels: 1,
+          bitRate: 256000,
+          linearPCMBitDepth: 16,
+          linearPCMIsBigEndian: false,
+          linearPCMIsFloat: false,
+        },
+        web: {},
+        isMeteringEnabled: true,
+      });
 
-  // ── Stop recording + send ─────────────────────────────────────────────────
-  const stopAndSend = async () => {
-    stopPulse();
+      await recording.startAsync();
+      recordingRef.current = recording;
+
+      // Poll metering + send audio chunks
+      const pollInterval = setInterval(async () => {
+        if (!recordingRef.current || !isMountedRef.current) {
+          clearInterval(pollInterval);
+          return;
+        }
+
+        const status = await recordingRef.current.getStatusAsync();
+        if (!status.isRecording) {
+          clearInterval(pollInterval);
+          return;
+        }
+
+        const db = status.metering ?? -160;
+
+        // Barge-in detection: user speaks while AI is talking
+        if (isAiSpeakingRef.current && db > SPEECH_DB_THRESHOLD) {
+          wsRef.current?.send("INTERRUPT");
+          await stopCurrentSound();
+          isAiSpeakingRef.current = false;
+          setCallState("user_speaking");
+          stopPulse();
+        }
+
+        // VAD silence detection
+        if (db < SILENCE_DB_THRESHOLD) {
+          if (!silenceTimerRef.current) {
+            silenceTimerRef.current = setTimeout(async () => {
+              // User has been silent — send VAD signal
+              if (wsRef.current?.readyState === WebSocket.OPEN) {
+                // Stop recording, read file, send PCM, restart recording
+                await flushAudioToServer();
+              }
+              silenceTimerRef.current = null;
+            }, SILENCE_DURATION_MS);
+          }
+        } else {
+          // Speech detected — cancel silence timer
+          if (silenceTimerRef.current) {
+            clearTimeout(silenceTimerRef.current);
+            silenceTimerRef.current = null;
+          }
+          if (!isAiSpeakingRef.current) {
+            setCallState("user_speaking");
+          }
+        }
+      }, RECORDING_INTERVAL_MS);
+
+      // Store interval ref for cleanup
+      (recordingRef.current as any)._pollInterval = pollInterval;
+    } catch (e) {
+      console.warn("[VoiceCall] startRecording error:", e);
+    }
+  }, [muted, stopCurrentSound, stopPulse]);
+
+  /**
+   * Stop recording, read the audio file as PCM bytes,
+   * send over WebSocket, then signal VAD_SILENCE.
+   */
+  const flushAudioToServer = useCallback(async () => {
     if (!recordingRef.current) return;
 
-    setState("processing");
+    const rec = recordingRef.current;
+    if ((rec as any)._pollInterval) {
+      clearInterval((rec as any)._pollInterval);
+    }
 
     try {
-      await recordingRef.current.stopAndUnloadAsync();
-      const uri = recordingRef.current.getURI();
+      await rec.stopAndUnloadAsync();
+      const uri = rec.getURI();
       recordingRef.current = null;
 
-      if (!uri) throw new Error("No recording URI");
+      if (uri && wsRef.current?.readyState === WebSocket.OPEN) {
+        // Read file as base64 then convert to ArrayBuffer
+        const response = await fetch(uri);
+        const arrayBuffer = await response.arrayBuffer();
 
-      await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
+        // Send audio bytes
+        wsRef.current.send(arrayBuffer);
+        // Signal end of speech
+        wsRef.current.send("VAD_SILENCE");
+      }
+    } catch (e) {
+      console.warn("[VoiceCall] flushAudioToServer error:", e);
+    }
 
-      // Build multipart form
-      const formData = new FormData();
-      formData.append("file", {
-        uri,
-        name: "voice.m4a",
-        type: "audio/m4a",
-      } as any);
-      formData.append("session_id", sessionId);
+    // Restart recording
+    if (isMountedRef.current && !muted) {
+      await startRecording();
+    }
+  }, [muted, startRecording]);
 
-      const res = await fetch(`${AI_URL}/voice`, {
-        method: "POST",
-        body: formData,
-        headers: { Accept: "audio/mpeg" },
-      });
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
+  useEffect(() => {
+    isMountedRef.current = true;
+    setupWebSocket();
 
-      if (!res.ok) {
-        let errMsg = "Voice processing failed";
-        try {
-          const body = await res.json();
-          errMsg = body?.detail?.message ?? errMsg;
-        } catch {}
-        throw new Error(errMsg);
+    return () => {
+      isMountedRef.current = false;
+      // Clean up
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      if (durationTimerRef.current) clearInterval(durationTimerRef.current);
+      pulseLoopRef.current?.stop();
+
+      if (recordingRef.current) {
+        if ((recordingRef.current as any)._pollInterval) {
+          clearInterval((recordingRef.current as any)._pollInterval);
+        }
+        recordingRef.current.stopAndUnloadAsync().catch(() => {});
+        recordingRef.current = null;
       }
 
-      // Read response headers for display
-      const userSaid = decodeURIComponent(
-        res.headers.get("X-Transcript") ?? "",
-      );
-      const aiSaid = decodeURIComponent(res.headers.get("X-Reply-Text") ?? "");
+      stopCurrentSound();
 
-      setTranscript(userSaid);
-      setReplyText(aiSaid);
-
-      // L1 memory cache
-      if (userSaid && aiSaid) {
-        const entry: CacheEntry = {
-          reply: aiSaid,
-          transcript: userSaid,
-          ts: Date.now(),
-        };
-        memCacheSet(userSaid, entry);
-        l2Set(userSaid, entry); // async, non-blocking
+      if (wsRef.current) {
+        wsRef.current.send("HANGUP");
+        wsRef.current.close();
+        wsRef.current = null;
       }
-
-      // Get audio bytes and play
-      const audioBytes = await res.arrayBuffer();
-      const base64Audio = _arrayBufferToBase64(audioBytes);
-      const audioUri = `data:audio/mpeg;base64,${base64Audio}`;
-
-      await cleanupSound();
-      const { sound } = await Audio.Sound.createAsync(
-        { uri: audioUri },
-        { shouldPlay: true, volume: 1.0 },
-        _onPlaybackStatus,
-      );
-      soundRef.current = sound;
-      setState("speaking");
-    } catch (e: any) {
-      console.warn("[VoiceCall] error:", e);
-      setErrorMsg(e?.message ?? "Something went wrong. Please try again.");
-      setState("error");
-    }
-  };
-
-  // ── Playback status ───────────────────────────────────────────────────────
-  const _onPlaybackStatus = useCallback((status: AVPlaybackStatus) => {
-    if (!status.isLoaded) return;
-    if (status.didJustFinish) {
-      setState("idle");
-      cleanupSound();
-    }
+    };
   }, []);
 
-  // ── Stop speaking ─────────────────────────────────────────────────────────
-  const stopSpeaking = async () => {
-    if (soundRef.current) {
-      try {
-        await soundRef.current.stopAsync();
-      } catch {}
-      await cleanupSound();
+  // Start mic once connected
+  useEffect(() => {
+    if (callState === "idle" && !recordingRef.current && !muted) {
+      startRecording();
     }
-    setState("idle");
+  }, [callState]);
+
+  // ── Mute toggle ────────────────────────────────────────────────────────────
+  const handleMute = useCallback(async () => {
+    setMuted((m) => {
+      const next = !m;
+      if (next) {
+        // Muting — stop recording
+        if (recordingRef.current) {
+          if ((recordingRef.current as any)._pollInterval) {
+            clearInterval((recordingRef.current as any)._pollInterval);
+          }
+          recordingRef.current.stopAndUnloadAsync().catch(() => {});
+          recordingRef.current = null;
+        }
+        if (silenceTimerRef.current) {
+          clearTimeout(silenceTimerRef.current);
+          silenceTimerRef.current = null;
+        }
+      }
+      return next;
+    });
+  }, []);
+
+  // Re-start recording when unmuted
+  useEffect(() => {
+    if (!muted && callState === "idle" && !recordingRef.current) {
+      startRecording();
+    }
+  }, [muted, callState]);
+
+  // ── Hang up ────────────────────────────────────────────────────────────────
+  const handleHangUp = useCallback(async () => {
+    if (recordingRef.current) {
+      if ((recordingRef.current as any)._pollInterval) {
+        clearInterval((recordingRef.current as any)._pollInterval);
+      }
+      await recordingRef.current.stopAndUnloadAsync().catch(() => {});
+      recordingRef.current = null;
+    }
+    await stopCurrentSound();
+    if (wsRef.current) {
+      try {
+        wsRef.current.send("HANGUP");
+      } catch {}
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    router.back();
+  }, [router, stopCurrentSound]);
+
+  // ── Format duration ────────────────────────────────────────────────────────
+  const formatDuration = (s: number) => {
+    const m = Math.floor(s / 60);
+    const sec = s % 60;
+    return `${m}:${sec.toString().padStart(2, "0")}`;
   };
 
-  // ── Mic button press ──────────────────────────────────────────────────────
-  const onMicPress = () => {
-    if (state === "idle" || state === "error") startRecording();
-    else if (state === "recording") stopAndSend();
-    else if (state === "speaking") stopSpeaking();
+  // ── Status label ───────────────────────────────────────────────────────────
+  const statusLabel = () => {
+    switch (callState) {
+      case "connecting":
+        return "Connecting…";
+      case "idle":
+        return "Listening…";
+      case "user_speaking":
+        return "Speaking…";
+      case "ai_speaking":
+        return "YPN AI is speaking";
+      case "error":
+        return errorMsg || "Error";
+    }
   };
 
-  // ── UI helpers ────────────────────────────────────────────────────────────
-  const micIcon: Record<ScreenState, keyof typeof Ionicons.glyphMap> = {
-    idle: "mic",
-    recording: "stop",
-    processing: "hourglass",
-    speaking: "volume-high",
-    error: "mic",
-  };
+  const STATUS_H =
+    Platform.OS === "android" ? (RNStatusBar.currentHeight ?? 24) : 0;
 
-  const statusLabel: Record<ScreenState, string> = {
-    idle: "Tap to speak",
-    recording: "Listening… tap to send",
-    processing: "Processing…",
-    speaking: "Speaking… tap to stop",
-    error: "Tap to try again",
-  };
-
-  const micBg =
-    state === "recording"
-      ? "#E91429"
-      : state === "speaking"
-        ? "#1DB954"
-        : state === "error"
-          ? "#333"
-          : "#1DB954";
-
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
-    <View
-      style={[s.root, { paddingTop: insets.top, paddingBottom: insets.bottom }]}
-    >
-      {/* Header */}
+    <View style={[s.root, { paddingTop: STATUS_H }]}>
+      {/* ── Header ── */}
       <View style={s.header}>
-        <TouchableOpacity onPress={() => router.back()} style={s.backBtn}>
-          <Ionicons name="chevron-down" size={28} color="#fff" />
-        </TouchableOpacity>
-        <Text style={s.headerTitle}>YPN AI Voice</Text>
-        <View style={{ width: 44 }} />
+        <Text style={s.headerTitle}>YPN AI</Text>
+        <Text style={s.headerDuration}>{formatDuration(callDuration)}</Text>
       </View>
 
-      {/* Centre display */}
-      <View style={s.centre}>
-        {/* Transcript bubble */}
-        {transcript.length > 0 && (
-          <View style={s.bubble}>
-            <Text style={s.bubbleLabel}>You said</Text>
-            <Text style={s.bubbleText}>{transcript}</Text>
-          </View>
-        )}
-
-        {/* AI reply bubble */}
-        {replyText.length > 0 && (
-          <View style={[s.bubble, s.bubbleAI]}>
-            <Text style={[s.bubbleLabel, { color: "#1DB954" }]}>YPN AI</Text>
-            <Text style={s.bubbleText}>{replyText}</Text>
-          </View>
-        )}
-
-        {/* Error */}
-        {state === "error" && errorMsg.length > 0 && (
-          <View style={s.errorBox}>
-            <Ionicons name="alert-circle-outline" size={18} color="#E91429" />
-            <Text style={s.errorText}>{errorMsg}</Text>
-          </View>
-        )}
-      </View>
-
-      {/* Status label */}
-      <Text style={s.statusLabel}>{statusLabel[state]}</Text>
-
-      {/* Mic button */}
-      <View style={s.micWrap}>
-        {/* Pulse ring — only while recording */}
-        {state === "recording" && (
-          <Animated.View
-            style={[s.pulseRing, { transform: [{ scale: pulseAnim }] }]}
-          />
-        )}
-
-        <TouchableOpacity
-          onPress={onMicPress}
-          disabled={state === "processing"}
-          activeOpacity={0.85}
-          style={[s.micBtn, { backgroundColor: micBg }]}
+      {/* ── Avatar area ── */}
+      <View style={s.avatarSection}>
+        <Animated.View
+          style={[
+            s.avatarRing,
+            {
+              transform: [{ scale: pulseAnim }],
+              borderColor:
+                callState === "ai_speaking"
+                  ? "#1DB954"
+                  : callState === "user_speaking"
+                    ? "#53BDEB"
+                    : "#333",
+            },
+          ]}
         >
-          {state === "processing" ? (
-            <ActivityIndicator size="large" color="#fff" />
-          ) : (
-            <Ionicons name={micIcon[state]} size={36} color="#fff" />
-          )}
+          <Animated.View
+            style={[
+              s.avatarRingInner,
+              {
+                transform: [{ scale: pulseAnim }],
+                backgroundColor:
+                  callState === "ai_speaking"
+                    ? "rgba(29,185,84,0.12)"
+                    : "rgba(255,255,255,0.04)",
+              },
+            ]}
+          >
+            <Image
+              source={require("../../assets/images/YPN.png")}
+              style={s.avatar}
+            />
+          </Animated.View>
+        </Animated.View>
+
+        <Text style={s.statusLabel}>{statusLabel()}</Text>
+
+        {callState === "user_speaking" && (
+          <Text style={s.listeningHint}>I'm listening…</Text>
+        )}
+      </View>
+
+      {/* ── Transcript scroll ── */}
+      <ScrollView
+        ref={scrollRef}
+        style={s.transcriptScroll}
+        contentContainerStyle={s.transcriptContent}
+        showsVerticalScrollIndicator={false}
+      >
+        {transcripts.length === 0 ? (
+          <Text style={s.transcriptPlaceholder}>
+            {callState === "connecting"
+              ? "Connecting to YPN AI…"
+              : "Say something to start the conversation"}
+          </Text>
+        ) : (
+          transcripts.map((t) => (
+            <View
+              key={t.id}
+              style={[
+                s.transcriptRow,
+                t.role === "user" ? s.transcriptUser : s.transcriptAI,
+              ]}
+            >
+              <View
+                style={[
+                  s.transcriptBubble,
+                  t.role === "user"
+                    ? s.transcriptBubbleUser
+                    : s.transcriptBubbleAI,
+                ]}
+              >
+                <Text style={s.transcriptLabel}>
+                  {t.role === "user" ? "You" : "YPN AI"}
+                </Text>
+                <Text style={s.transcriptText}>{t.text}</Text>
+              </View>
+            </View>
+          ))
+        )}
+      </ScrollView>
+
+      {/* ── Controls ── */}
+      <View style={s.controls}>
+        {/* Mute */}
+        <TouchableOpacity
+          style={[s.controlBtn, muted && s.controlBtnActive]}
+          onPress={handleMute}
+          activeOpacity={0.8}
+        >
+          <Ionicons
+            name={muted ? "mic-off" : "mic-outline"}
+            size={26}
+            color={muted ? "#000" : "#fff"}
+          />
+          <Text style={[s.controlLabel, muted && s.controlLabelActive]}>
+            {muted ? "Unmute" : "Mute"}
+          </Text>
         </TouchableOpacity>
+
+        {/* Hang up */}
+        <TouchableOpacity
+          style={s.hangUpBtn}
+          onPress={handleHangUp}
+          activeOpacity={0.8}
+        >
+          <Ionicons name="call" size={32} color="#fff" />
+        </TouchableOpacity>
+
+        {/* Speaker placeholder — always on for now */}
+        <View style={s.controlBtn}>
+          <Ionicons name="volume-high-outline" size={26} color="#fff" />
+          <Text style={s.controlLabel}>Speaker</Text>
+        </View>
       </View>
     </View>
   );
 }
 
-// ── Base64 helper (no external dep) ──────────────────────────────────────────
-function _arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  const chunk = 8192;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary);
-}
-
-// ── Styles ────────────────────────────────────────────────────────────────────
+// ── Styles ─────────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
   root: {
     flex: 1,
-    backgroundColor: "#000",
-    alignItems: "center",
+    backgroundColor: "#0B141A",
   },
+
   header: {
-    width: "100%",
-    flexDirection: "row",
     alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: "#111",
-  },
-  backBtn: {
-    width: 44,
-    height: 44,
-    justifyContent: "center",
-    alignItems: "center",
+    paddingVertical: 16,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: "#1F2C34",
   },
   headerTitle: {
     color: "#fff",
-    fontSize: 17,
-    fontWeight: "600",
-  },
-  centre: {
-    flex: 1,
-    width: "100%",
-    paddingHorizontal: 24,
-    paddingTop: 32,
-    gap: 16,
-  },
-  bubble: {
-    backgroundColor: "#111",
-    borderRadius: 18,
-    padding: 16,
-    borderWidth: 1,
-    borderColor: "#222",
-  },
-  bubbleAI: {
-    borderColor: "#1DB95430",
-    backgroundColor: "#0a1a0f",
-  },
-  bubbleLabel: {
-    color: "#555",
-    fontSize: 11,
-    fontWeight: "600",
-    marginBottom: 6,
+    fontSize: 18,
+    fontWeight: "700",
     letterSpacing: 0.5,
   },
-  bubbleText: {
-    color: "#E8E8E8",
-    fontSize: 16,
-    lineHeight: 24,
+  headerDuration: {
+    color: "#8696A0",
+    fontSize: 13,
+    marginTop: 2,
   },
-  errorBox: {
-    flexDirection: "row",
+
+  avatarSection: {
     alignItems: "center",
-    gap: 8,
-    backgroundColor: "#1a0000",
-    borderRadius: 12,
-    padding: 14,
-    borderWidth: 1,
-    borderColor: "#E9142930",
+    paddingTop: 32,
+    paddingBottom: 20,
   },
-  errorText: {
-    color: "#E91429",
-    fontSize: 14,
-    flex: 1,
+  avatarRing: {
+    width: 140,
+    height: 140,
+    borderRadius: 70,
+    borderWidth: 2,
+    justifyContent: "center",
+    alignItems: "center",
+    marginBottom: 16,
+  },
+  avatarRingInner: {
+    width: 124,
+    height: 124,
+    borderRadius: 62,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  avatar: {
+    width: 100,
+    height: 100,
+    borderRadius: 50,
   },
   statusLabel: {
-    color: "#555",
+    color: "#fff",
+    fontSize: 16,
+    fontWeight: "600",
+    letterSpacing: 0.3,
+  },
+  listeningHint: {
+    color: "#53BDEB",
+    fontSize: 13,
+    marginTop: 4,
+  },
+
+  transcriptScroll: {
+    flex: 1,
+    paddingHorizontal: 16,
+  },
+  transcriptContent: {
+    paddingVertical: 12,
+    gap: 8,
+  },
+  transcriptPlaceholder: {
+    color: "#3A4A54",
     fontSize: 14,
-    marginBottom: 24,
-    fontWeight: "500",
+    textAlign: "center",
+    marginTop: 20,
   },
-  micWrap: {
-    width: 120,
-    height: 120,
-    justifyContent: "center",
+  transcriptRow: {
+    flexDirection: "row",
+  },
+  transcriptUser: {
+    justifyContent: "flex-end",
+  },
+  transcriptAI: {
+    justifyContent: "flex-start",
+  },
+  transcriptBubble: {
+    maxWidth: "80%",
+    borderRadius: 12,
+    padding: 10,
+  },
+  transcriptBubbleUser: {
+    backgroundColor: "#005C4B",
+    borderBottomRightRadius: 3,
+  },
+  transcriptBubbleAI: {
+    backgroundColor: "#202C33",
+    borderBottomLeftRadius: 3,
+  },
+  transcriptLabel: {
+    color: "rgba(255,255,255,0.4)",
+    fontSize: 10,
+    fontWeight: "600",
+    marginBottom: 3,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  transcriptText: {
+    color: "#E9EDEF",
+    fontSize: 15,
+    lineHeight: 21,
+  },
+
+  controls: {
+    flexDirection: "row",
+    justifyContent: "space-around",
     alignItems: "center",
-    marginBottom: 40,
+    paddingVertical: 28,
+    paddingHorizontal: 24,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: "#1F2C34",
+    paddingBottom: 40,
+    backgroundColor: "#111B21",
   },
-  pulseRing: {
+  controlBtn: {
+    alignItems: "center",
+    gap: 6,
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    backgroundColor: "#202C33",
+    justifyContent: "center",
+  },
+  controlBtnActive: {
+    backgroundColor: "#fff",
+  },
+  controlLabel: {
+    color: "#8696A0",
+    fontSize: 11,
     position: "absolute",
-    width: 120,
-    height: 120,
-    borderRadius: 60,
-    backgroundColor: "rgba(233,20,41,0.15)",
-    borderWidth: 2,
-    borderColor: "rgba(233,20,41,0.4)",
+    bottom: -18,
   },
-  micBtn: {
-    width: 90,
-    height: 90,
-    borderRadius: 45,
+  controlLabelActive: {
+    color: "#000",
+  },
+  hangUpBtn: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    backgroundColor: "#E91429",
     justifyContent: "center",
     alignItems: "center",
-    shadowColor: "#1DB954",
+    shadowColor: "#E91429",
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.4,
-    shadowRadius: 12,
-    elevation: 10,
+    shadowRadius: 8,
+    elevation: 8,
   },
 });
