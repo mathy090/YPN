@@ -1,16 +1,14 @@
 # ypn-ai-service/main.py
 import os
 import json
-import wave
 import asyncio
 import hashlib
-import tempfile
 import io
 
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -28,9 +26,10 @@ MODEL = "command-r-plus-08-2024"
 SYSTEM_PROMPT = (
     "You are YPN AI, a warm and helpful assistant for Team YPN — "
     "a youth empowerment network based in Zimbabwe. "
-    "Be concise, helpful, and natural like ChatGPT. "
+    "Be concise, helpful, and natural. "
     "Avoid long explanations unless asked. "
-    "When responding in a voice call, keep replies short and conversational."
+    "When in a voice call, keep replies short and conversational — "
+    "two to three sentences maximum."
 )
 
 # ── In-memory text chat sessions (HTTP) ──────────────────────────────────────
@@ -46,7 +45,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Lazy-load heavy models (only when first voice call connects) ──────────────
+# ── Lazy-load heavy models ────────────────────────────────────────────────────
 _vosk_model = None
 _kokoro_pipeline = None
 
@@ -59,11 +58,10 @@ def get_vosk_model():
         if not os.path.exists(model_path):
             raise RuntimeError(
                 f"Vosk model not found at '{model_path}'. "
-                "Download from https://alphacephei.com/vosk/models "
-                "and set VOSK_MODEL_PATH env var."
+                "Run download_models.py or set VOSK_MODEL_PATH."
             )
         _vosk_model = Model(model_path)
-        print(f"[Vosk] Model loaded from {model_path}")
+        print(f"[Vosk] Model loaded from {model_path}", flush=True)
     return _vosk_model
 
 
@@ -76,14 +74,14 @@ def get_kokoro():
         if not os.path.exists(model_file):
             raise RuntimeError(
                 f"Kokoro model not found at '{model_file}'. "
-                "Download from https://github.com/thewh1teagle/kokoro-onnx/releases"
+                "Run download_models.py or set KOKORO_MODEL_PATH."
             )
         _kokoro_pipeline = Kokoro(model_file, voices_file)
-        print("[Kokoro] Pipeline loaded")
+        print("[Kokoro] Pipeline loaded", flush=True)
     return _kokoro_pipeline
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Shared helpers ────────────────────────────────────────────────────────────
 
 def trim_history(history, limit=6):
     return history[-limit:]
@@ -102,7 +100,6 @@ def cache_key(session_id, message, history):
 
 
 def cohere_reply(user_text: str, history: list) -> str:
-    """Single Cohere call, returns reply string. Used by both HTTP and WS."""
     response = co.chat(
         model=MODEL,
         messages=build_messages(history, user_text),
@@ -113,31 +110,26 @@ def cohere_reply(user_text: str, history: list) -> str:
 
 
 def synthesize_audio(text: str) -> bytes:
-    """
-    Convert text to WAV bytes using Kokoro ONNX (af_sky voice).
-    Returns raw WAV bytes suitable for streaming over WebSocket.
-    """
     kokoro = get_kokoro()
-    # af_sky = female voice, speed 1.0
-    samples, sample_rate = kokoro.create(text, voice="af_sky", speed=1.0, lang="en-us")
-
-    # Write to in-memory WAV
+    samples, sample_rate = kokoro.create(
+        text, voice="af_sky", speed=1.0, lang="en-us"
+    )
     buf = io.BytesIO()
     sf.write(buf, samples, sample_rate, format="WAV", subtype="PCM_16")
     buf.seek(0)
     return buf.read()
 
 
-# ── Existing HTTP endpoints (unchanged) ──────────────────────────────────────
-
-class ChatRequest(BaseModel):
-    message: str
-    session_id: str = "default"
-
+# ── Health / root ─────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
-    return {"status": "⚡ YPN AI"}
+    return {"status": "ok", "service": "YPN AI"}
+
+
+@app.head("/")
+async def root_head():
+    return Response(status_code=200)
 
 
 @app.get("/health")
@@ -148,6 +140,13 @@ async def health():
         "active_sessions": len(sessions),
         "cache_size": len(cache),
     }
+
+
+# ── Text chat (HTTP) ──────────────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str = "default"
 
 
 @app.post("/chat")
@@ -168,17 +167,18 @@ async def chat(req: ChatRequest):
         return {"reply": cache[key], "cached": True}
 
     try:
-        reply = cohere_reply(message, history)
-
+        reply = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: cohere_reply(message, history)
+        )
         sessions[session_id].append({"role": "user", "content": message})
         sessions[session_id].append({"role": "assistant", "content": reply})
         sessions[session_id] = sessions[session_id][-20:]
         cache[key] = reply
-
         return {"reply": reply, "cached": False}
 
     except Exception as e:
-        raise HTTPException(500, str(e))
+        print(f"[Chat] Error: {e}", flush=True)
+        raise HTTPException(500, "AI service error")
 
 
 @app.post("/chat/stream")
@@ -216,7 +216,8 @@ async def chat_stream(req: ChatRequest):
             sessions[session_id] = sessions[session_id][-20:]
 
         except Exception as e:
-            yield "⚠️ Error: " + str(e)
+            print(f"[ChatStream] Error: {e}", flush=True)
+            yield ""
 
     return StreamingResponse(generate(), media_type="text/plain")
 
@@ -229,116 +230,100 @@ async def clear_session(session_id: str):
 
 # ── WebSocket Voice Endpoint ──────────────────────────────────────────────────
 #
-# Protocol (client → server):
-#   Binary frames  : raw 16-bit PCM audio at 16000 Hz mono (chunks)
-#   Text frame "VAD_SILENCE" : user stopped speaking, process buffer
-#   Text frame "INTERRUPT"   : user started speaking, cancel AI playback
-#   Text frame "HANGUP"      : end call, close connection
+# Client → Server:
+#   bytes              : raw 16-bit PCM at 16000 Hz mono
+#   "VAD_SILENCE"      : user stopped speaking → transcribe + respond
+#   "INTERRUPT"        : barge-in → cancel AI speech
+#   "HANGUP"           : end call
 #
-# Protocol (server → client):
-#   Text  {"type":"transcript","text":"..."}  : what user said
-#   Text  {"type":"reply","text":"..."}       : AI text reply
-#   Text  {"type":"audio_start"}              : about to stream audio
-#   Binary frames                             : WAV audio chunks
-#   Text  {"type":"audio_end"}               : audio stream finished
-#   Text  {"type":"error","message":"..."}   : error occurred
+# Server → Client:
+#   {"type":"transcript","text":"..."}  STT result
+#   {"type":"reply","text":"..."}       AI text
+#   {"type":"audio_start"}             WAV stream begins
+#   bytes                              WAV chunks
+#   {"type":"audio_end"}               WAV stream done
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
-SAMPLE_RATE = 16000          # Vosk requires 16kHz
-SILENCE_RMS_THRESHOLD = 500  # RMS below this = silence (for server-side guard)
-AUDIO_CHUNK_SIZE = 4096      # bytes per WebSocket audio send chunk
+SAMPLE_RATE = 16000
+BARGE_IN_RMS = 800
+AUDIO_CHUNK_BYTES = 4096
 
 
 @app.websocket("/voice")
 async def voice_endpoint(websocket: WebSocket):
     await websocket.accept()
-    print("[Voice] Client connected")
+    print("[Voice] Client connected", flush=True)
 
-    # Load models (lazy, only on first connection)
     try:
         from vosk import KaldiRecognizer
         vosk_model = get_vosk_model()
         recognizer = KaldiRecognizer(vosk_model, SAMPLE_RATE)
-        recognizer.SetWords(True)
+        recognizer.SetWords(False)
+        print("[Voice] Models ready", flush=True)
     except Exception as e:
+        print(f"[Voice] Model load error: {e}", flush=True)
         await websocket.send_text(json.dumps({
             "type": "error",
-            "message": f"Model load failed: {str(e)}"
+            "message": "Voice service unavailable. Please try again later."
         }))
         await websocket.close()
         return
 
-    # Per-call state (no persistent memory — inline streaming only)
     audio_buffer = bytearray()
     is_ai_speaking = False
-    ai_speak_task: asyncio.Task | None = None
+    ai_task: asyncio.Task | None = None
 
-    async def stop_ai_speaking():
-        """Cancel ongoing AI audio stream immediately (barge-in)."""
-        nonlocal is_ai_speaking, ai_speak_task
-        if ai_speak_task and not ai_speak_task.done():
-            ai_speak_task.cancel()
+    async def cancel_ai():
+        nonlocal is_ai_speaking, ai_task
+        if ai_task and not ai_task.done():
+            ai_task.cancel()
             try:
-                await ai_speak_task
+                await ai_task
             except asyncio.CancelledError:
                 pass
         is_ai_speaking = False
-        ai_speak_task = None
+        ai_task = None
 
-    async def stream_ai_response(user_text: str):
-        """
-        Transcribe → Cohere → Kokoro → stream audio back.
-        Runs as a cancellable task so barge-in can stop it.
-        """
+    async def respond_to_user(user_text: str):
         nonlocal is_ai_speaking
         is_ai_speaking = True
-
         try:
-            # 1. Send transcript back so client can display it
             await websocket.send_text(json.dumps({
                 "type": "transcript",
                 "text": user_text
             }))
 
-            # 2. Get Cohere reply (no history — inline only)
             reply_text = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: cohere_reply(user_text, [])
+                None, lambda: cohere_reply(user_text, [])
             )
+            print(f"[Voice] Reply: {reply_text[:80]}", flush=True)
 
-            # 3. Send text reply so client displays it
             await websocket.send_text(json.dumps({
                 "type": "reply",
                 "text": reply_text
             }))
 
-            # 4. Synthesize speech
             await websocket.send_text(json.dumps({"type": "audio_start"}))
 
-            audio_bytes = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: synthesize_audio(reply_text)
+            wav_bytes = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: synthesize_audio(reply_text)
             )
 
-            # 5. Stream audio in chunks
-            for i in range(0, len(audio_bytes), AUDIO_CHUNK_SIZE):
-                chunk = audio_bytes[i:i + AUDIO_CHUNK_SIZE]
-                await websocket.send_bytes(chunk)
-                # Small yield so cancellation can happen between chunks
+            for i in range(0, len(wav_bytes), AUDIO_CHUNK_BYTES):
+                await websocket.send_bytes(wav_bytes[i:i + AUDIO_CHUNK_BYTES])
                 await asyncio.sleep(0)
 
             await websocket.send_text(json.dumps({"type": "audio_end"}))
 
         except asyncio.CancelledError:
-            # Barge-in — client interrupted, just stop cleanly
             await websocket.send_text(json.dumps({"type": "audio_end"}))
             raise
         except Exception as e:
-            print(f"[Voice] stream_ai_response error: {e}")
+            print(f"[Voice] respond_to_user error: {e}", flush=True)
             await websocket.send_text(json.dumps({
                 "type": "error",
-                "message": str(e)
+                "message": "Something went wrong. Please speak again."
             }))
         finally:
             is_ai_speaking = False
@@ -347,19 +332,15 @@ async def voice_endpoint(websocket: WebSocket):
         while True:
             message = await websocket.receive()
 
-            # ── Text control frames ───────────────────────────────────────
             if "text" in message:
-                control = message["text"].strip()
+                ctrl = message["text"].strip()
 
-                if control == "VAD_SILENCE":
-                    # User finished speaking — process buffered audio
+                if ctrl == "VAD_SILENCE":
                     if len(audio_buffer) < 3200:
-                        # Too short (< 0.1s at 16kHz 16-bit) — ignore
                         audio_buffer.clear()
                         recognizer.Reset()
                         continue
 
-                    # Run Vosk recognition on buffer
                     recognizer.AcceptWaveform(bytes(audio_buffer))
                     result = json.loads(recognizer.FinalResult())
                     user_text = result.get("text", "").strip()
@@ -367,68 +348,61 @@ async def voice_endpoint(websocket: WebSocket):
                     recognizer.Reset()
 
                     if not user_text:
-                        # Nothing recognised — don't send empty to Cohere
                         continue
 
-                    # Stop any ongoing AI speech before responding
-                    await stop_ai_speaking()
+                    print(f"[Voice] Transcribed: '{user_text}'", flush=True)
+                    await cancel_ai()
+                    ai_task = asyncio.create_task(respond_to_user(user_text))
 
-                    # Start AI response as cancellable task
-                    ai_speak_task = asyncio.create_task(
-                        stream_ai_response(user_text)
-                    )
-
-                elif control == "INTERRUPT":
-                    # User started speaking — stop AI immediately
-                    await stop_ai_speaking()
+                elif ctrl == "INTERRUPT":
+                    print("[Voice] Barge-in", flush=True)
+                    await cancel_ai()
                     audio_buffer.clear()
                     recognizer.Reset()
 
-                elif control == "HANGUP":
-                    await stop_ai_speaking()
+                elif ctrl == "HANGUP":
+                    print("[Voice] Hangup", flush=True)
+                    await cancel_ai()
                     break
 
-            # ── Binary audio frames ───────────────────────────────────────
             elif "bytes" in message:
                 raw = message["bytes"]
-                if raw:
-                    # If AI is speaking and user sends audio → barge-in check
-                    # Client handles VAD and sends INTERRUPT — but as a guard,
-                    # check RMS here too
-                    if is_ai_speaking:
-                        pcm = np.frombuffer(raw, dtype=np.int16)
-                        rms = int(np.sqrt(np.mean(pcm.astype(np.float32) ** 2)))
-                        if rms > SILENCE_RMS_THRESHOLD * 2:
-                            await stop_ai_speaking()
-                            audio_buffer.clear()
-                            recognizer.Reset()
+                if not raw:
+                    continue
 
-                    audio_buffer.extend(raw)
-                    # Feed to Vosk incrementally for partial results
-                    if recognizer.AcceptWaveform(raw):
-                        pass  # partial results ignored — we use FinalResult on VAD_SILENCE
+                if is_ai_speaking:
+                    pcm = np.frombuffer(raw, dtype=np.int16)
+                    rms = int(np.sqrt(np.mean(pcm.astype(np.float32) ** 2)))
+                    if rms > BARGE_IN_RMS:
+                        print("[Voice] Server barge-in detected", flush=True)
+                        await cancel_ai()
+                        audio_buffer.clear()
+                        recognizer.Reset()
+
+                audio_buffer.extend(raw)
+                recognizer.AcceptWaveform(raw)
 
     except WebSocketDisconnect:
-        print("[Voice] Client disconnected")
+        print("[Voice] Client disconnected", flush=True)
     except Exception as e:
-        print(f"[Voice] Unexpected error: {e}")
+        print(f"[Voice] Unexpected error: {e}", flush=True)
     finally:
-        await stop_ai_speaking()
-        print("[Voice] Connection closed")
+        await cancel_ai()
+        print("[Voice] Connection closed", flush=True)
 
 
 # ── Background cache cleanup ──────────────────────────────────────────────────
 
-async def cleanup_cache():
+async def _cleanup_cache():
     while True:
         await asyncio.sleep(600)
         cache.clear()
-        print("🧹 Cache cleared")
+        print("🧹 Cache cleared", flush=True)
 
 
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(cleanup_cache())
+    asyncio.create_task(_cleanup_cache())
 
 
 if __name__ == "__main__":

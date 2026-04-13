@@ -559,7 +559,7 @@ export default function TeamYPNScreen() {
               style={s.headerIcon}
             />
             <TouchableOpacity
-              onPress={() => router.push("/voice")}
+              onPress={() => router.push("/voice-call")}
               hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
               activeOpacity={0.7}
             >
