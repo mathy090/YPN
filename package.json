@@ -1,7 +1,7 @@
 {
   "name": "ypn",
   "main": "expo-router/entry",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "scripts": {
     "start": "expo start",
     "reset-project": "node ./scripts/reset-project.js",
@@ -20,6 +20,7 @@
     "expo-background-fetch": "~14.0.9",
     "expo-blur": "~15.0.8",
     "expo-crypto": "~15.0.8",
+    "expo-dev-client": "~6.0.20",
     "expo-file-system": "~19.0.21",
     "expo-image-picker": "~17.0.10",
     "expo-linear-gradient": "~15.0.8",
