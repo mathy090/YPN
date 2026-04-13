@@ -36,9 +36,7 @@
         "NSMicrophoneUsageDescription": "YPN needs microphone access to record your voice messages.",
         "NSLocationWhenInUseUsageDescription": "YPN needs your location to provide local context.",
         "NSLocationAlwaysAndWhenInUseUsageDescription": "YPN needs your location for background features.",
-        "UIBackgroundModes": [
-          "remote-notification"
-        ]
+        "UIBackgroundModes": ["remote-notification"]
       }
     },
     "plugins": [
@@ -78,9 +76,7 @@
         {
           "icon": "./assets/images/notification-icon.png",
           "color": "#E6F4FE",
-          "sounds": [
-            "./assets/notification-sound.wav"
-          ]
+          "sounds": ["./assets/notification_sound.wav"]
         }
       ],
       "expo-asset"
