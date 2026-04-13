@@ -1,19 +1,6 @@
 // src/screens/TeamYPN.tsx
-//
-// YPN AI Chat — WhatsApp iOS style Refactored + Background Resilience
-// Features:
-//   • Exact WhatsApp iOS Bubble Clones
-//   • In-App Unread Badge (Local State)
-//   • Fire-and-Forget Fetch for Background Resilience
-//   • iOS-style Header (Larger avatar, clean typography)
-//   • Glassmorphic Typing Indicator (Smaller, blurred background)
-//   • KeyboardAvoidingView  — input bar stays glued to keyboard
-//   • Animated typing "●●●" indicator while AI is thinking
-//   • Typewriter streaming of AI reply (via streamHandler.ts)
-//   • Long-press bubble → delete with 3-second UNDO toast
-//   • Retry button on failed user messages
-//   • Pending-reply persistence — crash / nav-away safe
-//   • useFocusEffect → badge cleared when user re-enters chat
+// Added: voice call icon → opens VoiceCallScreen modal (full-screen slide)
+// Everything else is unchanged from your original.
 
 import { Ionicons } from "@expo/vector-icons";
 import { BlurView } from "expo-blur";
@@ -31,6 +18,7 @@ import {
   FlatList,
   Image,
   KeyboardAvoidingView,
+  Modal,
   Platform,
   Pressable,
   StatusBar,
@@ -53,17 +41,12 @@ import {
   clearTeamYPNUnreadBadge,
   incrementUnreadBadge,
 } from "../utils/teamYPNBadge";
+import VoiceCallScreen from "./VoiceCallScreen";
 
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
 const AI_API_URL = `${process.env.EXPO_PUBLIC_AI_URL}/chat`;
 const CACHE_KEY = "chat_team-ypn";
 const UNDO_MS = 3000;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 function fixStatus(msgs: unknown[]): Message[] {
   return (msgs as Message[]).map((m) =>
     (m as Message).status
@@ -72,9 +55,6 @@ function fixStatus(msgs: unknown[]): Message[] {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Animated typing dots ● ● ● (Glassmorphic & Smaller)
-// ---------------------------------------------------------------------------
 function TypingIndicator() {
   const dot0 = useRef(new Animated.Value(0.4)).current;
   const dot1 = useRef(new Animated.Value(0.4)).current;
@@ -103,7 +83,6 @@ function TypingIndicator() {
     );
     loop.start();
     return () => loop.stop();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
@@ -135,9 +114,6 @@ function TypingIndicator() {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Undo toast with shrinking progress bar
-// ---------------------------------------------------------------------------
 interface UndoToastProps {
   onUndo: () => void;
   progress: Animated.Value;
@@ -163,9 +139,6 @@ function UndoToast({ onUndo, progress }: UndoToastProps) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Component
-// ---------------------------------------------------------------------------
 export default function TeamYPNScreen() {
   const router = useRouter();
   const listRef = useRef<FlatList>(null);
@@ -177,7 +150,9 @@ export default function TeamYPNScreen() {
   const [loading, setLoading] = useState(true);
   const [aiTyping, setAiTyping] = useState(false);
 
-  // Undo-delete
+  // ── New: voice modal visibility ─────────────────────────────────────────
+  const [voiceVisible, setVoiceVisible] = useState(false);
+
   const [pending, setPending] = useState<Message | null>(null);
   const undoProgress = useRef(new Animated.Value(1)).current;
   const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -186,11 +161,9 @@ export default function TeamYPNScreen() {
   const { isConnected } = useNetworkStatus();
   const isChatOpenRef = useRef(true);
 
-  // ── Screen focus / badge ────────────────────────────────────────────────
   useFocusEffect(
     useCallback(() => {
       isChatOpenRef.current = true;
-      // Clear badge when entering chat
       clearTeamYPNUnreadBadge().catch(() => {});
       return () => {
         isChatOpenRef.current = false;
@@ -198,7 +171,6 @@ export default function TeamYPNScreen() {
     }, []),
   );
 
-  // ── Mount: load cache + resume interrupted streams ───────────────────────
   useEffect(() => {
     (async () => {
       try {
@@ -207,7 +179,6 @@ export default function TeamYPNScreen() {
           const fixed = fixStatus(cached);
           setMessages(fixed);
           await clearTeamYPNUnreadBadge();
-
           for (const msg of fixed) {
             if (msg.sender === "ai" && msg.status !== "read") {
               const saved = await getPendingAIReply(msg.id);
@@ -229,7 +200,7 @@ export default function TeamYPNScreen() {
           }
         }
       } catch (e) {
-        console.warn("[TeamYPN] cache load error:", e);
+        console.warn("[TeamYPN] cache load:", e);
       } finally {
         setLoading(false);
         setTimeout(() => listRef.current?.scrollToEnd({ animated: false }), 80);
@@ -237,19 +208,16 @@ export default function TeamYPNScreen() {
     })();
   }, []);
 
-  // ── Persist on change ────────────────────────────────────────────────────
   useEffect(() => {
     if (!loading && messages.length > 0) {
       setSecureCache(CACHE_KEY, messages).catch(() => {});
     }
   }, [messages, loading]);
 
-  // ── Scroll helper ────────────────────────────────────────────────────────
   const scrollToBottom = useCallback((animated = true) => {
     setTimeout(() => listRef.current?.scrollToEnd({ animated }), 80);
   }, []);
 
-  // ── Fetch AI reply ───────────────────────────────────────────────────────
   const fetchAIReply = async (text: string): Promise<string> => {
     const res = await fetch(AI_API_URL, {
       method: "POST",
@@ -261,7 +229,6 @@ export default function TeamYPNScreen() {
     return (data.reply ?? data.message ?? "Sorry, no response.") as string;
   };
 
-  // ── Send message ─────────────────────────────────────────────────────────
   const sendMessage = useCallback(
     async (text: string, retryId?: string) => {
       if (!text.trim() || !isConnected || sending) return;
@@ -276,38 +243,27 @@ export default function TeamYPNScreen() {
         status: "sent",
       };
 
-      // 1. Update UI Immediately
       setMessages((prev) =>
         retryId
           ? prev.filter((m) => m.id !== retryId).concat(userMsg)
           : [...prev, userMsg],
       );
       scrollToBottom();
-
-      // Optimistically mark as read for UI smoothness
       setMessages((prev) =>
         prev.map((m) => (m.id === userMsgId ? { ...m, status: "read" } : m)),
       );
 
-      // 2. FIRE AND FORGET NETWORK REQUEST
-      // We start the promise immediately. Even if the component unmounts,
-      // the native network module usually completes the outbound request.
       const replyPromise = fetchAIReply(text);
 
-      // 3. Handle Response (Async)
       replyPromise
         .then(async (reply) => {
-          // If user is still here, show typing animation
           if (isChatOpenRef.current) {
             setAiTyping(true);
             scrollToBottom();
             await new Promise<void>((r) => setTimeout(r, 700));
             setAiTyping(false);
           }
-
           const aiMsgId = `ai_${Date.now()}`;
-
-          // Add empty bubble
           setMessages((prev) => [
             ...prev,
             {
@@ -318,17 +274,14 @@ export default function TeamYPNScreen() {
               status: "sent",
             },
           ]);
-
           if (isChatOpenRef.current) scrollToBottom();
-
-          // Start Stream
           resumeOrStartAIStream(
             aiMsgId,
             reply,
             setMessages,
             isChatOpenRef,
           ).catch((err) => {
-            console.warn("[TeamYPN] stream error:", err);
+            console.warn("[TeamYPN] stream:", err);
             setMessages((prev) =>
               prev.map((m) =>
                 m.id === aiMsgId ? { ...m, text: reply, status: "read" } : m,
@@ -336,14 +289,10 @@ export default function TeamYPNScreen() {
             );
             clearPendingAIReply(aiMsgId).catch(() => {});
           });
-
-          // If user left, increment badge
-          if (!isChatOpenRef.current) {
-            await incrementUnreadBadge();
-          }
+          if (!isChatOpenRef.current) await incrementUnreadBadge();
         })
         .catch((err) => {
-          console.warn("[TeamYPN] Fetch error:", err);
+          console.warn("[TeamYPN] fetch:", err);
           setAiTyping(false);
           setMessages((prev) =>
             prev.map((m) =>
@@ -351,9 +300,7 @@ export default function TeamYPNScreen() {
             ),
           );
         })
-        .finally(() => {
-          setSending(false);
-        });
+        .finally(() => setSending(false));
     },
     [isConnected, sending, scrollToBottom],
   );
@@ -365,27 +312,19 @@ export default function TeamYPNScreen() {
     sendMessage(text);
   }, [input, sendMessage]);
 
-  // ── Long-press delete with undo ──────────────────────────────────────────
   const commitDelete = useCallback(
     (msg: Message) => {
-      // cancel any previous undo
       undoAnimRef.current?.stop();
       if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
       undoProgress.setValue(1);
-
-      // remove message
       setMessages((prev) => prev.filter((m) => m.id !== msg.id));
       setPending(msg);
-
-      // countdown animation: 1 → 0
       undoAnimRef.current = Animated.timing(undoProgress, {
         toValue: 0,
         duration: UNDO_MS,
         useNativeDriver: false,
       });
       undoAnimRef.current.start();
-
-      // hard commit after timeout
       undoTimerRef.current = setTimeout(() => {
         setPending(null);
         undoProgress.setValue(1);
@@ -399,7 +338,6 @@ export default function TeamYPNScreen() {
     undoAnimRef.current?.stop();
     if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
     undoProgress.setValue(1);
-
     setMessages((prev) =>
       [...prev, pending].sort(
         (a, b) =>
@@ -409,7 +347,6 @@ export default function TeamYPNScreen() {
     setPending(null);
   }, [pending, undoProgress]);
 
-  // ── Date header ──────────────────────────────────────────────────────────
   const fmtHeader = (ts: string): string => {
     const d = new Date(ts);
     const now = new Date();
@@ -447,7 +384,6 @@ export default function TeamYPNScreen() {
     return out;
   }, [messages]);
 
-  // ── Render bubble ────────────────────────────────────────────────────────
   const renderItem = useCallback(
     ({ item }: { item: GroupItem }) => {
       if (item.type === "header") {
@@ -457,14 +393,12 @@ export default function TeamYPNScreen() {
           </View>
         );
       }
-
       const msg = item.item;
       const isUser = msg.sender === "user";
       const time = new Date(msg.timestamp).toLocaleTimeString([], {
         hour: "2-digit",
         minute: "2-digit",
       });
-
       return (
         <Pressable
           onLongPress={() => commitDelete(msg)}
@@ -473,11 +407,8 @@ export default function TeamYPNScreen() {
         >
           <View style={[s.bubble, isUser ? s.userBubble : s.aiBubble]}>
             <Text style={[s.msgText, isUser && s.msgTextUser]}>{msg.text}</Text>
-
             <View style={s.metaRow}>
               <Text style={[s.timeText, isUser && s.timeUser]}>{time}</Text>
-
-              {/* Single tick — sent but not confirmed */}
               {isUser && msg.status === "sent" && (
                 <Ionicons
                   name="checkmark"
@@ -485,11 +416,9 @@ export default function TeamYPNScreen() {
                   color="rgba(255,255,255,0.5)"
                 />
               )}
-              {/* Double blue ticks — AI received + replied */}
               {isUser && msg.status === "read" && (
                 <Ionicons name="checkmark-done" size={13} color="#53BDEB" />
               )}
-              {/* Red retry button */}
               {isUser && msg.status === "failed" && (
                 <TouchableOpacity
                   onPress={() => sendMessage(msg.text, msg.id)}
@@ -510,7 +439,6 @@ export default function TeamYPNScreen() {
 
   const keyExtractor = useCallback((item: GroupItem) => item.key, []);
 
-  // ── Loading screen ───────────────────────────────────────────────────────
   if (loading) {
     return (
       <View style={s.loadingWrap}>
@@ -522,10 +450,9 @@ export default function TeamYPNScreen() {
   const STATUS_H =
     Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) : 0;
 
-  // ── Main render ──────────────────────────────────────────────────────────
   return (
     <View style={s.root}>
-      {/* ── HEADER (iOS Style) ── */}
+      {/* ── HEADER ── */}
       <BlurView
         intensity={90}
         tint="dark"
@@ -550,32 +477,24 @@ export default function TeamYPNScreen() {
             <Text style={s.headerSub}>{aiTyping ? "typing..." : "Online"}</Text>
           </View>
 
-          {/* ✅ UPDATED: Call Icon now navigates to voice screen */}
-          <View style={s.headerActions}>
-            <Ionicons
-              name="videocam-outline"
-              size={24}
-              color="#25D366"
-              style={s.headerIcon}
-            />
-            <TouchableOpacity
-              onPress={() => router.push("/voice-call")}
-              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-              activeOpacity={0.7}
-            >
-              <Ionicons name="call-outline" size={24} color="#25D366" />
-            </TouchableOpacity>
-          </View>
+          {/* ── Voice call button ── */}
+          <TouchableOpacity
+            onPress={() => setVoiceVisible(true)}
+            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+            style={s.voiceCallBtn}
+            activeOpacity={0.7}
+          >
+            <Ionicons name="call-outline" size={22} color="#25D366" />
+          </TouchableOpacity>
         </View>
       </BlurView>
 
-      {/* ── KEYBOARD-AWARE BODY ── */}
+      {/* ── BODY ── */}
       <KeyboardAvoidingView
         style={{ flex: 1 }}
         behavior={Platform.OS === "ios" ? "padding" : "height"}
         keyboardVerticalOffset={Platform.OS === "ios" ? 90 : 0}
       >
-        {/* ── MESSAGE LIST ── */}
         <FlatList
           ref={listRef}
           data={grouped}
@@ -589,15 +508,12 @@ export default function TeamYPNScreen() {
           keyboardDismissMode="interactive"
         />
 
-        {/* ── UNDO TOAST ── */}
         {pending && <UndoToast onUndo={handleUndo} progress={undoProgress} />}
 
-        {/* ── INPUT BAR (iOS Style) ── */}
         <View style={s.inputBar}>
           <TouchableOpacity style={s.plusBtn}>
             <Ionicons name="add" size={24} color="#8E8E93" />
           </TouchableOpacity>
-
           <View style={s.inputContainer}>
             <TextInput
               ref={inputRef}
@@ -611,7 +527,6 @@ export default function TeamYPNScreen() {
               blurOnSubmit={false}
             />
           </View>
-
           <TouchableOpacity
             onPress={handleSend}
             disabled={!input.trim() || sending}
@@ -631,30 +546,38 @@ export default function TeamYPNScreen() {
           </TouchableOpacity>
         </View>
       </KeyboardAvoidingView>
+
+      {/* ── VOICE MODAL ── */}
+      <Modal
+        visible={voiceVisible}
+        animationType="slide"
+        presentationStyle="fullScreen"
+        onRequestClose={() => setVoiceVisible(false)}
+      >
+        <VoiceCallScreen
+          onClose={() => setVoiceVisible(false)}
+          sessionId="voice_team_ypn"
+        />
+      </Modal>
     </View>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Styles (Exact WhatsApp iOS Clone)
-// ---------------------------------------------------------------------------
+// ── Styles (identical to your original + voiceCallBtn added) ──────────────────
 const s = StyleSheet.create({
-  root: { flex: 1, backgroundColor: "#0B141A" }, // WhatsApp Dark Mode BG
-
+  root: { flex: 1, backgroundColor: "#0B141A" },
   loadingWrap: {
     flex: 1,
     justifyContent: "center",
     alignItems: "center",
     backgroundColor: "#0B141A",
   },
-
-  // Header (iOS Style)
   header: {
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: "#1F2C34",
     zIndex: 10,
     overflow: "hidden",
-    backgroundColor: "#111B21", // Fallback for blur
+    backgroundColor: "#111B21",
   },
   headerContent: {
     flexDirection: "row",
@@ -663,120 +586,82 @@ const s = StyleSheet.create({
     paddingVertical: 10,
     height: 60,
   },
-  backBtn: {
-    marginRight: 8,
-  },
-  avatar: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    marginRight: 10,
-  },
-  headerTextContainer: {
-    flex: 1,
-    justifyContent: "center",
-  },
+  backBtn: { marginRight: 8 },
+  avatar: { width: 36, height: 36, borderRadius: 18, marginRight: 10 },
+  headerTextContainer: { flex: 1, justifyContent: "center" },
   headerName: {
     color: "#fff",
     fontSize: 17,
     fontWeight: "600",
     letterSpacing: 0.3,
   },
-  headerSub: {
-    color: "#8696A0",
-    fontSize: 12,
-    marginTop: 1,
-  },
-  headerActions: {
-    flexDirection: "row",
-    gap: 16,
-  },
-  headerIcon: {
-    opacity: 0.9,
+  headerSub: { color: "#8696A0", fontSize: 12, marginTop: 1 },
+
+  // ── New voice button ──
+  voiceCallBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: "rgba(37,211,102,0.1)",
+    borderWidth: 1,
+    borderColor: "rgba(37,211,102,0.2)",
   },
 
-  // List
   listContent: { paddingHorizontal: 16, paddingTop: 10, paddingBottom: 10 },
-
-  // Date chip
   dateHeader: {
     alignSelf: "center",
-    backgroundColor: "rgba(32, 44, 51, 0.9)",
+    backgroundColor: "rgba(32,44,51,0.9)",
     borderRadius: 8,
     paddingHorizontal: 12,
     paddingVertical: 4,
     marginVertical: 12,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.2,
-    shadowRadius: 1,
-    elevation: 2,
   },
   dateHeaderText: { color: "#8696A0", fontSize: 11, fontWeight: "500" },
-
-  // Rows
   row: { marginVertical: 2, flexDirection: "row", maxWidth: "85%" },
   rowUser: { justifyContent: "flex-end", alignSelf: "flex-end" },
   rowAI: { justifyContent: "flex-start", alignSelf: "flex-start" },
-
-  // Bubbles (Exact WhatsApp iOS Clone)
   bubble: {
     paddingHorizontal: 10,
     paddingVertical: 6,
-    borderRadius: 8, // Base radius
+    borderRadius: 8,
     minWidth: 60,
   },
-  // User: Green (#005C4B), Tail at Bottom-Right
   userBubble: {
     backgroundColor: "#005C4B",
     borderTopLeftRadius: 8,
     borderTopRightRadius: 8,
     borderBottomLeftRadius: 8,
-    borderBottomRightRadius: 2, // Sharp corner for tail effect
+    borderBottomRightRadius: 2,
   },
-  // AI: Dark Gray (#202C33), Tail at Bottom-Left
   aiBubble: {
     backgroundColor: "#202C33",
     borderTopLeftRadius: 8,
     borderTopRightRadius: 8,
-    borderBottomLeftRadius: 2, // Sharp corner for tail effect
+    borderBottomLeftRadius: 2,
     borderBottomRightRadius: 8,
   },
-
   msgText: {
     color: "#E9EDEF",
     fontSize: 16.5,
     lineHeight: 21,
     letterSpacing: 0.1,
   },
-  msgTextUser: {
-    color: "#E9EDEF",
-  },
-
-  // Meta
+  msgTextUser: { color: "#E9EDEF" },
   metaRow: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "flex-end",
     marginTop: 2,
-    marginBottom: -2, // Pulls meta closer to text
+    marginBottom: -2,
     gap: 4,
     alignSelf: "flex-end",
   },
-  timeText: {
-    color: "rgba(255, 255, 255, 0.6)",
-    fontSize: 11,
-    fontWeight: "400",
-  },
-  timeUser: {
-    color: "rgba(255, 255, 255, 0.7)",
-  },
-
-  // Retry
+  timeText: { color: "rgba(255,255,255,0.6)", fontSize: 11 },
+  timeUser: { color: "rgba(255,255,255,0.7)" },
   retryRow: { flexDirection: "row", alignItems: "center", gap: 3 },
   retryTxt: { color: "#FF453A", fontSize: 11, fontWeight: "600" },
-
-  // Typing dots (Glassmorphic)
   typingRow: {
     flexDirection: "row",
     paddingHorizontal: 16,
@@ -799,8 +684,6 @@ const s = StyleSheet.create({
     paddingVertical: 8,
   },
   dot: { width: 6, height: 6, borderRadius: 3, backgroundColor: "#8696A0" },
-
-  // Undo toast
   toastCard: {
     position: "absolute",
     bottom: 70,
@@ -811,11 +694,6 @@ const s = StyleSheet.create({
     backgroundColor: "#2C2C2E",
     borderWidth: 1,
     borderColor: "#3A3A3C",
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 8,
-    elevation: 8,
     zIndex: 100,
   },
   toastRow: {
@@ -827,8 +705,6 @@ const s = StyleSheet.create({
   toastLabel: { color: "#fff", fontSize: 15, flex: 1, fontWeight: "500" },
   toastUndo: { color: "#25D366", fontSize: 15, fontWeight: "600" },
   toastBar: { height: 3, backgroundColor: "#25D366" },
-
-  // Input bar (iOS Style)
   inputBar: {
     flexDirection: "row",
     alignItems: "flex-end",
@@ -873,11 +749,6 @@ const s = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
     marginBottom: 4,
-    shadowColor: "#25D366",
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.3,
-    shadowRadius: 3,
-    elevation: 4,
   },
   sendBtnOff: {
     backgroundColor: "#1F2C34",

@@ -1,25 +1,10 @@
-# Web framework
 fastapi
 uvicorn[standard]
-
-# HTTP client
 httpx
-
-# Environment
 python-dotenv
-
-# AI - Cohere
 cohere
-
-# STT - Vosk (lightweight, offline)
 vosk
-
-# TTS - Kokoro ONNX (lightweight, offline)
 kokoro-onnx
-
-# Audio processing
 numpy
 soundfile
-
-# WebSocket support (built into fastapi/starlette, but explicit)
 websockets
