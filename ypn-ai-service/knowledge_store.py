@@ -1,13 +1,21 @@
-from retrievers.google import search_google
-from retrievers.web import fetch_page_text
-from sources import TRUSTED_QUERY_PREFIX
+_store = {}
 
-def collect_knowledge(user_query: str) -> str:
-    query = f"{TRUSTED_QUERY_PREFIX} {user_query}"
-    links = search_google(query)
 
-    combined_text = ""
-    for link in links:
-        combined_text += fetch_page_text(link)
+def add_document(doc_id: str, text: str):
+    _store[doc_id] = text
 
-    return combined_text.strip()
+
+def get_all():
+    return _store
+
+
+def search(query: str):
+    results = []
+    for k, v in _store.items():
+        if query.lower() in v.lower():
+            results.append({"id": k, "text": v})
+    return results
+
+
+def reset_store():
+    _store.clear()

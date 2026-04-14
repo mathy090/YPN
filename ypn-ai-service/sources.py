@@ -14,3 +14,12 @@ GOOGLE_TOPICS = [
     "Youth empowerment programs Zimbabwe",
     "Counselling support for young people"
 ]
+SUPPORTED_MENTAL_HEALTH_TOPICS = [
+    "cognitive behavioral therapy (CBT)",
+    "breathing techniques",
+    "grounding exercises",
+    "stress management",
+    "sleep hygiene",
+    "mindfulness practices",
+    "anxiety coping strategies"
+]
