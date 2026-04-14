@@ -1,166 +1,222 @@
-# ypn-ai-service/main.py
+# main.py
+# FastAPI WebSocket + HTTP API with:
+# - Redis (double cache: request/response + session cache)
+# - Supabase (persistent memory)
+# - Firebase Admin (JWT verification)
+# - Streaming AI responses
+
 import os
 import json
 import asyncio
-import cohere
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from typing import Optional
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
 
-load_dotenv()
+import redis
+import httpx
 
-# ── Configuration ──────────────────────────────────────────────────────────────
-COHERE_API_KEY = os.getenv("COHERE_API_KEY")
-if not COHERE_API_KEY:
-    raise RuntimeError("COHERE_API_KEY missing")
+# Supabase
+from supabase import create_client, Client
 
-co = cohere.ClientV2(api_key=COHERE_API_KEY)
-MODEL = "command-r-plus-08-2024"
+# Firebase Admin
+import firebase_admin
+from firebase_admin import credentials, auth
 
-SYSTEM_PROMPT = (
-    "You are YPN AI, a warm assistant for Team YPN (Zimbabwe). "
-    "Be concise, helpful, and natural. Keep replies short (2-3 sentences). "
-    "Treat every user input as a standalone question; do not reference past conversations."
+# ─────────────────────────────────────────────
+# ENV
+# ─────────────────────────────────────────────
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+AI_API_URL = os.getenv("AI_API_URL")
+AI_API_KEY = os.getenv("AI_API_KEY")
+
+# Firebase
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID")
+FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL")
+FIREBASE_PRIVATE_KEY = os.getenv("FIREBASE_PRIVATE_KEY")
+
+# ─────────────────────────────────────────────
+# INIT
+# ─────────────────────────────────────────────
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-app = FastAPI(title="YPN AI Stateless WS")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# Redis (double cache)
+redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
-# ── Lazy Load Vosk (Only loaded once per worker) ─────────────────────────────
-_vosk_model = None
-def get_vosk():
-    global _vosk_model
-    if _vosk_model is None:
-        from vosk import Model
-        path = os.getenv("VOSK_MODEL_PATH", "vosk-model-small-en-us-0.15")
-        print(f"[Vosk] Loading model from {path}...")
-        _vosk_model = Model(path)
-        print("[Vosk] Model loaded.")
-    return _vosk_model
+# Supabase
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ── Helper: Get Reply (STATELESS - No History) ───────────────────────────────
-def get_reply(text: str) -> str:
-    # Only System Prompt + Current User Message. No history list.
-    msgs = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": text}
-    ]
-    
+# Firebase init
+firebase_admin.initialize_app(
+    credentials.Certificate({
+        "type": "service_account",
+        "project_id": FIREBASE_PROJECT_ID,
+        "private_key": FIREBASE_PRIVATE_KEY.replace("\\n", "\n"),
+        "client_email": FIREBASE_CLIENT_EMAIL,
+        "token_uri": "https://oauth2.googleapis.com/token",
+    })
+)
+
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+def verify_token(token: str):
     try:
-        resp = co.chat(model=MODEL, messages=msgs, max_tokens=150, temperature=0.7)
-        return resp.message.content[0].text.strip()
-    except Exception as e:
-        print(f"Cohere Error: {e}")
-        return "I'm having trouble thinking right now."
+        decoded = auth.verify_id_token(token)
+        return decoded
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-# ── Health Check ──────────────────────────────────────────────────────────────
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok", 
-        "vosk_ready": get_vosk() is not None, 
-        "mode": "Stateless WebSocket (No History)"
+
+def redis_session_key(session_id: str):
+    return f"session:{session_id}"
+
+
+def redis_response_key(text: str):
+    return f"resp:{hash(text)}"
+
+
+async def load_session(session_id: str):
+    cached = redis_client.get(redis_session_key(session_id))
+    if cached:
+        return json.loads(cached)
+
+    res = supabase.table("chat_sessions").select("*").eq("session_id", session_id).execute()
+
+    if res.data:
+        data = res.data[0]
+        redis_client.set(redis_session_key(session_id), json.dumps(data), ex=3600)
+        return data
+
+    new_data = {
+        "session_id": session_id,
+        "messages": [],
+        "emotion_state": "neutral"
     }
 
-# ── Unified WebSocket Endpoint ───────────────────────────────────────────────
-@app.websocket("/voice")
-async def hybrid_ws(websocket: WebSocket):
-    await websocket.accept()
-    print("[WS] Client connected (Stateless Mode).")
-    
-    # Initialize Vosk for this connection
-    model = get_vosk()
-    from vosk import KaldiRecognizer
-    rec = KaldiRecognizer(model, 16000) 
-    
-    is_processing = False
-    
+    supabase.table("chat_sessions").insert(new_data).execute()
+    redis_client.set(redis_session_key(session_id), json.dumps(new_data), ex=3600)
+
+    return new_data
+
+
+async def save_session(session_id: str, data: dict):
+    redis_client.set(redis_session_key(session_id), json.dumps(data), ex=3600)
+
+    supabase.table("chat_sessions").upsert(data).execute()
+
+
+# ─────────────────────────────────────────────
+# AI STREAM (WITH CACHE)
+# ─────────────────────────────────────────────
+async def stream_ai(text: str):
+    cache_key = redis_response_key(text)
+
+    cached = redis_client.get(cache_key)
+    if cached:
+        for token in cached.split():
+            yield token + " "
+        return
+
+    # Replace with real AI API call
+    response = f"I understand. Let's take this step by step."
+
+    redis_client.set(cache_key, response, ex=600)
+
+    for token in response.split():
+        await asyncio.sleep(0.05)
+        yield token + " "
+
+
+# ─────────────────────────────────────────────
+# HTTP ENDPOINT (fallback)
+# ─────────────────────────────────────────────
+@app.post("/chat")
+async def chat(request: Request):
+    body = await request.json()
+
+    token = body.get("token")
+    message = body.get("message")
+    session_id = body.get("session_id")
+
+    verify_token(token)
+
+    session = await load_session(session_id)
+
+    session["messages"].append({"role": "user", "content": message})
+
+    reply = ""
+    async for token in stream_ai(message):
+        reply += token
+
+    session["messages"].append({"role": "ai", "content": reply})
+
+    await save_session(session_id, session)
+
+    return {"reply": reply}
+
+
+# ─────────────────────────────────────────────
+# WEBSOCKET (REALTIME)
+# ─────────────────────────────────────────────
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+
     try:
         while True:
-            message = await websocket.receive()
-            
-            # ── CASE 1: BINARY AUDIO (Voice) ─────────────────────────────────
-            if "bytes" in message:
-                audio_data = message["bytes"]
-                
-                if rec.AcceptWaveform(audio_data):
-                    result = json.loads(rec.Result())
-                    current_transcript = result.get("text", "")
-                    
-                    if current_transcript and not is_processing:
-                        is_processing = True
-                        print(f"[Voice] Heard: {current_transcript}")
-                        
-                        # Send Transcript to Client
-                        await websocket.send_json({
-                            "type": "transcript_final",
-                            "text": current_transcript
-                        })
-                        
-                        # Get AI Reply (Stateless)
-                        loop = asyncio.get_event_loop()
-                        reply = await loop.run_in_executor(None, get_reply, current_transcript)
-                        
-                        print(f"[AI] Reply: {reply}")
-                        
-                        # Send Reply
-                        await websocket.send_json({
-                            "type": "reply",
-                            "text": reply
-                        })
-                        await websocket.send_json({"type": "done"})
-                        
-                        is_processing = False
-                        rec.Reset() # Reset for next sentence
-                
-                else:
-                    # Partial Result (Live Typing)
-                    partial = json.loads(rec.PartialResult())
-                    p_text = partial.get("partial", "")
-                    if p_text:
-                        await websocket.send_json({
-                            "type": "transcript_partial",
-                            "text": p_text
-                        })
+            data = await ws.receive_json()
 
-            # ── CASE 2: TEXT MESSAGE (Chat) ──────────────────────────────────
-            elif "text" in message:
-                try:
-                    data = json.loads(message["text"])
-                    
-                    if data.get("type") == "interrupt":
-                        is_processing = False
-                        rec.Reset()
-                        continue
-                    
-                    if data.get("type") == "chat":
-                        user_text = data.get("text", "").strip()
-                        if not user_text:
-                            continue
-                            
-                        print(f"[Text] Received: {user_text}")
-                        
-                        # Get AI Reply (Stateless)
-                        loop = asyncio.get_event_loop()
-                        reply = await loop.run_in_executor(None, get_reply, user_text)
-                        
-                        print(f"[AI] Reply: {reply}")
-                        
-                        await websocket.send_json({
-                            "type": "reply",
-                            "text": reply
-                        })
-                        await websocket.send_json({"type": "done"})
-                        
-                except json.JSONDecodeError:
-                    pass
+            token = data.get("token")
+            session_id = data.get("session_id")
+            msg_type = data.get("type")
+
+            verify_token(token)
+
+            session = await load_session(session_id)
+
+            if msg_type == "text":
+                user_text = data.get("message")
+
+                session["messages"].append({
+                    "role": "user",
+                    "content": user_text
+                })
+
+                await ws.send_json({"type": "state", "value": "THINKING"})
+
+                ai_text = ""
+
+                async for token in stream_ai(user_text):
+                    ai_text += token
+
+                    await ws.send_json({
+                        "type": "ai_token",
+                        "text": token
+                    })
+
+                session["messages"].append({
+                    "role": "ai",
+                    "content": ai_text
+                })
+
+                await save_session(session_id, session)
+
+                await ws.send_json({"type": "ai_done"})
+                await ws.send_json({"type": "state", "value": "LISTENING"})
+
+            elif msg_type == "interrupt":
+                await ws.send_json({"type": "state", "value": "LISTENING"})
 
     except WebSocketDisconnect:
-        print("[WS] Client disconnected.")
-    except Exception as e:
-        print(f"[WS] Error: {e}")
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+        pass
