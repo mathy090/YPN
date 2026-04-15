@@ -1,6 +1,4 @@
 // src/screens/TeamYPN.tsx
-// Refactored to call YPN Main.py (FastAPI) with Hybrid Auth
-
 import { Ionicons } from "@expo/vector-icons";
 import { BlurView } from "expo-blur";
 import { useFocusEffect, useRouter } from "expo-router";
@@ -45,6 +43,7 @@ import VoiceCallScreen from "./VoiceCallScreen";
 
 // 🔥 Point to your Python FastAPI Backend
 const AI_API_URL = `${process.env.EXPO_PUBLIC_AI_URL}/chat`;
+const HEARTBEAT_URL = `${process.env.EXPO_PUBLIC_AI_URL}/heartbeat`;
 const CACHE_KEY = "chat_team-ypn";
 const UNDO_MS = 3000;
 
@@ -219,22 +218,28 @@ export default function TeamYPNScreen() {
     setTimeout(() => listRef.current?.scrollToEnd({ animated }), 80);
   }, []);
 
-  // 🔥 Fetch AI with Hybrid Auth (Auto-refreshes Backend JWT)
+  // 🔥 Fetch AI with Heartbeat & Hybrid Auth
   const fetchAIReply = async (text: string): Promise<string> => {
     try {
-      // Get valid token (refreshes automatically if expired)
+      // 1. Get Valid Token (Refreshes if needed)
       const token = await getValidBackendToken();
 
+      // 2. Send Heartbeat to Main.py (Proof of Life)
+      await fetch(HEARTBEAT_URL, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      // 3. Send Message
       const res = await fetch(AI_API_URL, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`, // 🔥 Uses Backend JWT
+          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({ message: text }),
       });
 
-      // Handle 401 instantly: clear tokens + redirect
       if (res.status === 401) {
         await clearAllTokens();
         router.replace("/auth/otp");
@@ -250,7 +255,8 @@ export default function TeamYPNScreen() {
     } catch (err: any) {
       if (
         err.message === "NO_FIREBASE_TOKEN" ||
-        err.message === "REFRESH_FAILED"
+        err.message === "REFRESH_FAILED" ||
+        err.message === "AUTH_EXPIRED"
       ) {
         await clearAllTokens();
         router.replace("/auth/otp");
@@ -326,7 +332,6 @@ export default function TeamYPNScreen() {
           console.warn("[TeamYPN] fetch:", err);
           setAiTyping(false);
 
-          // 🔥 Handle auth expiration (already redirected)
           if (err.message === "AUTH_EXPIRED") {
             return;
           }

@@ -137,7 +137,7 @@ async def http_chat(
     
     token = authorization.split("Bearer ")[1]
     
-    # 1. Verify User
+    # 1. Verify User with Express Backend
     user_info = await verify_token_with_backend(token)
     if not user_info:
         raise HTTPException(status_code=401, detail="Invalid token")
@@ -148,7 +148,7 @@ async def http_chat(
     if not user_text:
         return JSONResponse(content={"reply": ""})
 
-    # 2. Process Message
+    # 2. Process Message (Same logic as WS)
     add_message(uid, "user", user_text)
     prompt = build_prompt(uid, user_text)
     
@@ -164,6 +164,27 @@ async def http_chat(
     }).execute()
     
     return JSONResponse(content={"reply": response_text})
+
+
+# ── 🔥 NEW: Heartbeat Endpoint ───────────────────────────────────────────────
+@app.post("/heartbeat")
+async def heartbeat(authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+    
+    token = authorization.split("Bearer ")[1]
+    
+    # Verify token with Express Backend
+    user_info = await verify_token_with_backend(token)
+    if not user_info:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    uid = user_info.get("uid")
+    
+    # Update status in Redis to show user is active
+    redis.set(f"user_status:{uid}", "online", ex=60) # Expires in 60s
+    
+    return JSONResponse(content={"status": "ok", "uid": uid})
 
 
 # ── WebSocket: Auth-First, Then Stream ────────────────────────────────────────

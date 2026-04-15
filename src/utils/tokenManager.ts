@@ -7,6 +7,8 @@ const KEYS = {
   TOKEN_EXPIRY: "ypn_backend_jwt_expiry", // Unix timestamp in ms
 };
 
+const API_URL = process.env.EXPO_PUBLIC_API_URL;
+
 // Save BOTH tokens after login/refresh
 export const saveTokens = async (
   firebaseToken: string,
@@ -18,7 +20,7 @@ export const saveTokens = async (
   await SecureStore.setItemAsync(KEYS.TOKEN_EXPIRY, expiryMs.toString());
 };
 
-// Get valid backend JWT (auto-refresh if expiring soon)
+// Get valid backend JWT (auto-refreshes if expiring soon)
 export const getValidBackendToken = async (): Promise<string> => {
   const backendJwt = await SecureStore.getItemAsync(KEYS.BACKEND_JWT);
   const expiryStr = await SecureStore.getItemAsync(KEYS.TOKEN_EXPIRY);
@@ -36,25 +38,28 @@ export const getValidBackendToken = async (): Promise<string> => {
     throw new Error("NO_FIREBASE_TOKEN");
   }
 
-  const API_URL = process.env.EXPO_PUBLIC_API_URL;
   if (!API_URL) throw new Error("API_URL_NOT_SET");
 
-  const res = await fetch(`${API_URL}/api/auth/refresh`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ firebase_id_token: firebaseToken }),
-  });
+  try {
+    const res = await fetch(`${API_URL}/api/auth/refresh`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ firebase_id_token: firebaseToken }),
+    });
 
-  if (!res.ok) {
+    if (!res.ok) {
+      await clearAllTokens();
+      throw new Error("REFRESH_FAILED");
+    }
+
+    const { backend_jwt, expires_in } = await res.json();
+    const newExpiry = Date.now() + expires_in * 1000;
+    await saveTokens(firebaseToken, backend_jwt, newExpiry);
+    return backend_jwt;
+  } catch (err) {
     await clearAllTokens();
-    const errData = await res.json().catch(() => ({}));
-    throw new Error(errData.code || "REFRESH_FAILED");
+    throw new Error("REFRESH_FAILED");
   }
-
-  const { backend_jwt, expires_in } = await res.json();
-  const newExpiry = Date.now() + expires_in * 1000;
-  await saveTokens(firebaseToken, backend_jwt, newExpiry);
-  return backend_jwt;
 };
 
 // Auth headers for API calls (auto-refreshes if needed)
@@ -70,8 +75,8 @@ export const clearAllTokens = async () => {
   await SecureStore.deleteItemAsync(KEYS.TOKEN_EXPIRY);
 };
 
-// Legacy support (optional, for backward compatibility)
+// Legacy support (optional)
+export const getToken = async () => SecureStore.getItemAsync(KEYS.BACKEND_JWT);
 export const saveToken = async (token: string) => {
   await SecureStore.setItemAsync(KEYS.BACKEND_JWT, token);
 };
-export const getToken = async () => SecureStore.getItemAsync(KEYS.BACKEND_JWT);

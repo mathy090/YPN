@@ -1,80 +1,71 @@
 // app/_layout.tsx
-//
-// SECURITY: The app renders a black splash overlay until bootAndVerify()
-// resolves. Navigation ONLY fires after the backend has confirmed the token.
-// No cached session can bypass this gate.
-
-import { Stack, useRootNavigationState, useRouter } from "expo-router";
-import { useEffect, useRef, useState } from "react";
+import { useFocusEffect } from "@react-navigation/native";
+import {
+  Stack,
+  usePathname,
+  useRootNavigationState,
+  useRouter,
+} from "expo-router";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
 import { useAuth } from "../src/store/authStore";
-import { startHeartbeat, stopHeartbeat } from "../src/utils/heartbeat"; // 🔥 Import Heartbeat
+import { getLastRoute, saveLastRoute } from "../src/utils/cacheAppState";
+
+// List of routes that are considered "pre-auth" or public
+const PUBLIC_ROUTES = ["welcome", "auth/otp", "auth/phone", "index"];
 
 export default function RootLayout() {
   const router = useRouter();
   const navState = useRootNavigationState();
+  const pathname = usePathname();
   const { bootAndVerify } = useAuth();
 
-  // Keep the splash gate up until we have a definitive result.
   const [booting, setBooting] = useState(true);
-  const [statusMsg, setStatusMsg] = useState("Verifying session…");
-
   const didBoot = useRef(false);
 
+  // Cache the current route whenever it changes
+  useFocusEffect(
+    useCallback(() => {
+      if (pathname) {
+        saveLastRoute(pathname);
+      }
+    }, [pathname]),
+  );
+
   useEffect(() => {
-    // Wait for the Expo Router navigator to fully mount before navigating.
     if (!navState?.key) return;
     if (didBoot.current) return;
     didBoot.current = true;
 
-    (async () => {
-      setStatusMsg("Verifying session…");
-
+    const handleBoot = async () => {
       const result = await bootAndVerify();
 
       if (result.ok) {
-        // 🔥 Start Heartbeat since user is verified
-        startHeartbeat();
+        // User is authenticated
+        const lastRoute = await getLastRoute();
 
-        // Backend confirmed — route based on profile completeness.
-        if (result.hasProfile) {
-          router.replace("/tabs/discord");
-        } else {
-          // Firebase account exists but profile setup not finished.
-          router.replace("/auth/device");
+        // Determine where to go
+        let targetRoute = "/tabs/discord"; // Default home
+
+        if (lastRoute && !PUBLIC_ROUTES.some((r) => lastRoute.includes(r))) {
+          // If last route was a protected page (e.g., TeamYPN), go there
+          targetRoute = lastRoute;
+        } else if (!result.hasProfile) {
+          // If profile not complete, force device setup
+          targetRoute = "/auth/device";
         }
+
+        router.replace(targetRoute as any);
       } else {
-        // 🔥 Ensure Heartbeat is stopped if auth fails
-        stopHeartbeat();
-
-        // Any failure: sign-out already done inside bootAndVerify.
-        switch (result.reason) {
-          case "offline":
-          case "timeout":
-            setStatusMsg(
-              "Could not reach server. Please check your connection.",
-            );
-            // Give the user a moment to read the message then redirect.
-            await new Promise((r) => setTimeout(r, 1800));
-            break;
-          case "auth_error":
-          case "no_user":
-          default:
-            break;
-        }
+        // User is NOT authenticated
         router.replace("/welcome");
       }
 
       setBooting(false);
-    })();
-  }, [navState?.key]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Cleanup heartbeat on unmount
-  useEffect(() => {
-    return () => {
-      stopHeartbeat();
     };
-  }, []);
+
+    handleBoot();
+  }, [navState?.key]);
 
   return (
     <>
@@ -117,16 +108,10 @@ export default function RootLayout() {
         />
       </Stack>
 
-      {/*
-        Blocking splash gate.
-        Stays on top of everything until bootAndVerify() resolves AND
-        the router.replace() call has fired.  setBooting(false) is called
-        AFTER replace() so there is zero flash of the wrong screen.
-      */}
       {booting && (
         <View style={styles.splash}>
           <ActivityIndicator size="large" color="#1DB954" />
-          <Text style={styles.msg}>{statusMsg}</Text>
+          <Text style={styles.msg}>Loading YPN...</Text>
         </View>
       )}
     </>
