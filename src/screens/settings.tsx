@@ -222,7 +222,8 @@ export default function SettingsScreen() {
     }
 
     const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ["images"],
+      // ✅ FIX: Use correct enum value for Expo ImagePicker
+      mediaTypes: ImagePicker.MediaType.Images,
       allowsEditing: true,
       aspect: [1, 1],
       quality: 0.8,
@@ -238,11 +239,25 @@ export default function SettingsScreen() {
       if (!token)
         throw new Error("Authentication required. Please sign in again.");
 
+      // ✅ DEBUG: Decode JWT to verify it contains uid (sub field)
+      try {
+        const tokenPayload = JSON.parse(atob(token.split(".")[1]));
+        console.log("[Settings] Avatar upload token payload:", {
+          sub: tokenPayload.sub, // ✅ This is the Firebase UID
+          email: tokenPayload.email,
+          hasTokenVersion: "tokenVersion" in tokenPayload,
+        });
+      } catch (e) {
+        console.warn("[Settings] Could not decode token payload:", e);
+      }
+
       const imageUri = result.assets[0].uri;
       const mimeType = result.assets[0].mimeType || "image/jpeg";
 
       const response = await fetch(imageUri);
       const blob = await response.blob();
+
+      console.log("[Settings] Uploading avatar to backend...");
 
       const uploadResponse = await fetch(`${API_URL}/api/avatar`, {
         method: "POST",
@@ -253,60 +268,59 @@ export default function SettingsScreen() {
         body: blob,
       });
 
+      const uploadData = await uploadResponse.json().catch(() => ({}));
+
+      console.log("[Settings] Avatar upload response:", {
+        status: uploadResponse.status,
+        ok: uploadResponse.ok,
+        avatarUrl: uploadData.avatarUrl,
+        uid: uploadData.uid,
+        error: uploadData.message,
+        code: uploadData.code,
+      });
+
       if (!uploadResponse.ok) {
-        const err = await uploadResponse.json().catch(() => ({}));
-
-        if (err.code === "TOKEN_EXPIRED" || uploadResponse.status === 401) {
-          try {
-            const refreshedData = await refreshTokens();
-            await saveTokens(refreshedData);
-
-            const retryResponse = await fetch(`${API_URL}/api/avatar`, {
-              method: "POST",
-              headers: {
-                Authorization: `Bearer ${refreshedData.backend_jwt}`,
-                "Content-Type": mimeType,
-              },
-              body: blob,
-            });
-
-            if (!retryResponse.ok)
-              throw new Error("Failed to upload after token refresh");
-
-            const { avatarUrl } = await retryResponse.json();
-            setProfile((prev) => (prev ? { ...prev, avatarUrl } : null));
-            await saveProfileToCache({
-              ...(await getCachedProfile()),
-              avatarUrl,
-            } as UserProfileCache);
-            return;
-          } catch (retryError) {
-            throw new Error("Session expired. Please sign in again.");
-          }
+        if (uploadResponse.status === 401) {
+          throw new Error("Session expired. Please sign in again.");
         }
-
-        throw new Error(err.message || "Failed to upload avatar");
+        if (uploadResponse.status === 429) {
+          throw new Error("Too many uploads. Please wait a few minutes.");
+        }
+        throw new Error(uploadData.message || "Failed to upload avatar");
       }
 
-      const { avatarUrl } = await uploadResponse.json();
+      const { avatarUrl, uid } = uploadData;
+
+      if (!avatarUrl) {
+        throw new Error("Backend did not return avatar URL");
+      }
 
       // ✅ Update local state and cache with new avatar
       setProfile((prev) => (prev ? { ...prev, avatarUrl } : null));
+
+      // Update cache with full profile structure
+      const cachedProfile = await getCachedProfile();
       await saveProfileToCache({
-        ...(await getCachedProfile()),
+        ...(cachedProfile || {}),
         avatarUrl,
+        uid: uid || cachedProfile?.uid,
       } as UserProfileCache);
 
-      console.log("[Settings] ✅ Avatar uploaded:", avatarUrl);
+      console.log("[Settings] ✅ Avatar uploaded and cached:", avatarUrl);
     } catch (error: any) {
-      console.error("[Settings] Avatar upload error:", error.message);
+      console.error("[Settings] Avatar upload error:", {
+        message: error.message,
+        name: error.name,
+      });
       setUploadError("Failed to upload photo. Please try again.");
 
       Alert.alert(
         "Upload Failed",
         error.message.includes("sign in")
           ? "Your session expired. Please sign in again to continue."
-          : "Could not upload your photo. Please try again.",
+          : error.message.includes("Too many")
+            ? "Too many uploads. Please wait a few minutes."
+            : "Could not upload your photo. Please try again.",
         [{ text: "OK" }],
       );
     } finally {
@@ -457,12 +471,20 @@ export default function SettingsScreen() {
                   <ActivityIndicator color={COLORS.primary} size="large" />
                 </View>
               ) : profile?.avatarUrl ? (
-                // ✅ Show avatar from MongoDB
+                // ✅ Show avatar from MongoDB with error handling
                 <Image
                   source={{ uri: profile.avatarUrl }}
                   style={styles.avatar}
                   resizeMode="cover"
-                  onError={() => console.warn("[Settings] Avatar load failed")}
+                  onError={(e) => {
+                    console.warn("[Settings] Avatar load failed:", {
+                      uri: profile.avatarUrl,
+                      error: e.nativeEvent?.error,
+                    });
+                  }}
+                  onLoad={() => {
+                    console.log("[Settings] ✅ Avatar loaded successfully");
+                  }}
                 />
               ) : (
                 // ✅ Show placeholder if avatarUrl is null/undefined in MongoDB

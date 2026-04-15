@@ -17,18 +17,17 @@ import {
 interface AuthState {
   isAuthenticated: boolean;
   isChecking: boolean;
-  isSessionExpired: boolean; // ✅ NEW: Track expired session without auto-logout
+  isSessionExpired: boolean;
   user: UserData | null;
   checkAuth: () => Promise<boolean>;
   login: (email: string, password: string) => Promise<void>;
-  // ✅ NEW: Two-step sign out flow
-  requestSignOut: () => void; // Starts password confirmation
+  requestSignOut: () => void;
   confirmSignOut: (
     email: string,
     password: string,
     clearLocalDb: () => Promise<void>,
-  ) => Promise<void>; // Executes after verification
-  cancelSignOut: () => void; // Cancels pending sign out
+  ) => Promise<void>;
+  cancelSignOut: () => void;
   startHeartbeat: () => void;
   stopHeartbeat: () => void;
 }
@@ -38,7 +37,7 @@ let heartbeatInterval: NodeJS.Timeout | null = null;
 export const useAuth = create<AuthState>((set, get) => ({
   isAuthenticated: false,
   isChecking: true,
-  isSessionExpired: false, // ✅ Default: not expired
+  isSessionExpired: false,
   user: null,
 
   // ✅ Login Function for REST API
@@ -67,7 +66,7 @@ export const useAuth = create<AuthState>((set, get) => ({
       set({
         isAuthenticated: true,
         isChecking: false,
-        isSessionExpired: false, // ✅ Clear expired flag on successful login
+        isSessionExpired: false,
         user: data.user,
       });
 
@@ -79,7 +78,7 @@ export const useAuth = create<AuthState>((set, get) => ({
     }
   },
 
-  // ✅ Check Auth (unchanged logic, just adds expired flag handling)
+  // ✅ Check Auth
   checkAuth: async () => {
     set({ isChecking: true });
     stopBackgroundRetry();
@@ -146,31 +145,27 @@ export const useAuth = create<AuthState>((set, get) => ({
         return false;
       }
 
-      // ✅ NEW: Instead of auto-redirect, mark session expired
       console.warn(
         "[AuthStore] Session expired or invalid. Marking for re-auth.",
       );
       set({
-        isAuthenticated: true, // ✅ Stay "logged in" UI-wise
+        isAuthenticated: true,
         isChecking: false,
-        isSessionExpired: true, // ✅ Flag that re-auth is needed
-        user: await getUserData(), // ✅ Keep user data visible
+        isSessionExpired: true,
+        user: await getUserData(),
       });
-
-      // Don't redirect - let UI handle re-auth prompt
       return false;
     }
   },
 
-  // ✅ NEW: Start sign out flow (shows password modal)
+  // ✅ Start sign out flow (shows password modal)
   requestSignOut: () => {
     console.log(
       "[AuthStore] Sign out requested - awaiting password confirmation",
     );
-    // Just set a flag or do nothing - UI handles the modal
   },
 
-  // ✅ NEW: Execute sign out AFTER password verification
+  // ✅ Execute sign out AFTER password verification - ✅ FIXED
   confirmSignOut: async (
     email: string,
     password: string,
@@ -182,33 +177,101 @@ export const useAuth = create<AuthState>((set, get) => ({
       const API_URL = process.env.EXPO_PUBLIC_API_URL;
       if (!API_URL) throw new Error("API_URL_NOT_SET");
 
-      // ✅ 1. Verify credentials with backend BEFORE clearing anything
-      const response = await fetch(`${API_URL}/api/auth/verify-logout`, {
+      // ✅ STEP 1: Get the CURRENT valid backend JWT for Authorization header
+      console.log("[AuthStore] Fetching current backend token for sign-out...");
+      let currentToken = await getBackendToken();
+
+      // If no valid token, try to refresh first
+      if (!currentToken) {
+        console.log("[AuthStore] No valid token found, attempting refresh...");
+        try {
+          const refreshedData = await refreshTokens();
+          await saveTokens(refreshedData);
+          currentToken = await getBackendToken();
+        } catch (refreshError: any) {
+          console.warn(
+            "[AuthStore] Token refresh failed during sign-out:",
+            refreshError.message,
+          );
+          throw new Error("Session expired. Please sign in again to sign out.");
+        }
+      }
+
+      if (!currentToken) {
+        throw new Error("Could not obtain valid authentication token");
+      }
+
+      console.log("[AuthStore] Token ready for sign-out request");
+
+      // ✅ STEP 2: Get user UID for the request body
+      const userData = await getUserData();
+      const firebaseUid = userData?.uid || get()?.user?.uid;
+
+      if (!firebaseUid) {
+        console.warn(
+          "[AuthStore] Could not determine firebase_uid, using email only",
+        );
+      }
+
+      // ✅ STEP 3: Call backend sign-out endpoint WITH proper Authorization header
+      console.log("[AuthStore] Calling POST /api/auth/signout...");
+
+      const signoutResponse = await fetch(`${API_URL}/api/auth/signout`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
+        headers: {
+          // ✅ CRITICAL: Send backend JWT in Authorization header
+          Authorization: `Bearer ${currentToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          email: email.trim(),
+          firebase_uid: firebaseUid,
+        }),
       });
 
-      if (!response.ok) {
-        const err = await response
-          .json()
-          .catch(() => ({ message: "Verification failed" }));
-        throw new Error(err.message || "Invalid credentials for sign out");
+      const signoutData = await signoutResponse.json().catch(() => ({}));
+
+      console.log("[AuthStore] Sign-out response:", {
+        status: signoutResponse.status,
+        ok: signoutResponse.ok,
+        success: signoutData.success,
+        message: signoutData.message,
+        code: signoutData.code,
+      });
+
+      // ✅ STEP 4: Handle response
+      if (!signoutResponse.ok) {
+        if (signoutResponse.status === 401) {
+          throw new Error("Invalid credentials. Please check your password.");
+        }
+        if (signoutResponse.status === 403) {
+          throw new Error("Authentication failed. Please sign in again.");
+        }
+        if (signoutData.code === "USER_NOT_FOUND") {
+          // User not found is OK - proceed with local cleanup (idempotent sign-out)
+          console.warn(
+            "[AuthStore] User not found in DB, proceeding with local sign-out",
+          );
+        } else {
+          throw new Error(
+            signoutData.message || "Sign-out failed. Please try again.",
+          );
+        }
       }
 
       console.log(
-        "[AuthStore] Credentials verified. Proceeding with secure logout...",
+        "[AuthStore] ✅ Backend sign-out verified. Proceeding with local cleanup...",
       );
 
-      // ✅ 2. ONLY NOW: Clear local database (MANDATORY)
+      // ✅ STEP 5: Clear local database (MANDATORY)
       await clearLocalDb();
       console.log("[AuthStore] Local database cleared");
 
-      // ✅ 3. Clear all tokens
+      // ✅ STEP 6: Clear all tokens from SecureStore
       await clearAllTokens();
       console.log("[AuthStore] Secure tokens cleared");
 
-      // ✅ 4. Stop heartbeat and reset state
+      // ✅ STEP 7: Stop heartbeat and reset state
       get().stopHeartbeat();
       set({
         isAuthenticated: false,
@@ -217,20 +280,20 @@ export const useAuth = create<AuthState>((set, get) => ({
         user: null,
       });
 
-      // ✅ 5. Redirect to login
-      router.replace("../auth/login");
-      console.log("[AuthStore] Sign out complete");
+      // ✅ STEP 8: Redirect to login/welcome
+      router.replace("/welcome");
+
+      console.log("[AuthStore] ✅ Sign out complete - redirected to /welcome");
     } catch (error: any) {
       console.error("[AuthStore] Sign out verification failed:", error.message);
-      // Don't clear anything if verification fails
+      // Don't clear anything if verification fails - let user retry
       throw error; // Let UI show the error
     }
   },
 
-  // ✅ NEW: Cancel pending sign out
+  // ✅ Cancel pending sign out
   cancelSignOut: () => {
     console.log("[AuthStore] Sign out cancelled");
-    // No state change needed - just abort the flow
   },
 
   // ✅ Heartbeat: Mark expired but DON'T auto-logout
@@ -255,7 +318,6 @@ export const useAuth = create<AuthState>((set, get) => ({
         console.log(
           "[AuthStore] Token expired. Marking session for re-auth...",
         );
-        // ✅ NEW: Just mark expired, don't call signOut
         set({ isSessionExpired: true });
       }
     }, 30000);
