@@ -1,7 +1,9 @@
 // src/screens/TeamYPN.tsx
+// Firebase ID Token Auth for HTTP AI Requests
+
 import { Ionicons } from "@expo/vector-icons";
 import { BlurView } from "expo-blur";
-import { useRouter } from "expo-router";
+import { useFocusEffect, useRouter } from "expo-router";
 import React, {
   useCallback,
   useEffect,
@@ -11,7 +13,6 @@ import React, {
 } from "react";
 import {
   ActivityIndicator,
-  Alert,
   Animated,
   FlatList,
   Image,
@@ -149,7 +150,7 @@ export default function TeamYPNScreen() {
   const [loading, setLoading] = useState(true);
   const [aiTyping, setAiTyping] = useState(false);
 
-  // ── Voice modal visibility ─────────────────────────────────────────
+  // Voice modal visibility
   const [voiceVisible, setVoiceVisible] = useState(false);
 
   const [pending, setPending] = useState<Message | null>(null);
@@ -217,45 +218,35 @@ export default function TeamYPNScreen() {
     setTimeout(() => listRef.current?.scrollToEnd({ animated }), 80);
   }, []);
 
-  // 🔥 Auth-aware AI fetch with Firebase ID token
+  // 🔥 Fetch AI with Firebase ID Token Auth
   const fetchAIReply = async (text: string): Promise<string> => {
-    try {
-      const token = await getToken();
-      if (!token) throw new Error("NO_TOKEN");
-
-      const res = await fetch(AI_API_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`, // 🔥 Firebase ID token only
-        },
-        body: JSON.stringify({ message: text }),
-      });
-
-      // 🔥 Handle 401 = invalid/expired token
-      if (res.status === 401) {
-        await clearToken();
-        throw new Error("AUTH_EXPIRED");
-      }
-
-      if (!res.ok) throw new Error(`AI ${res.status}`);
-      const data = await res.json();
-      return (data.reply ?? data.message ?? "Sorry, no response.") as string;
-    } catch (err: any) {
-      if (err.message === "NO_TOKEN" || err.message === "AUTH_EXPIRED") {
-        // Redirect to login on auth failure
-        Alert.alert("Session Expired", "Please log in again to continue.", [
-          {
-            text: "Log In",
-            onPress: () => {
-              clearToken();
-              router.replace("/auth/otp");
-            },
-          },
-        ]);
-      }
-      throw err;
+    const token = await getToken();
+    if (!token) {
+      throw new Error("NO_TOKEN");
     }
+
+    const res = await fetch(AI_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`, // 🔥 Firebase ID token only
+      },
+      body: JSON.stringify({ message: text }),
+    });
+
+    // 🔥 Handle 401 instantly: clear token + redirect
+    if (res.status === 401) {
+      await clearToken();
+      router.replace("/auth/otp");
+      throw new Error("AUTH_EXPIRED");
+    }
+
+    if (!res.ok) {
+      throw new Error(`AI ${res.status}`);
+    }
+
+    const data = await res.json();
+    return (data.reply ?? data.message ?? "Sorry, no response.") as string;
   };
 
   const sendMessage = useCallback(
@@ -320,9 +311,15 @@ export default function TeamYPNScreen() {
           });
           if (!isChatOpenRef.current) await incrementUnreadBadge();
         })
-        .catch((err) => {
+        .catch((err: any) => {
           console.warn("[TeamYPN] fetch:", err);
           setAiTyping(false);
+
+          // 🔥 Handle auth expiration (already redirected)
+          if (err.message === "AUTH_EXPIRED" || err.message === "NO_TOKEN") {
+            return;
+          }
+
           setMessages((prev) =>
             prev.map((m) =>
               m.id === userMsgId ? { ...m, status: "failed" } : m,
@@ -592,7 +589,7 @@ export default function TeamYPNScreen() {
   );
 }
 
-// ── Styles (unchanged + voiceCallBtn) ──────────────────
+// ── Styles ──────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#0B141A" },
   loadingWrap: {
@@ -625,8 +622,6 @@ const s = StyleSheet.create({
     letterSpacing: 0.3,
   },
   headerSub: { color: "#8696A0", fontSize: 12, marginTop: 1 },
-
-  // ── Voice button ──
   voiceCallBtn: {
     width: 40,
     height: 40,
@@ -637,7 +632,6 @@ const s = StyleSheet.create({
     borderWidth: 1,
     borderColor: "rgba(37,211,102,0.2)",
   },
-
   listContent: { paddingHorizontal: 16, paddingTop: 10, paddingBottom: 10 },
   dateHeader: {
     alignSelf: "center",
@@ -741,7 +735,7 @@ const s = StyleSheet.create({
     paddingVertical: 10,
     backgroundColor: "#111B21",
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: "#1F2C34",
+    borderTopColor: "rgba(255,255,255,0.08)",
     gap: 10,
   },
   plusBtn: {

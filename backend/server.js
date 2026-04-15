@@ -1,3 +1,4 @@
+// server.js
 "use strict";
 require("dotenv").config();
 
@@ -5,6 +6,8 @@ const express = require("express");
 const { MongoClient } = require("mongodb");
 const cors = require("cors");
 const admin = require("firebase-admin");
+const jwt = require("jsonwebtoken");
+const rateLimit = require("express-rate-limit"); // 🔥 New: Rate Limiting
 
 // Import Routes
 const {
@@ -47,6 +50,31 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ── 🔥 Rate Limiting Configuration ──────────────────────────────────────────
+
+// General API Limiter: 100 requests per 15 minutes
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: {
+    status: 429,
+    message: "Too many requests, please try again later.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Strict Auth Limiter: 5 attempts per 15 minutes (Prevent brute force)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { status: 429, message: "Too many authentication attempts." },
+  skipSuccessfulRequests: true, // Don't count successful logins
+});
+
+// Apply General Limiter to all API routes
+app.use("/api/", generalLimiter);
+
 // ── Middleware: Verify Firebase Token ────────────────────────────────────────
 async function verifyFirebaseToken(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -60,7 +88,7 @@ async function verifyFirebaseToken(req, res, next) {
 
   try {
     const decodedToken = await admin.auth().verifyIdToken(idToken);
-    req.user = decodedToken; // Attach user info (uid, email, etc.) to request
+    req.user = decodedToken;
     next();
   } catch (err) {
     if (err.code === "auth/id-token-expired") {
@@ -75,6 +103,42 @@ async function verifyFirebaseToken(req, res, next) {
   }
 }
 
+// ── Middleware: Verify Backend JWT (Hybrid Auth) ────────────────────────────
+function verifyBackendToken(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer ")) {
+    return res
+      .status(401)
+      .json({ message: "No token provided", code: "NO_TOKEN" });
+  }
+
+  const token = authHeader.split("Bearer ")[1];
+
+  jwt.verify(
+    token,
+    process.env.BACKEND_JWT_SECRET,
+    {
+      issuer: "ypn-backend",
+      audience: "ypn-app",
+    },
+    (err, decoded) => {
+      if (err) {
+        if (err.name === "TokenExpiredError") {
+          return res.status(401).json({
+            message: "Token expired. Please sign in again.",
+            code: "TOKEN_EXPIRED",
+          });
+        }
+        return res
+          .status(403)
+          .json({ message: "Invalid token", code: "INVALID_TOKEN" });
+      }
+      req.user = decoded; // { sub: firebase_uid, email, role, hasProfile, ... }
+      next();
+    },
+  );
+}
+
 // ── Health Check ─────────────────────────────────────────────────────────────
 app.get("/", (_req, res) => {
   res.status(200).json({
@@ -83,7 +147,6 @@ app.get("/", (_req, res) => {
     time: new Date().toISOString(),
   });
 });
-
 app.head("/", (_req, res) => res.status(200).end());
 
 // ── MongoDB Connection ───────────────────────────────────────────────────────
@@ -96,12 +159,6 @@ async function connectDB() {
     db = client.db("ypn_users");
     console.log("✅ Connected to MongoDB");
 
-    // ⚠️ INDEX CREATION REMOVED
-    // We are relying on the indexes that already exist in your database.
-    // This prevents the "IndexOptionsConflict" crash on Render.
-    // Your existing indexes (username, email, uid) are preserved exactly as they are.
-
-    // Initialize modules
     initUserVideos(db);
     initDiscordChannels(db);
     initKeyStore(db);
@@ -117,6 +174,29 @@ async function connectDB() {
 
 // ── Route Definitions ────────────────────────────────────────────────────────
 function registerRoutes() {
+  // ── 🔥 NEW: POST /api/auth/status (Heartbeat/Presence) ────────────────────
+  app.post("/api/auth/status", verifyBackendToken, async (req, res) => {
+    try {
+      const userId = req.user.id; // MongoDB ID from JWT
+      const { status } = req.body; // 'online', 'idle', etc.
+
+      await db.collection("users").updateOne(
+        { _id: new require("mongodb").ObjectId(userId) }, // Ensure ObjectId format if needed
+        {
+          $set: {
+            lastSeen: new Date(),
+            status: status || "online",
+          },
+        },
+      );
+
+      res.json({ success: true, status: status || "online" });
+    } catch (err) {
+      console.error("[/api/auth/status] Error:", err);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
   // ── POST /api/auth/login ───────────────────────────────────────────────────
   app.post("/api/auth/login", async (req, res) => {
     const { email, password } = req.body;
@@ -196,12 +276,90 @@ function registerRoutes() {
 
       res.json({
         token: idToken,
-        hasProfile, // Frontend uses this to decide routing (skip device.tsx if true)
+        hasProfile,
         user: { uid, email: userRecord.email },
       });
     } catch (err) {
       console.error("[/api/auth/login] Error:", err);
       res.status(500).json({ message: "Internal server error." });
+    }
+  });
+
+  // ── 🔥 NEW: POST /api/auth/refresh (Hybrid Auth) ───────────────────────────
+  app.post("/api/auth/refresh", async (req, res) => {
+    const { firebase_id_token } = req.body;
+
+    if (!firebase_id_token) {
+      return res
+        .status(400)
+        .json({ message: "Missing firebase_id_token", code: "MISSING_TOKEN" });
+    }
+
+    try {
+      // 1. Verify Firebase ID Token
+      const decoded = await admin.auth().verifyIdToken(firebase_id_token);
+      const { uid, email, name, picture } = decoded;
+
+      // 2. Check MongoDB for profile/roles
+      const userProfile = await db
+        .collection("users")
+        .findOne(
+          { uid },
+          { projection: { username: 1, role: 1, isBanned: 1, hasProfile: 1 } },
+        );
+
+      if (userProfile?.isBanned) {
+        return res
+          .status(403)
+          .json({ message: "Account suspended", code: "ACCOUNT_SUSPENDED" });
+      }
+
+      // 3. Issue custom backend JWT with custom claims + expiry
+      const backendJwt = jwt.sign(
+        {
+          sub: uid, // Firebase UID as subject
+          email,
+          name: name || "",
+          picture: picture || "",
+          role: userProfile?.role || "user",
+          hasProfile: !!userProfile?.username, // true if username is set
+        },
+        process.env.BACKEND_JWT_SECRET,
+        {
+          expiresIn: process.env.BACKEND_JWT_EXPIRY || "1h", // e.g., "1h", "7d"
+          issuer: "ypn-backend",
+          audience: "ypn-app",
+        },
+      );
+
+      const expiresIn = parseInt(process.env.BACKEND_JWT_EXPIRY) || 3600;
+
+      res.json({
+        backend_jwt: backendJwt,
+        expires_in: expiresIn,
+        user: {
+          uid,
+          email,
+          name: name || "",
+          role: userProfile?.role || "user",
+          hasProfile: !!userProfile?.username,
+        },
+      });
+    } catch (err) {
+      console.error("[/api/auth/refresh] Error:", err);
+      if (
+        err.code === "auth/id-token-expired" ||
+        err.code === "auth/argument-error"
+      ) {
+        return res.status(401).json({
+          message: "Firebase token expired",
+          code: "FIREBASE_TOKEN_EXPIRED",
+        });
+      }
+      res.status(401).json({
+        message: "Invalid Firebase token",
+        code: "INVALID_FIREBASE_TOKEN",
+      });
     }
   });
 
@@ -385,14 +543,14 @@ function registerRoutes() {
     }
   });
 
-  // ── Mount External Routes ──────────────────────────────────────────────────
-  app.use("/api/avatar", verifyFirebaseToken, avatarRoutes);
+  // ── Mount External Routes (Use verifyBackendToken for hybrid auth) ─────────
+  app.use("/api/avatar", verifyBackendToken, avatarRoutes);
   app.use("/api/videos/drive", driveVideoRoutes);
   app.use("/api/videos", videoRoutes);
   app.use("/api/discord", discordRoutes);
   app.use("/api/news", newsRoutes);
-  app.use("/api/keys", verifyFirebaseToken, keyRoutes);
-  app.use("/api/media", verifyFirebaseToken, mediaRoutes);
+  app.use("/api/keys", verifyBackendToken, keyRoutes);
+  app.use("/api/media", verifyBackendToken, mediaRoutes);
 
   // 404 Handler
   app.use((_req, res) => res.status(404).json({ message: "Not found" }));

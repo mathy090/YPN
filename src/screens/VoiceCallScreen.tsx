@@ -1,4 +1,6 @@
-// app/voice/VoiceCallScreen.tsx
+// src/screens/VoiceCallScreen.tsx
+// Firebase ID Token Auth + WebSocket Streaming + TTS
+
 import { Ionicons } from "@expo/vector-icons";
 import { BlurView } from "expo-blur";
 import { useRouter } from "expo-router";
@@ -18,14 +20,23 @@ import {
 import AudioRecord from "react-native-audio-record";
 import { SafeAreaView } from "react-native-safe-area-context";
 import Tts, { Voice } from "react-native-tts";
-import { clearToken, getToken } from "../../src/utils/tokenManager";
+
+import { clearToken, getToken } from "../utils/tokenManager";
 
 const API_BASE = process.env.EXPO_PUBLIC_AI_URL || "http://localhost:8000";
 const WS_URL = `${API_BASE.replace("http", "ws")}/ws`;
 
 type Phase = "idle" | "connecting" | "listening" | "thinking" | "speaking";
 
-export default function VoiceCallScreen({ onClose }: { onClose: () => void }) {
+interface Props {
+  onClose: () => void;
+  sessionId?: string;
+}
+
+export default function VoiceCallScreen({
+  onClose,
+  sessionId = "default",
+}: Props) {
   const router = useRouter();
   const [phase, setPhase] = useState<Phase>("idle");
   const [liveText, setLiveText] = useState("");
@@ -65,50 +76,60 @@ export default function VoiceCallScreen({ onClose }: { onClose: () => void }) {
         setSelectedVoiceId(defaultVoice.id);
         await Tts.setDefaultVoice(defaultVoice.id);
       }
-    } catch {}
+    } catch (e) {
+      console.warn("[TTS] Init error:", e);
+    }
   };
 
+  // 🔥 Connect with Firebase ID Token Auth
   const connect = async () => {
     setPhase("connecting");
-    try {
-      // 🔥 1. Load Firebase ID Token from SecureStore
-      const token = await getToken();
-      if (!token) throw new Error("NO_TOKEN");
 
+    try {
+      // 1. Load Firebase ID Token from SecureStore
+      const token = await getToken();
+      if (!token) {
+        throw new Error("NO_TOKEN");
+      }
+
+      // 2. Create WebSocket
       const ws = new WebSocket(WS_URL);
       socketRef.current = ws;
 
+      // 3. On open: send auth IMMEDIATELY
       ws.onopen = () => {
-        // 🔥 2. Send auth immediately on connection
         ws.send(JSON.stringify({ type: "auth", token }));
       };
 
+      // 4. Handle messages
       ws.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data);
 
-          // 🔥 3. Handle Auth Verification
-          if (
-            msg.type === "auth_success" ||
-            (msg.type === "ready" && phase === "connecting")
-          ) {
+          // ── Auth Responses ─────────────────────────────────────
+          if (msg.type === "auth_success") {
             setPhase("listening");
             startStreaming();
             return;
           }
 
-          if (msg.type === "auth_error" || msg.status === 401) {
-            handleAuthFailure("Session expired. Please log in again.");
+          if (msg.type === "auth_error") {
+            handleAuthFailure(msg.message || "Authentication failed");
             return;
           }
 
-          // 🔥 4. Handle Live Transcription & AI Responses
-          if (msg.type === "transcript_partial" || msg.type === "partial") {
+          // ── Voice/Transcription ────────────────────────────────
+          if (msg.type === "partial" || msg.type === "transcript_partial") {
             setLiveText(msg.text || "");
           }
 
-          if (msg.type === "mode" || msg.type === "state") {
-            const state = msg.state || msg.value;
+          if (msg.type === "transcript_final") {
+            setLiveText(msg.text || "");
+          }
+
+          // ── State Changes ──────────────────────────────────────
+          if (msg.type === "state" || msg.type === "mode") {
+            const state = msg.value || msg.state;
             if (state === "thinking") setPhase("thinking");
             if (state === "speaking") setPhase("speaking");
             if (state === "listening") {
@@ -117,29 +138,39 @@ export default function VoiceCallScreen({ onClose }: { onClose: () => void }) {
             }
           }
 
-          if (msg.type === "ai_chunk" || msg.type === "ai_token") {
+          // ── AI Streaming ───────────────────────────────────────
+          if (msg.type === "ai_token" || msg.type === "ai_chunk") {
             aiBufferRef.current += msg.text;
             setAiReply(aiBufferRef.current);
           }
 
-          if (msg.type === "ai_done" || msg.type === "done") {
+          // ── AI Complete ────────────────────────────────────────
+          if (msg.type === "done" || msg.type === "ai_complete") {
             const fullReply = aiBufferRef.current.trim();
             aiBufferRef.current = "";
             setAiReply("");
 
-            // 🔥 5. Trigger TTS when AI finishes responding
             if (fullReply) {
               Tts.stop();
               Tts.speak(fullReply);
             }
+            setPhase("listening");
           }
         } catch (e) {
-          console.warn("WS Parse Error", e);
+          console.warn("[WS] Parse error:", e);
         }
       };
 
-      ws.onerror = () => setPhase("idle");
-      ws.onclose = () => setPhase("idle");
+      ws.onerror = (e) => {
+        console.error("[WS] Error:", e);
+        setPhase("idle");
+      };
+
+      ws.onclose = () => {
+        if (phase !== "idle") {
+          setPhase("idle");
+        }
+      };
     } catch (err: any) {
       if (err.message === "NO_TOKEN") {
         handleAuthFailure("Please log in to use voice features.");
@@ -149,24 +180,29 @@ export default function VoiceCallScreen({ onClose }: { onClose: () => void }) {
     }
   };
 
-  // 🔥 Auth failure handler
+  // 🔥 Handle auth failure: clear token + redirect
   const handleAuthFailure = (message: string) => {
     clearToken();
     disconnect();
-    Alert.alert("Authentication Required", message, [
-      {
-        text: "Log In",
-        onPress: () => {
-          onClose();
-          router.replace("/auth/otp");
+    Alert.alert(
+      "Authentication Required",
+      message,
+      [
+        {
+          text: "Log In",
+          onPress: () => {
+            onClose();
+            router.replace("/auth/otp");
+          },
         },
-      },
-      { text: "Cancel", style: "cancel", onPress: onClose },
-    ]);
+        { text: "Cancel", style: "cancel", onPress: onClose },
+      ],
+      { cancelable: false },
+    );
   };
 
   const startStreaming = () => {
-    if (intervalRef.current) return; // Prevent double-start
+    if (intervalRef.current) return;
 
     const options = {
       sampleRate: 16000,
@@ -182,7 +218,7 @@ export default function VoiceCallScreen({ onClose }: { onClose: () => void }) {
     intervalRef.current = setInterval(() => {
       const data = AudioRecord.fetch?.();
       if (data && socketRef.current?.readyState === WebSocket.OPEN) {
-        // Send raw binary for lower latency & RAM usage
+        // Send raw binary for lower latency
         socketRef.current.send(data);
       }
     }, 120);
@@ -208,8 +244,8 @@ export default function VoiceCallScreen({ onClose }: { onClose: () => void }) {
     else disconnect();
   };
 
+  // Pulse animation for mic ring
   const pulseAnim = useRef(new Animated.Value(1)).current;
-
   useEffect(() => {
     if (phase === "listening" || phase === "speaking") {
       const loop = Animated.loop(
@@ -284,11 +320,10 @@ export default function VoiceCallScreen({ onClose }: { onClose: () => void }) {
         </TouchableOpacity>
       </View>
 
+      {/* Voice Settings Modal */}
       <Modal visible={isSettingsOpen} transparent animationType="slide">
         <View style={styles.modal}>
-          <Text style={{ color: "#fff", fontSize: 18, marginBottom: 12 }}>
-            Voice Settings
-          </Text>
+          <Text style={styles.modalTitle}>Voice Settings</Text>
           {availableVoices.map((voice) => (
             <TouchableOpacity
               key={voice.id}
@@ -359,6 +394,12 @@ const styles = StyleSheet.create({
     padding: 24,
     borderTopLeftRadius: 20,
     borderTopRightRadius: 20,
+  },
+  modalTitle: {
+    color: "#fff",
+    fontSize: 18,
+    fontWeight: "600",
+    marginBottom: 12,
   },
   voiceOption: { padding: 14, borderRadius: 10, marginBottom: 6 },
   voiceOptionActive: { backgroundColor: "rgba(29,185,84,0.2)" },
