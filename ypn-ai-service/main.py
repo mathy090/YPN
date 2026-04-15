@@ -1,10 +1,8 @@
-# main.py
 import os
 import json
 import time
 import base64
 import asyncio
-from collections import defaultdict, deque
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
@@ -13,15 +11,15 @@ from firebase_admin import credentials, auth
 
 from vosk import Model, KaldiRecognizer
 
-from supabase import create_client
+from upstash_redis import Redis
 
-from memory import load_memory, append_message
+from supabase import create_client
 from retrievers import retrieve
 from prompts import SYSTEM_PROMPT
 
 
 # ─────────────────────────────────────────────
-# FIREBASE INIT
+# FIREBASE
 # ─────────────────────────────────────────────
 cred_json = json.loads(os.getenv("FIREBASE_CREDENTIALS"))
 
@@ -32,7 +30,16 @@ if not firebase_admin._apps:
 
 
 # ─────────────────────────────────────────────
-# SUPABASE (TEXT ONLY STORAGE)
+# REDIS (STATE + VAD BRAIN)
+# ─────────────────────────────────────────────
+redis = Redis(
+    url=os.getenv("UPSTASH_REDIS_REST_URL"),
+    token=os.getenv("UPSTASH_REDIS_REST_TOKEN")
+)
+
+
+# ─────────────────────────────────────────────
+# SUPABASE
 # ─────────────────────────────────────────────
 supabase = create_client(
     os.getenv("SUPABASE_URL"),
@@ -41,25 +48,12 @@ supabase = create_client(
 
 
 # ─────────────────────────────────────────────
-# VOSK MODEL (SMALL ENGLISH US)
+# VOSK MODEL
 # ─────────────────────────────────────────────
 model = Model("models/vosk-small-en-us-0.15")
 
 
-# ─────────────────────────────────────────────
-# APP
-# ─────────────────────────────────────────────
 app = FastAPI()
-
-
-# ─────────────────────────────────────────────
-# SESSION STATE
-# ─────────────────────────────────────────────
-sessions = {}          # {uid: {interrupted: bool}}
-memory_cache = {}      # {uid: memory}
-recognizers = {}       # {uid: vosk recognizer}
-
-rate_limit = defaultdict(lambda: deque(maxlen=5))
 
 
 # ─────────────────────────────────────────────
@@ -68,185 +62,203 @@ rate_limit = defaultdict(lambda: deque(maxlen=5))
 def verify_token(token: str):
     try:
         return auth.verify_id_token(token)
-    except Exception as e:
-        print("Auth error:", e)
+    except:
         return None
 
 
 # ─────────────────────────────────────────────
-# RATE LIMIT (5 msgs / 10 sec)
-# ─────────────────────────────────────────────
-def is_rate_limited(uid: str):
-    now = time.time()
-    q = rate_limit[uid]
-
-    while q and now - q[0] > 10:
-        q.popleft()
-
-    if len(q) >= 5:
-        return True
-
-    q.append(now)
-    return False
-
-
-# ─────────────────────────────────────────────
-# AI ENGINE (REPLACE WITH GPT / GROQ)
+# AI ENGINE (replace later with GPT/Groq)
 # ─────────────────────────────────────────────
 async def run_ai(prompt: str):
     await asyncio.sleep(0.2)
-    return "I understand your message. Let's work through this step by step."
+    return "I understand. I'm listening carefully and responding step by step."
 
 
 # ─────────────────────────────────────────────
-# WEBSOCKET
+# REDIS HELPERS
 # ─────────────────────────────────────────────
-@app.websocket("/ws")
-async def websocket(ws: WebSocket):
-    await ws.accept()
+def add_message(uid, role, text):
+    key = f"chat:{uid}"
+    data = redis.get(key)
 
-    session_id = None
+    chat = json.loads(data) if data else []
 
-    try:
-        # ── AUTH ─────────────────────────
-        auth_data = await ws.receive_json()
+    chat.append({"role": role, "text": text, "t": time.time()})
 
-        token = auth_data.get("token")
-        user = verify_token(token) if token else None
+    chat = chat[-20:]  # keep window
 
-        session_id = user["uid"] if user else "test_user"
+    redis.set(key, json.dumps(chat))
 
-        sessions[session_id] = {"interrupted": False}
+    return chat
 
-        # ── INIT MEMORY ──────────────────
-        if session_id not in memory_cache:
-            memory_cache[session_id] = load_memory(session_id)
 
-        # ── INIT VOSK RECOGNIZER ─────────
-        recognizers[session_id] = KaldiRecognizer(model, 16000)
+def get_chat(uid):
+    data = redis.get(f"chat:{uid}")
+    return json.loads(data) if data else []
 
-        recognizer = recognizers[session_id]
 
-        # ────────────────────────────────
-        # MAIN LOOP
-        # ────────────────────────────────
-        while True:
-            data = await ws.receive_json()
-            msg_type = data.get("type")
+# ─────────────────────────────────────────────
+# VAD (SILENCE DETECTION)
+# ─────────────────────────────────────────────
+def update_audio_time(uid):
+    redis.set(f"last_audio:{uid}", time.time())
 
-            user_text = None
 
-            # ───────── TEXT INPUT ─────────
-            if msg_type == "text":
-                user_text = data.get("message", "").strip()
+def is_user_silent(uid, threshold=0.8):
+    last = redis.get(f"last_audio:{uid}")
 
-            # ───────── PCM AUDIO INPUT ─────
-            elif msg_type == "audio":
+    if not last:
+        return False
 
-                # PCM base64 → raw bytes
-                pcm_bytes = base64.b64decode(data["audio"])
+    return (time.time() - float(last)) > threshold
 
-                if recognizer.AcceptWaveform(pcm_bytes):
-                    result = json.loads(recognizer.Result())
-                    user_text = result.get("text", "").strip()
-                else:
-                    partial = json.loads(recognizer.PartialResult())
-                    await ws.send_json({
-                        "type": "partial_transcript",
-                        "text": partial.get("partial", "")
-                    })
-                    continue
 
-            # ───────── INTERRUPT ───────────
-            elif msg_type == "interrupt":
-                sessions[session_id]["interrupted"] = True
-                continue
+# ─────────────────────────────────────────────
+# PROMPT BUILDER
+# ─────────────────────────────────────────────
+def build_prompt(uid, user_text):
+    chat = get_chat(uid)
 
-            if not user_text:
-                continue
+    context = retrieve(user_text, chat)
 
-            # ───────── RATE LIMIT ───────────
-            if is_rate_limited(session_id):
-                await ws.send_json({
-                    "type": "error",
-                    "message": "Too many requests. Slow down."
-                })
-                continue
-
-            sessions[session_id]["interrupted"] = False
-
-            # ───────── STORE USER TEXT ──────
-            supabase.table("messages").insert({
-                "user_id": session_id,
-                "role": "user",
-                "content": user_text
-            }).execute()
-
-            append_message(session_id, "user", user_text)
-
-            # ───────── MEMORY CACHE ─────────
-            memory_cache[session_id] = load_memory(session_id)
-
-            context = retrieve(user_text, memory_cache[session_id])
-
-            prompt = f"""
+    return f"""
 {SYSTEM_PROMPT}
+
+Conversation:
+{json.dumps(chat)}
 
 Context:
 {json.dumps(context)}
-
-Memory:
-{json.dumps(memory_cache[session_id])}
 
 User:
 {user_text}
 """
 
-            await ws.send_json({"type": "state", "value": "thinking"})
 
-            # ───────── AI RESPONSE ─────────
+# ─────────────────────────────────────────────
+# APP
+# ─────────────────────────────────────────────
+@app.websocket("/ws")
+async def ws(websocket: WebSocket):
+    await websocket.accept()
+
+    uid = None
+
+    try:
+        auth_data = await websocket.receive_json()
+
+        token = auth_data.get("token")
+        user = verify_token(token)
+
+        uid = user["uid"] if user else "test_user"
+
+        # init redis keys
+        redis.setnx(f"chat:{uid}", json.dumps([]))
+
+        recognizer = KaldiRecognizer(model, 16000)
+
+        pending_text = ""   # holds partial speech buffer
+
+        # ─────────────────────────────
+        # MAIN LOOP
+        # ─────────────────────────────
+        while True:
+            data = await websocket.receive_json()
+            msg_type = data.get("type")
+
+            user_text = None
+
+            # ───────── TEXT ─────────
+            if msg_type == "text":
+                user_text = data.get("message", "").strip()
+
+            # ───────── AUDIO PCM ─────────
+            elif msg_type == "audio":
+
+                pcm = base64.b64decode(data["audio"])
+
+                update_audio_time(uid)
+
+                if recognizer.AcceptWaveform(pcm):
+                    res = json.loads(recognizer.Result())
+                    user_text = res.get("text", "").strip()
+                else:
+                    partial = json.loads(recognizer.PartialResult())
+                    pending_text = partial.get("partial", "")
+
+                    await websocket.send_json({
+                        "type": "partial",
+                        "text": pending_text
+                    })
+
+                    # 🔥 CHECK SILENCE → AUTO TRIGGER AI
+                    if is_user_silent(uid):
+                        if pending_text:
+                            user_text = pending_text
+                            pending_text = ""
+
+            # ───────── INTERRUPT ─────────
+            elif msg_type == "interrupt":
+                redis.set(f"interrupt:{uid}", "1")
+                continue
+
+            if not user_text:
+                continue
+
+            # ───────── STORE USER MESSAGE ─────────
+            add_message(uid, "user", user_text)
+
+            prompt = build_prompt(uid, user_text)
+
+            await websocket.send_json({
+                "type": "state",
+                "value": "thinking"
+            })
+
+            # ───────── AI STREAM START ─────────
             response = await run_ai(prompt)
 
-            await ws.send_json({"type": "state", "value": "speaking"})
+            await websocket.send_json({
+                "type": "state",
+                "value": "speaking"
+            })
 
             ai_text = ""
 
             for word in response.split():
-                if sessions[session_id]["interrupted"]:
-                    break
 
-                await asyncio.sleep(0.03)
+                # check interrupt
+                if redis.get(f"interrupt:{uid}") == "1":
+                    redis.delete(f"interrupt:{uid}")
+                    break
 
                 ai_text += word + " "
 
-                await ws.send_json({
+                await websocket.send_json({
                     "type": "ai_token",
                     "text": word + " "
                 })
 
-            # ───────── STORE AI TEXT ────────
+                await asyncio.sleep(0.03)
+
+            # ───────── SAVE AI ─────────
+            add_message(uid, "ai", ai_text)
+
             supabase.table("messages").insert({
-                "user_id": session_id,
+                "user_id": uid,
                 "role": "ai",
                 "content": ai_text
             }).execute()
 
-            append_message(session_id, "ai", ai_text)
+            await websocket.send_json({
+                "type": "done"
+            })
 
-            memory_cache[session_id] = load_memory(session_id)
-
-            await ws.send_json({"type": "ai_done"})
-            await ws.send_json({"type": "state", "value": "listening"})
+            await websocket.send_json({
+                "type": "state",
+                "value": "listening"
+            })
 
 
     except WebSocketDisconnect:
-        print(f"Disconnected: {session_id}")
-
-    except Exception as e:
-        print("Error:", e)
-
-    finally:
-        if session_id:
-            sessions.pop(session_id, None)
-            memory_cache.pop(session_id, None)
-            recognizers.pop(session_id, None)
+        print("Disconnected:", uid)
