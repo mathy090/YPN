@@ -20,17 +20,14 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useAuth } from "../../src/store/authStore";
-import { saveTokens } from "../../src/utils/tokenManager"; // 🔥 Hybrid Auth
+import { saveTokens } from "../../src/utils/tokenManager";
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
-// 🔥 Use your Firebase Web API Key here (from Firebase Console > Project Settings)
 const FIREBASE_WEB_API_KEY =
   process.env.EXPO_PUBLIC_FIREBASE_WEB_API_KEY || "YOUR_WEB_API_KEY";
 
 export default function OTP() {
   const router = useRouter();
-  const { login } = useAuth();
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -58,7 +55,7 @@ export default function OTP() {
       const netState = await NetInfo.fetch();
       if (!netState.isConnected) throw new Error("NO_INTERNET");
 
-      // 🔥 1. Sign in with Firebase REST API (No native deps needed)
+      // 🔥 1. Sign in with Firebase REST API
       const restUrl = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_WEB_API_KEY}`;
 
       const restResponse = await fetch(restUrl, {
@@ -86,7 +83,7 @@ export default function OTP() {
         throw new Error("INVALID_CREDENTIALS");
       }
 
-      const firebaseIdToken = restData.idToken;
+      const firebaseIdToken = restData.idToken; // ✅ This is a STRING
       const uid = restData.localId;
 
       // 🔥 2. Exchange Firebase ID Token for Backend JWT
@@ -102,23 +99,44 @@ export default function OTP() {
         throw new Error("BACKEND_AUTH_FAILED");
       }
 
-      const { backend_jwt, expires_in, user } = await backendRes.json();
+      const backendData = await backendRes.json();
 
-      // 🔥 3. Store BOTH tokens in SecureStore
-      const expiryMs = Date.now() + expires_in * 1000;
-      await saveTokens(firebaseIdToken, backend_jwt, expiryMs);
+      // ✅ EXTRACT & VALIDATE RESPONSE
+      const { backend_jwt, expires_in, user, refresh_token } = backendData;
 
-      // 🔥 4. Update auth store
-      await login({
-        uid: user.uid,
-        email: user.email,
-        role: user.role,
-        hasProfile: user.hasProfile,
+      if (!backend_jwt || typeof backend_jwt !== "string") {
+        console.error(
+          "[otp.tsx] Invalid backend_jwt from server:",
+          backend_jwt,
+        );
+        throw new Error("INVALID_BACKEND_RESPONSE");
+      }
+      if (typeof expires_in !== "number") {
+        console.error("[otp.tsx] Invalid expires_in from server:", expires_in);
+        throw new Error("INVALID_BACKEND_RESPONSE");
+      }
+      if (!user || typeof user !== "object") {
+        console.error("[otp.tsx] Invalid user data from server:", user);
+        throw new Error("INVALID_BACKEND_RESPONSE");
+      }
+
+      // 🔥 3. Store tokens using OBJECT syntax (recommended)
+      console.log("[otp.tsx] Saving tokens...");
+
+      await saveTokens({
+        backend_jwt: String(backend_jwt).trim(),
+        refresh_token: refresh_token
+          ? String(refresh_token).trim()
+          : String(firebaseIdToken).trim(), // Fallback to Firebase token
+        expires_in: Number(expires_in),
+        user: user,
       });
 
-      // 🔥 5. Route based on profile status
+      console.log("[otp.tsx] ✅ Tokens saved successfully");
+
+      // 🔥 4. Route based on profile status
       if (user.hasProfile) {
-        router.replace("/tabs/discord");
+        router.replace("/(tabs)/discord");
       } else {
         router.replace({
           pathname: "/auth/device",
@@ -140,6 +158,13 @@ export default function OTP() {
         setError("This account has been suspended. Contact support.");
       } else if (e.message === "BACKEND_AUTH_FAILED") {
         setError("Our side is having a problem, try again later.");
+      } else if (e.message === "INVALID_BACKEND_RESPONSE") {
+        setError("Server returned invalid data. Please contact support.");
+      } else if (
+        e.message === "TOKEN_SAVE_FAILED" ||
+        e.message.includes("SecureStore")
+      ) {
+        setError("Failed to save login. Please restart the app.");
       } else {
         setError("Something went wrong. Please try again.");
       }

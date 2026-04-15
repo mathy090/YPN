@@ -1,4 +1,4 @@
-// app/tabs/_layout.tsx
+// app/(tabs)/_layout.tsx
 import { Ionicons } from "@expo/vector-icons";
 import { BlurView } from "expo-blur";
 import { Tabs } from "expo-router";
@@ -88,6 +88,7 @@ export default function TabsLayout() {
       <Tabs.Screen name="discord" />
       <Tabs.Screen name="foryou" />
       <Tabs.Screen name="news" />
+      {/* ✅ Settings tab is now registered */}
       <Tabs.Screen name="settings" />
     </Tabs>
   );
