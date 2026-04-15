@@ -3,11 +3,9 @@ import json
 import time
 import base64
 import asyncio
+import httpx
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
-
-import firebase_admin
-from firebase_admin import credentials, auth
 
 from vosk import Model, KaldiRecognizer
 
@@ -17,16 +15,8 @@ from supabase import create_client
 from retrievers import retrieve
 from prompts import SYSTEM_PROMPT
 
-
-# ── Firebase Init ─────────────────────────────────────────────────────────────
-cred_raw = os.getenv("FIREBASE_CREDENTIALS")
-if not cred_raw:
-    raise Exception("FIREBASE_CREDENTIALS missing")
-
-cred_json = json.loads(cred_raw)
-if not firebase_admin._apps:
-    firebase_admin.initialize_app(credentials.Certificate(cred_json))
-
+# ── Configuration ─────────────────────────────────────────────────────────────
+EXPRESS_BACKEND_URL = os.getenv("EXPRESS_BACKEND_URL")
 
 # ── Redis & Supabase ──────────────────────────────────────────────────────────
 redis = Redis(
@@ -60,13 +50,29 @@ else:
 app = FastAPI()
 
 
-# ── Auth: Verify Firebase ID Token ONLY ───────────────────────────────────────
-def verify_token(token: str):
-    """Returns decoded token dict if valid, None otherwise."""
-    try:
-        return auth.verify_id_token(token)
-    except Exception:
+# ── Auth: Verify Token via Express Backend ────────────────────────────────────
+async def verify_token_with_backend(token: str):
+    """
+    Sends the Backend JWT to Express /api/users/profile to verify it 
+    and get user details (uid, etc).
+    """
+    if not EXPRESS_BACKEND_URL:
         return None
+        
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                f"{EXPRESS_BACKEND_URL}/api/users/profile",
+                headers={"Authorization": f"Bearer {token}"}
+            )
+            
+            if response.status_code == 200:
+                return response.json() # Returns { uid, email, name, ... }
+            else:
+                return None
+        except Exception as e:
+            print(f"[Auth Error] {e}")
+            return None
 
 
 # ── AI Stub (Replace with your real async provider) ───────────────────────────
@@ -128,6 +134,7 @@ async def ws(websocket: WebSocket):
     uid = None
     recognizer = None
     pending_text = ""
+    backend_token = None
 
     try:
         # 🔥 1. AUTH PHASE: Wait for auth message ONLY
@@ -138,21 +145,22 @@ async def ws(websocket: WebSocket):
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
 
-        token = auth_data.get("token")
-        if not token:
+        backend_token = auth_data.get("token")
+        if not backend_token:
             await websocket.send_json({"type": "auth_error", "status": 401, "message": "Token missing"})
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
 
-        # 🔥 2. Verify Firebase ID Token — NO FALLBACK
-        user = verify_token(token)
-        if not user:
+        # 🔥 2. Verify Backend JWT with Express Server
+        user_info = await verify_token_with_backend(backend_token)
+        
+        if not user_info:
             await websocket.send_json({"type": "auth_error", "status": 401, "message": "Invalid token"})
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
 
         # 🔥 3. Auth success — proceed
-        uid = user["uid"]
+        uid = user_info.get("uid")
         redis.setnx(f"chat:{uid}", json.dumps([]))  # Init chat if new user
 
         if model:
