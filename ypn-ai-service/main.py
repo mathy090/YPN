@@ -18,10 +18,12 @@ from retrievers import retrieve
 from prompts import SYSTEM_PROMPT
 
 
-# ─────────────────────────────────────────────
-# FIREBASE
-# ─────────────────────────────────────────────
-cred_json = json.loads(os.getenv("FIREBASE_CREDENTIALS"))
+cred_raw = os.getenv("FIREBASE_CREDENTIALS")
+
+if not cred_raw:
+    raise Exception("FIREBASE_CREDENTIALS missing")
+
+cred_json = json.loads(cred_raw)
 
 if not firebase_admin._apps:
     firebase_admin.initialize_app(
@@ -29,36 +31,41 @@ if not firebase_admin._apps:
     )
 
 
-# ─────────────────────────────────────────────
-# REDIS
-# ─────────────────────────────────────────────
 redis = Redis(
     url=os.getenv("UPSTASH_REDIS_REST_URL"),
     token=os.getenv("UPSTASH_REDIS_REST_TOKEN")
 )
 
 
-# ─────────────────────────────────────────────
-# SUPABASE
-# ─────────────────────────────────────────────
-supabase = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_KEY")
+supabase_url = os.getenv("SUPABASE_URL")
+supabase_key = os.getenv("SUPABASE_KEY")
+
+if not supabase_url or not supabase_key:
+    raise Exception("SUPABASE_URL or SUPABASE_KEY missing")
+
+supabase = create_client(supabase_url, supabase_key)
+
+
+VOSK_MODEL_PATH = os.getenv(
+    "VOSK_MODEL_PATH",
+    "models/vosk-model-small-en-us-0.15"
 )
 
+model = None
 
-# ─────────────────────────────────────────────
-# VOSK MODEL
-# ─────────────────────────────────────────────
-model = Model("models/vosk-small-en-us-0.15")
+if os.path.isdir(VOSK_MODEL_PATH) and os.path.exists(os.path.join(VOSK_MODEL_PATH, "conf")):
+    try:
+        model = Model(VOSK_MODEL_PATH)
+        print("[VOSK] Model loaded successfully")
+    except Exception:
+        model = None
+else:
+    print("[VOSK] Model missing or invalid")
 
 
 app = FastAPI()
 
 
-# ─────────────────────────────────────────────
-# AUTH
-# ─────────────────────────────────────────────
 def verify_token(token: str):
     try:
         return auth.verify_id_token(token)
@@ -66,24 +73,17 @@ def verify_token(token: str):
         return None
 
 
-# ─────────────────────────────────────────────
-# AI ENGINE (placeholder)
-# ─────────────────────────────────────────────
 async def run_ai(prompt: str):
     await asyncio.sleep(0.2)
     return "I understand. I'm listening carefully and responding step by step."
 
 
-# ─────────────────────────────────────────────
-# REDIS HELPERS
-# ─────────────────────────────────────────────
 def add_message(uid, role, text):
     key = f"chat:{uid}"
     data = redis.get(key)
 
     chat = json.loads(data) if data else []
     chat.append({"role": role, "text": text, "t": time.time()})
-
     chat = chat[-20:]
 
     redis.set(key, json.dumps(chat))
@@ -95,9 +95,6 @@ def get_chat(uid):
     return json.loads(data) if data else []
 
 
-# ─────────────────────────────────────────────
-# VAD
-# ─────────────────────────────────────────────
 def update_audio_time(uid):
     redis.set(f"last_audio:{uid}", time.time())
 
@@ -109,9 +106,6 @@ def is_user_silent(uid, threshold=0.8):
     return (time.time() - float(last)) > threshold
 
 
-# ─────────────────────────────────────────────
-# PROMPT
-# ─────────────────────────────────────────────
 def build_prompt(uid, user_text):
     chat = get_chat(uid)
     context = retrieve(user_text, chat)
@@ -130,14 +124,13 @@ User:
 """
 
 
-# ─────────────────────────────────────────────
-# WEB SOCKET
-# ─────────────────────────────────────────────
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
     await websocket.accept()
 
     uid = None
+    recognizer = None
+    pending_text = ""
 
     try:
         auth_data = await websocket.receive_json()
@@ -149,8 +142,8 @@ async def ws(websocket: WebSocket):
 
         redis.setnx(f"chat:{uid}", json.dumps([]))
 
-        recognizer = KaldiRecognizer(model, 16000)
-        pending_text = ""
+        if model:
+            recognizer = KaldiRecognizer(model, 16000)
 
         while True:
             data = await websocket.receive_json()
@@ -158,12 +151,10 @@ async def ws(websocket: WebSocket):
 
             user_text = None
 
-            # TEXT
             if msg_type == "text":
                 user_text = data.get("message", "").strip()
 
-            # AUDIO
-            elif msg_type == "audio":
+            elif msg_type == "audio" and recognizer:
                 pcm = base64.b64decode(data["audio"])
                 update_audio_time(uid)
 
@@ -183,7 +174,6 @@ async def ws(websocket: WebSocket):
                         user_text = pending_text
                         pending_text = ""
 
-            # INTERRUPT
             elif msg_type == "interrupt":
                 redis.set(f"interrupt:{uid}", "1")
                 continue
@@ -228,7 +218,6 @@ async def ws(websocket: WebSocket):
 
             await websocket.send_json({"type": "done"})
             await websocket.send_json({"type": "state", "value": "listening"})
-
 
     except WebSocketDisconnect:
         print("Disconnected:", uid)
