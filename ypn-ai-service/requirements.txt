@@ -3,6 +3,6 @@ uvicorn[standard]
 httpx
 python-dotenv
 cohere
-vosk
+vosk-model-small-en-us-0.15
 python-multipart
 websockets
