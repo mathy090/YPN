@@ -1,10 +1,7 @@
 // src/screens/TeamYPN.tsx
-// Added: voice call icon → opens VoiceCallScreen modal (full-screen slide)
-// Everything else is unchanged from your original.
-
 import { Ionicons } from "@expo/vector-icons";
 import { BlurView } from "expo-blur";
-import { useFocusEffect, useRouter } from "expo-router";
+import { useRouter } from "expo-router";
 import React, {
   useCallback,
   useEffect,
@@ -14,6 +11,7 @@ import React, {
 } from "react";
 import {
   ActivityIndicator,
+  Alert,
   Animated,
   FlatList,
   Image,
@@ -41,6 +39,7 @@ import {
   clearTeamYPNUnreadBadge,
   incrementUnreadBadge,
 } from "../utils/teamYPNBadge";
+import { clearToken, getToken } from "../utils/tokenManager"; // 🔥 Firebase token utils
 import VoiceCallScreen from "./VoiceCallScreen";
 
 const AI_API_URL = `${process.env.EXPO_PUBLIC_AI_URL}/chat`;
@@ -150,7 +149,7 @@ export default function TeamYPNScreen() {
   const [loading, setLoading] = useState(true);
   const [aiTyping, setAiTyping] = useState(false);
 
-  // ── New: voice modal visibility ─────────────────────────────────────────
+  // ── Voice modal visibility ─────────────────────────────────────────
   const [voiceVisible, setVoiceVisible] = useState(false);
 
   const [pending, setPending] = useState<Message | null>(null);
@@ -218,15 +217,45 @@ export default function TeamYPNScreen() {
     setTimeout(() => listRef.current?.scrollToEnd({ animated }), 80);
   }, []);
 
+  // 🔥 Auth-aware AI fetch with Firebase ID token
   const fetchAIReply = async (text: string): Promise<string> => {
-    const res = await fetch(AI_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text }),
-    });
-    if (!res.ok) throw new Error(`AI ${res.status}`);
-    const data = await res.json();
-    return (data.reply ?? data.message ?? "Sorry, no response.") as string;
+    try {
+      const token = await getToken();
+      if (!token) throw new Error("NO_TOKEN");
+
+      const res = await fetch(AI_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`, // 🔥 Firebase ID token only
+        },
+        body: JSON.stringify({ message: text }),
+      });
+
+      // 🔥 Handle 401 = invalid/expired token
+      if (res.status === 401) {
+        await clearToken();
+        throw new Error("AUTH_EXPIRED");
+      }
+
+      if (!res.ok) throw new Error(`AI ${res.status}`);
+      const data = await res.json();
+      return (data.reply ?? data.message ?? "Sorry, no response.") as string;
+    } catch (err: any) {
+      if (err.message === "NO_TOKEN" || err.message === "AUTH_EXPIRED") {
+        // Redirect to login on auth failure
+        Alert.alert("Session Expired", "Please log in again to continue.", [
+          {
+            text: "Log In",
+            onPress: () => {
+              clearToken();
+              router.replace("/auth/otp");
+            },
+          },
+        ]);
+      }
+      throw err;
+    }
   };
 
   const sendMessage = useCallback(
@@ -563,7 +592,7 @@ export default function TeamYPNScreen() {
   );
 }
 
-// ── Styles (identical to your original + voiceCallBtn added) ──────────────────
+// ── Styles (unchanged + voiceCallBtn) ──────────────────
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#0B141A" },
   loadingWrap: {
@@ -597,7 +626,7 @@ const s = StyleSheet.create({
   },
   headerSub: { color: "#8696A0", fontSize: 12, marginTop: 1 },
 
-  // ── New voice button ──
+  // ── Voice button ──
   voiceCallBtn: {
     width: 40,
     height: 40,

@@ -12,41 +12,62 @@ if (__DEV__ && !API_URL) {
   );
 }
 
+// ── Helper: Check if token is near expiry (<5 mins) ────────────────────────
+function isTokenExpiringSoon(token: string): boolean {
+  try {
+    // Firebase ID tokens are JWTs; decode payload without verification
+    const payload = JSON.parse(atob(token.split(".")[1]));
+    const expiry = payload.exp * 1000; // convert to ms
+    const now = Date.now();
+    return expiry - now < 5 * 60 * 1000; // <5 mins remaining
+  } catch {
+    return true; // If we can't decode, assume expiring
+  }
+}
+
+// ── Save token to SecureStore ─────────────────────────────────────────────
 export async function saveToken(token: string): Promise<void> {
   await SecureStore.setItemAsync(TOKEN_KEY, token, {
     keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
   });
 }
 
+// ── Get cached token (no network) ─────────────────────────────────────────
 export async function getToken(): Promise<string | null> {
   return SecureStore.getItemAsync(TOKEN_KEY);
 }
 
-export async function refreshToken(): Promise<string> {
+// ── Get valid token: cached if fresh, else refresh from Firebase ──────────
+export async function getValidToken(): Promise<string> {
+  const cached = await getToken();
+
+  // Use cached if still valid (not expiring soon)
+  if (cached && !isTokenExpiringSoon(cached)) {
+    return cached;
+  }
+
+  // Otherwise, get fresh token from Firebase
   const user = auth.currentUser;
-  if (!user) throw new Error("No authenticated user");
-  const fresh = await user.getIdToken(true);
+  if (!user) throw new Error("Not authenticated");
+
+  // Force refresh only if truly needed
+  const fresh = await user.getIdToken(!!cached); // true if we had a cached one
   await saveToken(fresh);
   return fresh;
 }
 
+// ── Auth headers for API calls ────────────────────────────────────────────
+export async function authHeaders(): Promise<{ Authorization: string }> {
+  const token = await getValidToken();
+  return { Authorization: `Bearer ${token}` };
+}
+
+// ── Clear token on logout ─────────────────────────────────────────────────
 export async function clearToken(): Promise<void> {
   await SecureStore.deleteItemAsync(TOKEN_KEY);
 }
 
-export async function authHeaders(): Promise<{ Authorization: string }> {
-  try {
-    const token = await refreshToken();
-    return { Authorization: `Bearer ${token}` };
-  } catch {
-    const cached = await getToken();
-    if (!cached) throw new Error("Not authenticated");
-    return { Authorization: `Bearer ${cached}` };
-  }
-}
-
-// Token sent as Authorization header — matches verifyFirebaseToken middleware
-// (original sent it in body as { token } which the middleware never read → always 401)
+// ── Verify token with backend (for profile checks, etc.) ──────────────────
 export async function verifyWithBackend(
   idToken: string,
 ): Promise<{ uid: string; email: string; hasProfile: boolean }> {
