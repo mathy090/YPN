@@ -8,6 +8,7 @@ import { Stack, useRootNavigationState, useRouter } from "expo-router";
 import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
 import { useAuth } from "../src/store/authStore";
+import { startHeartbeat, stopHeartbeat } from "../src/utils/heartbeat"; // 🔥 Import Heartbeat
 
 export default function RootLayout() {
   const router = useRouter();
@@ -32,6 +33,9 @@ export default function RootLayout() {
       const result = await bootAndVerify();
 
       if (result.ok) {
+        // 🔥 Start Heartbeat since user is verified
+        startHeartbeat();
+
         // Backend confirmed — route based on profile completeness.
         if (result.hasProfile) {
           router.replace("/tabs/discord");
@@ -40,6 +44,9 @@ export default function RootLayout() {
           router.replace("/auth/device");
         }
       } else {
+        // 🔥 Ensure Heartbeat is stopped if auth fails
+        stopHeartbeat();
+
         // Any failure: sign-out already done inside bootAndVerify.
         switch (result.reason) {
           case "offline":
@@ -61,6 +68,13 @@ export default function RootLayout() {
       setBooting(false);
     })();
   }, [navState?.key]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Cleanup heartbeat on unmount
+  useEffect(() => {
+    return () => {
+      stopHeartbeat();
+    };
+  }, []);
 
   return (
     <>

@@ -1,7 +1,6 @@
-// app/auth/otp.tsx — Login (Firebase ID Token Only)
+// app/auth/otp.tsx — Login (Firebase REST API + Hybrid Auth)
 import { Ionicons } from "@expo/vector-icons";
 import NetInfo from "@react-native-community/netinfo";
-import auth from "@react-native-firebase/auth"; // 🔥 Firebase Auth
 import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
@@ -22,9 +21,12 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useAuth } from "../../src/store/authStore";
-import { saveToken, verifyWithBackend } from "../../src/utils/tokenManager";
+import { saveTokens } from "../../src/utils/tokenManager"; // 🔥 Hybrid Auth
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
+// 🔥 Use your Firebase Web API Key here (from Firebase Console > Project Settings)
+const FIREBASE_WEB_API_KEY =
+  process.env.EXPO_PUBLIC_FIREBASE_WEB_API_KEY || "YOUR_WEB_API_KEY";
 
 export default function OTP() {
   const router = useRouter();
@@ -56,70 +58,87 @@ export default function OTP() {
       const netState = await NetInfo.fetch();
       if (!netState.isConnected) throw new Error("NO_INTERNET");
 
-      // 🔥 1. Sign in with Firebase Auth (email/password)
-      const userCredential = await auth().signInWithEmailAndPassword(
-        email.trim(),
-        password,
-      );
-      const firebaseUser = userCredential.user;
+      // 🔥 1. Sign in with Firebase REST API (No native deps needed)
+      const restUrl = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_WEB_API_KEY}`;
 
-      // 🔥 2. Get Firebase ID Token (the ONLY token we use)
-      const idToken = await firebaseUser.getIdToken(/* forceRefresh */ false);
-      if (!idToken) throw new Error("TOKEN_MISSING");
+      const restResponse = await fetch(restUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: email.trim(),
+          password,
+          returnSecureToken: true,
+        }),
+      });
 
-      // 🔥 3. Store ONLY the Firebase ID token in SecureStore
-      await saveToken(idToken);
+      const restData = await restResponse.json();
 
-      // 🔥 4. Optional: Verify with backend for profile status
-      //    Backend will verify this ID token server-side via verifyFirebaseToken middleware
-      let hasProfile = false;
-      try {
-        const profile = await verifyWithBackend(idToken);
-        hasProfile = profile.hasProfile ?? false;
-      } catch (err) {
-        // Non-critical: proceed even if backend is down
-        // Profile setup can happen later
-        console.warn("[Login] Backend verify failed, proceeding:", err);
-        hasProfile = false;
+      if (!restResponse.ok) {
+        if (restData.error?.message === "EMAIL_NOT_FOUND") {
+          throw new Error("ACCOUNT_NOT_FOUND");
+        }
+        if (restData.error?.message === "INVALID_PASSWORD") {
+          throw new Error("INVALID_CREDENTIALS");
+        }
+        if (restData.error?.message === "USER_DISABLED") {
+          throw new Error("USER_DISABLED");
+        }
+        throw new Error("INVALID_CREDENTIALS");
       }
 
-      // 🔥 5. Update auth store & route based on profile status
-      await login(); // Your store can store firebaseUser.uid if needed
+      const firebaseIdToken = restData.idToken;
+      const uid = restData.localId;
 
-      if (hasProfile) {
+      // 🔥 2. Exchange Firebase ID Token for Backend JWT
+      const backendRes = await fetch(`${API_URL}/api/auth/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ firebase_id_token: firebaseIdToken }),
+      });
+
+      if (!backendRes.ok) {
+        const errData = await backendRes.json().catch(() => ({}));
+        if (backendRes.status === 403) throw new Error("ACCOUNT_SUSPENDED");
+        throw new Error("BACKEND_AUTH_FAILED");
+      }
+
+      const { backend_jwt, expires_in, user } = await backendRes.json();
+
+      // 🔥 3. Store BOTH tokens in SecureStore
+      const expiryMs = Date.now() + expires_in * 1000;
+      await saveTokens(firebaseIdToken, backend_jwt, expiryMs);
+
+      // 🔥 4. Update auth store
+      await login({
+        uid: user.uid,
+        email: user.email,
+        role: user.role,
+        hasProfile: user.hasProfile,
+      });
+
+      // 🔥 5. Route based on profile status
+      if (user.hasProfile) {
         router.replace("/tabs/discord");
       } else {
         router.replace({
           pathname: "/auth/device",
-          params: {
-            userEmail: firebaseUser.email,
-            userUid: firebaseUser.uid,
-          },
+          params: { userEmail: user.email, userUid: user.uid },
         });
       }
     } catch (e: any) {
       console.error("[Login Error]", e);
 
-      // 🔥 Firebase-specific error mapping for better UX
-      const code = e.code;
-      if (code === "auth/invalid-email") {
-        setError("Invalid email format.");
-      } else if (code === "auth/user-disabled") {
-        setError("This account has been disabled.");
-      } else if (code === "auth/user-not-found") {
-        setError("No account found with this email.");
-      } else if (code === "auth/wrong-password") {
-        setError("Incorrect password. Try again or reset.");
-      } else if (code === "auth/too-many-requests") {
-        setError("Too many attempts. Try again later.");
-      } else if (
-        code === "auth/network-request-failed" ||
-        e.message === "NO_INTERNET"
-      ) {
+      if (e.message === "NO_INTERNET") {
         setError("Poor internet connection.");
-      } else if (e.message === "TOKEN_MISSING") {
-        setError("Authentication failed. Please try again.");
-      } else if (code === "auth/internal-error" || code === "auth/unknown") {
+      } else if (e.message === "ACCOUNT_NOT_FOUND") {
+        setError("No account found with this email.");
+      } else if (e.message === "INVALID_CREDENTIALS") {
+        setError("Incorrect password. Try again or reset.");
+      } else if (e.message === "USER_DISABLED") {
+        setError("This account has been disabled.");
+      } else if (e.message === "ACCOUNT_SUSPENDED") {
+        setError("This account has been suspended. Contact support.");
+      } else if (e.message === "BACKEND_AUTH_FAILED") {
         setError("Our side is having a problem, try again later.");
       } else {
         setError("Something went wrong. Please try again.");

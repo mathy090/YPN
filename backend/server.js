@@ -47,6 +47,10 @@ admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
 // ── Express App Setup ────────────────────────────────────────────────────────
 const app = express();
+
+// 🔥 FIX: Trust Render's Proxy (Fixes X-Forwarded-For error)
+app.set('trust proxy', 1);
+
 app.use(cors());
 app.use(express.json());
 
