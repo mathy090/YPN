@@ -2,7 +2,10 @@ fastapi
 uvicorn[standard]
 httpx
 python-dotenv
+pydantic
+firebase-admin
 cohere
 vosk-model-small-en-us-0.15
 python-multipart
 websockets
+supabase 

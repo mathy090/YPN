@@ -1,222 +1,252 @@
 # main.py
-# FastAPI WebSocket + HTTP API with:
-# - Redis (double cache: request/response + session cache)
-# - Supabase (persistent memory)
-# - Firebase Admin (JWT verification)
-# - Streaming AI responses
-
 import os
 import json
+import time
+import base64
 import asyncio
-from typing import Optional
+from collections import defaultdict, deque
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
-import redis
-import httpx
-
-# Supabase
-from supabase import create_client, Client
-
-# Firebase Admin
 import firebase_admin
 from firebase_admin import credentials, auth
 
-# ─────────────────────────────────────────────
-# ENV
-# ─────────────────────────────────────────────
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-AI_API_URL = os.getenv("AI_API_URL")
-AI_API_KEY = os.getenv("AI_API_KEY")
+from vosk import Model, KaldiRecognizer
 
-# Firebase
-FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID")
-FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL")
-FIREBASE_PRIVATE_KEY = os.getenv("FIREBASE_PRIVATE_KEY")
+from supabase import create_client
+
+from memory import load_memory, append_message
+from retrievers import retrieve
+from prompts import SYSTEM_PROMPT
+
 
 # ─────────────────────────────────────────────
-# INIT
+# FIREBASE INIT
+# ─────────────────────────────────────────────
+cred_json = json.loads(os.getenv("FIREBASE_CREDENTIALS"))
+
+if not firebase_admin._apps:
+    firebase_admin.initialize_app(
+        credentials.Certificate(cred_json)
+    )
+
+
+# ─────────────────────────────────────────────
+# SUPABASE (TEXT ONLY STORAGE)
+# ─────────────────────────────────────────────
+supabase = create_client(
+    os.getenv("SUPABASE_URL"),
+    os.getenv("SUPABASE_KEY")
+)
+
+
+# ─────────────────────────────────────────────
+# VOSK MODEL (SMALL ENGLISH US)
+# ─────────────────────────────────────────────
+model = Model("models/vosk-small-en-us-0.15")
+
+
+# ─────────────────────────────────────────────
+# APP
 # ─────────────────────────────────────────────
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Redis (double cache)
-redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-
-# Supabase
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# Firebase init
-firebase_admin.initialize_app(
-    credentials.Certificate({
-        "type": "service_account",
-        "project_id": FIREBASE_PROJECT_ID,
-        "private_key": FIREBASE_PRIVATE_KEY.replace("\\n", "\n"),
-        "client_email": FIREBASE_CLIENT_EMAIL,
-        "token_uri": "https://oauth2.googleapis.com/token",
-    })
-)
 
 # ─────────────────────────────────────────────
-# HELPERS
+# SESSION STATE
+# ─────────────────────────────────────────────
+sessions = {}          # {uid: {interrupted: bool}}
+memory_cache = {}      # {uid: memory}
+recognizers = {}       # {uid: vosk recognizer}
+
+rate_limit = defaultdict(lambda: deque(maxlen=5))
+
+
+# ─────────────────────────────────────────────
+# AUTH
 # ─────────────────────────────────────────────
 def verify_token(token: str):
     try:
-        decoded = auth.verify_id_token(token)
-        return decoded
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-
-def redis_session_key(session_id: str):
-    return f"session:{session_id}"
-
-
-def redis_response_key(text: str):
-    return f"resp:{hash(text)}"
-
-
-async def load_session(session_id: str):
-    cached = redis_client.get(redis_session_key(session_id))
-    if cached:
-        return json.loads(cached)
-
-    res = supabase.table("chat_sessions").select("*").eq("session_id", session_id).execute()
-
-    if res.data:
-        data = res.data[0]
-        redis_client.set(redis_session_key(session_id), json.dumps(data), ex=3600)
-        return data
-
-    new_data = {
-        "session_id": session_id,
-        "messages": [],
-        "emotion_state": "neutral"
-    }
-
-    supabase.table("chat_sessions").insert(new_data).execute()
-    redis_client.set(redis_session_key(session_id), json.dumps(new_data), ex=3600)
-
-    return new_data
-
-
-async def save_session(session_id: str, data: dict):
-    redis_client.set(redis_session_key(session_id), json.dumps(data), ex=3600)
-
-    supabase.table("chat_sessions").upsert(data).execute()
+        return auth.verify_id_token(token)
+    except Exception as e:
+        print("Auth error:", e)
+        return None
 
 
 # ─────────────────────────────────────────────
-# AI STREAM (WITH CACHE)
+# RATE LIMIT (5 msgs / 10 sec)
 # ─────────────────────────────────────────────
-async def stream_ai(text: str):
-    cache_key = redis_response_key(text)
+def is_rate_limited(uid: str):
+    now = time.time()
+    q = rate_limit[uid]
 
-    cached = redis_client.get(cache_key)
-    if cached:
-        for token in cached.split():
-            yield token + " "
-        return
+    while q and now - q[0] > 10:
+        q.popleft()
 
-    # Replace with real AI API call
-    response = f"I understand. Let's take this step by step."
+    if len(q) >= 5:
+        return True
 
-    redis_client.set(cache_key, response, ex=600)
-
-    for token in response.split():
-        await asyncio.sleep(0.05)
-        yield token + " "
+    q.append(now)
+    return False
 
 
 # ─────────────────────────────────────────────
-# HTTP ENDPOINT (fallback)
+# AI ENGINE (REPLACE WITH GPT / GROQ)
 # ─────────────────────────────────────────────
-@app.post("/chat")
-async def chat(request: Request):
-    body = await request.json()
-
-    token = body.get("token")
-    message = body.get("message")
-    session_id = body.get("session_id")
-
-    verify_token(token)
-
-    session = await load_session(session_id)
-
-    session["messages"].append({"role": "user", "content": message})
-
-    reply = ""
-    async for token in stream_ai(message):
-        reply += token
-
-    session["messages"].append({"role": "ai", "content": reply})
-
-    await save_session(session_id, session)
-
-    return {"reply": reply}
+async def run_ai(prompt: str):
+    await asyncio.sleep(0.2)
+    return "I understand your message. Let's work through this step by step."
 
 
 # ─────────────────────────────────────────────
-# WEBSOCKET (REALTIME)
+# WEBSOCKET
 # ─────────────────────────────────────────────
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
+async def websocket(ws: WebSocket):
     await ws.accept()
 
+    session_id = None
+
     try:
+        # ── AUTH ─────────────────────────
+        auth_data = await ws.receive_json()
+
+        token = auth_data.get("token")
+        user = verify_token(token) if token else None
+
+        session_id = user["uid"] if user else "test_user"
+
+        sessions[session_id] = {"interrupted": False}
+
+        # ── INIT MEMORY ──────────────────
+        if session_id not in memory_cache:
+            memory_cache[session_id] = load_memory(session_id)
+
+        # ── INIT VOSK RECOGNIZER ─────────
+        recognizers[session_id] = KaldiRecognizer(model, 16000)
+
+        recognizer = recognizers[session_id]
+
+        # ────────────────────────────────
+        # MAIN LOOP
+        # ────────────────────────────────
         while True:
             data = await ws.receive_json()
-
-            token = data.get("token")
-            session_id = data.get("session_id")
             msg_type = data.get("type")
 
-            verify_token(token)
+            user_text = None
 
-            session = await load_session(session_id)
-
+            # ───────── TEXT INPUT ─────────
             if msg_type == "text":
-                user_text = data.get("message")
+                user_text = data.get("message", "").strip()
 
-                session["messages"].append({
-                    "role": "user",
-                    "content": user_text
-                })
+            # ───────── PCM AUDIO INPUT ─────
+            elif msg_type == "audio":
 
-                await ws.send_json({"type": "state", "value": "THINKING"})
+                # PCM base64 → raw bytes
+                pcm_bytes = base64.b64decode(data["audio"])
 
-                ai_text = ""
-
-                async for token in stream_ai(user_text):
-                    ai_text += token
-
+                if recognizer.AcceptWaveform(pcm_bytes):
+                    result = json.loads(recognizer.Result())
+                    user_text = result.get("text", "").strip()
+                else:
+                    partial = json.loads(recognizer.PartialResult())
                     await ws.send_json({
-                        "type": "ai_token",
-                        "text": token
+                        "type": "partial_transcript",
+                        "text": partial.get("partial", "")
                     })
+                    continue
 
-                session["messages"].append({
-                    "role": "ai",
-                    "content": ai_text
+            # ───────── INTERRUPT ───────────
+            elif msg_type == "interrupt":
+                sessions[session_id]["interrupted"] = True
+                continue
+
+            if not user_text:
+                continue
+
+            # ───────── RATE LIMIT ───────────
+            if is_rate_limited(session_id):
+                await ws.send_json({
+                    "type": "error",
+                    "message": "Too many requests. Slow down."
+                })
+                continue
+
+            sessions[session_id]["interrupted"] = False
+
+            # ───────── STORE USER TEXT ──────
+            supabase.table("messages").insert({
+                "user_id": session_id,
+                "role": "user",
+                "content": user_text
+            }).execute()
+
+            append_message(session_id, "user", user_text)
+
+            # ───────── MEMORY CACHE ─────────
+            memory_cache[session_id] = load_memory(session_id)
+
+            context = retrieve(user_text, memory_cache[session_id])
+
+            prompt = f"""
+{SYSTEM_PROMPT}
+
+Context:
+{json.dumps(context)}
+
+Memory:
+{json.dumps(memory_cache[session_id])}
+
+User:
+{user_text}
+"""
+
+            await ws.send_json({"type": "state", "value": "thinking"})
+
+            # ───────── AI RESPONSE ─────────
+            response = await run_ai(prompt)
+
+            await ws.send_json({"type": "state", "value": "speaking"})
+
+            ai_text = ""
+
+            for word in response.split():
+                if sessions[session_id]["interrupted"]:
+                    break
+
+                await asyncio.sleep(0.03)
+
+                ai_text += word + " "
+
+                await ws.send_json({
+                    "type": "ai_token",
+                    "text": word + " "
                 })
 
-                await save_session(session_id, session)
+            # ───────── STORE AI TEXT ────────
+            supabase.table("messages").insert({
+                "user_id": session_id,
+                "role": "ai",
+                "content": ai_text
+            }).execute()
 
-                await ws.send_json({"type": "ai_done"})
-                await ws.send_json({"type": "state", "value": "LISTENING"})
+            append_message(session_id, "ai", ai_text)
 
-            elif msg_type == "interrupt":
-                await ws.send_json({"type": "state", "value": "LISTENING"})
+            memory_cache[session_id] = load_memory(session_id)
+
+            await ws.send_json({"type": "ai_done"})
+            await ws.send_json({"type": "state", "value": "listening"})
+
 
     except WebSocketDisconnect:
-        pass
+        print(f"Disconnected: {session_id}")
+
+    except Exception as e:
+        print("Error:", e)
+
+    finally:
+        if session_id:
+            sessions.pop(session_id, None)
+            memory_cache.pop(session_id, None)
+            recognizers.pop(session_id, None)
