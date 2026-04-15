@@ -27,7 +27,11 @@ const {
   initNewsArchive,
 } = require("./src/routes/newsRoutes");
 const mediaRoutes = require("./src/routes/mediaRoutes");
-const avatarRoutes = require("./src/routes/avatarRoutes");
+// 🔥 Import avatar routes module (with init function)
+const {
+  router: avatarRouter,
+  init: initAvatarRoutes,
+} = require("./src/routes/avatarRoutes");
 
 // ── Firebase Admin Setup ─────────────────────────────────────────────────────
 if (!process.env.FIREBASE_ADMIN_KEY) {
@@ -48,11 +52,18 @@ admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 // ── Express App Setup ────────────────────────────────────────────────────────
 const app = express();
 
-// 🔥 FIX 1: Trust Render's Proxy (Fixes X-Forwarded-For error)
+// 🔥 FIX: Trust Render's Proxy (Fixes X-Forwarded-For error)
 app.set("trust proxy", 1);
 
 app.use(cors());
 app.use(express.json());
+
+// 🔥 Avatar routes need raw body parsing for image uploads (not JSON)
+// We apply this ONLY to /api/avatar routes
+app.use(
+  "/api/avatar",
+  express.raw({ type: ["image/*", "application/octet-stream"], limit: "5mb" }),
+);
 
 // ── 🔥 Rate Limiting Configuration ──────────────────────────────────────────
 
@@ -163,11 +174,15 @@ async function connectDB() {
     db = client.db("ypn_users");
     console.log("✅ Connected to MongoDB");
 
+    // Initialize all modules with db instance
     initUserVideos(db);
     initDiscordChannels(db);
     initKeyStore(db);
     initNewsArchive(db);
     initDriveVideos(db);
+
+    // 🔥 Initialize avatar routes with db (for MongoDB updates)
+    initAvatarRoutes(db);
 
     registerRoutes();
   } catch (err) {
@@ -185,7 +200,7 @@ function registerRoutes() {
       const { status } = req.body; // 'online', 'idle', etc.
 
       await db.collection("users").updateOne(
-        { _id: new require("mongodb").ObjectId(userId) }, // Ensure ObjectId format if needed
+        { _id: new require("mongodb").ObjectId(userId) },
         {
           $set: {
             lastSeen: new Date(),
@@ -319,19 +334,18 @@ function registerRoutes() {
       }
 
       // 3. Issue custom backend JWT with custom claims + expiry
-      // 🔥 This uses the BACKEND_JWT_SECRET from your Render Env Vars
       const backendJwt = jwt.sign(
         {
-          sub: uid, // Firebase UID as subject
+          sub: uid,
           email,
           name: name || "",
           picture: picture || "",
           role: userProfile?.role || "user",
-          hasProfile: !!userProfile?.username, // true if username is set
+          hasProfile: !!userProfile?.username,
         },
         process.env.BACKEND_JWT_SECRET,
         {
-          expiresIn: process.env.BACKEND_JWT_EXPIRY || "1h", // e.g., "1h", "7d"
+          expiresIn: process.env.BACKEND_JWT_EXPIRY || "1h",
           issuer: "ypn-backend",
           audience: "ypn-app",
         },
@@ -448,7 +462,6 @@ function registerRoutes() {
       }
 
       if (!currentUser.username) {
-        // User hasn't set a username yet. Try to set it now.
         const result = await db.collection("users").findOneAndUpdate(
           { uid, username: { $exists: false } },
           {
@@ -467,7 +480,6 @@ function registerRoutes() {
             .json({ code: "USERNAME_TAKEN", message: "Username taken." });
         }
       } else {
-        // User already has a username. Just update name/avatar.
         if (rawUsername && rawUsername.toLowerCase() !== currentUser.username) {
           return res.status(409).json({
             code: "USERNAME_LOCKED",
@@ -548,8 +560,10 @@ function registerRoutes() {
     }
   });
 
-  // ── Mount External Routes (Use verifyBackendToken for hybrid auth) ─────────
-  app.use("/api/avatar", verifyBackendToken, avatarRoutes);
+  // ── Mount External Routes ──────────────────────────────────────────────────
+  // 🔥 Avatar routes: protected + raw body parsing already applied above
+  app.use("/api/avatar", verifyBackendToken, avatarRouter);
+
   app.use("/api/videos/drive", driveVideoRoutes);
   app.use("/api/videos", videoRoutes);
   app.use("/api/discord", discordRoutes);
