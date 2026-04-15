@@ -5,7 +5,7 @@ python-dotenv
 pydantic
 firebase-admin
 cohere
-vosk-model-small-en-us-0.15
+vosk
 python-multipart
 websockets
 supabase 
