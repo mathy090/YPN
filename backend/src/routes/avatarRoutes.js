@@ -116,8 +116,8 @@ router.post("/", avatarUploadLimiter, async (req, res) => {
 
     const supabase = getSupabase();
 
-    // ✅ FIX 1: Correct destructuring for upload() - returns { data, error }
-    const { uploadData, error: uploadError } = await supabase.storage
+    // ✅ FIX: Supabase upload() returns { data: { path }, error }
+    const uploadResult = await supabase.storage
       .from("avatars")
       .upload(filePath, buffer, {
         contentType: mimeType,
@@ -125,11 +125,18 @@ router.post("/", avatarUploadLimiter, async (req, res) => {
         cacheControl: "3600",
       });
 
-    if (uploadError) {
+    console.log("[/api/avatar] Upload result:", {
+      hasData: !!uploadResult.data,
+      path: uploadResult.data?.path,
+      hasError: !!uploadResult.error,
+      errorMessage: uploadResult.error?.message,
+    });
+
+    if (uploadResult.error) {
       console.error("[/api/avatar] Supabase upload error:", {
-        message: uploadError.message,
-        name: uploadError.name,
-        statusCode: uploadError.statusCode,
+        message: uploadResult.error.message,
+        name: uploadResult.error.name,
+        statusCode: uploadResult.error.statusCode,
       });
       return res.status(500).json({
         code: "SERVER_ERROR",
@@ -137,25 +144,37 @@ router.post("/", avatarUploadLimiter, async (req, res) => {
       });
     }
 
-    console.log(`[/api/avatar] Supabase upload success:`, {
-      path: uploadData?.path,
-      fullPath: uploadData?.fullPath,
+    if (!uploadResult.data?.path) {
+      console.error("[/api/avatar] ❌ Upload succeeded but no path returned");
+      return res.status(500).json({
+        code: "SERVER_ERROR",
+        message: "Upload completed but path not returned",
+      });
+    }
+
+    console.log(
+      `[/api/avatar] Supabase upload success: path=${uploadResult.data.path}`,
+    );
+
+    // ✅ FIX: Supabase getPublicUrl() returns { data: { publicUrl } }
+    const urlResult = supabase.storage.from("avatars").getPublicUrl(filePath);
+
+    console.log("[/api/avatar] getPublicUrl result:", {
+      hasData: !!urlResult.data,
+      publicUrl: urlResult.data?.publicUrl,
     });
 
-    // ✅ FIX 2: Correct destructuring for getPublicUrl() - returns {  publicUrl } DIRECTLY
-    const { publicUrl } = supabase.storage
-      .from("avatars")
-      .getPublicUrl(filePath);
-
-    if (!publicUrl) {
-      console.error("[/api/avatar] ❌ getPublicUrl returned no publicUrl");
+    if (!urlResult.data?.publicUrl) {
+      console.error("[/api/avatar] ❌ getPublicUrl returned no publicUrl", {
+        urlResult,
+      });
       return res.status(500).json({
         code: "SERVER_ERROR",
         message: "Failed to generate avatar URL",
       });
     }
 
-    const avatarUrl = publicUrl;
+    const avatarUrl = urlResult.data.publicUrl;
     console.log(`[/api/avatar] Generated public URL: ${avatarUrl}`);
 
     // Update MongoDB with the new URL
@@ -208,29 +227,29 @@ router.delete("/", avatarUploadLimiter, async (req, res) => {
 
     const supabase = getSupabase();
 
-    const { files, error: listError } = await supabase.storage
+    const listResult = await supabase.storage
       .from("avatars")
       .list(uid, { limit: 10, search: "avatar." });
 
-    if (listError) {
+    if (listResult.error) {
       console.warn(
         "[/api/avatar DELETE] List error (non-fatal):",
-        listError.message,
+        listResult.error.message,
       );
     }
 
-    if (files && files.length > 0) {
-      const filesToDelete = files.map((f) => `${uid}/${f.name}`);
+    if (listResult.data && listResult.data.length > 0) {
+      const filesToDelete = listResult.data.map((f) => `${uid}/${f.name}`);
       console.log(`[/api/avatar DELETE] Deleting files:`, filesToDelete);
 
-      const { error: removeError } = await supabase.storage
+      const removeResult = await supabase.storage
         .from("avatars")
         .remove(filesToDelete);
 
-      if (removeError) {
+      if (removeResult.error) {
         console.error(
           "[/api/avatar DELETE] Remove error:",
-          removeError.message,
+          removeResult.error.message,
         );
       } else {
         console.log(`[/api/avatar DELETE] ✅ Files deleted from Supabase`);
