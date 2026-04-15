@@ -12,18 +12,15 @@ const MAX_BYTES = 5 * 1024 * 1024;
 const ALLOWED_MIME = ["image/jpeg", "image/png", "image/webp"];
 
 // ── 🔥 Rate Limiter for Avatar Uploads ───────────────────────────────────────
-// Prevent abuse: 3 avatar uploads per 15 minutes per user
 const avatarUploadLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 3, // 3 requests per window
+  windowMs: 15 * 60 * 1000,
+  max: 3,
   message: {
     code: "RATE_LIMITED",
     message: "Too many avatar uploads. Please try again later.",
   },
-  // ✅ Use Firebase UID from JWT as key (not IP, since users share IPs)
-  keyGenerator: (req) => {
-    return req.user?.sub || req.user?.uid || req.ip || "anonymous";
-  },
+  keyGenerator: (req) =>
+    req.user?.sub || req.user?.uid || req.ip || "anonymous",
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -58,13 +55,8 @@ async function getDB() {
 }
 
 // ── POST /api/avatar ───────────────────────────────────────────────────────────
-// Uploads image to Supabase, then updates MongoDB with the public URL.
-// ✅ Protected by verifyBackendToken middleware (mounted in server.js)
-// ✅ Rate limited: 3 uploads per 15 minutes per user
 router.post("/", avatarUploadLimiter, async (req, res) => {
   try {
-    // ✅ FIX: Extract uid from JWT payload - 'sub' is the Firebase UID
-    // Also log what we received for debugging
     const uid = req.user?.sub || req.user?.uid || req.user?.id;
 
     console.log("[/api/avatar] Request received:", {
@@ -72,7 +64,6 @@ router.post("/", avatarUploadLimiter, async (req, res) => {
       userSub: req.user?.sub,
       userEmail: req.user?.email,
       extractedUid: uid,
-      authHeader: req.headers.authorization?.substring(0, 30) + "...",
       contentType: req.headers["content-type"],
       contentLength: req.headers["content-length"],
     });
@@ -119,14 +110,13 @@ router.post("/", avatarUploadLimiter, async (req, res) => {
     }
 
     const ext = mimeType.split("/")[1] ?? "jpg";
-    // ✅ FIX: Use extracted uid (no more undefined)
     const filePath = `${uid}/avatar.${ext}`;
 
     console.log(`[/api/avatar] Uploading to Supabase: ${filePath}`);
 
     const supabase = getSupabase();
 
-    // Upload to Supabase Storage
+    // ✅ FIX 1: Correct destructuring for upload() - returns { data, error }
     const { uploadData, error: uploadError } = await supabase.storage
       .from("avatars")
       .upload(filePath, buffer, {
@@ -147,12 +137,25 @@ router.post("/", avatarUploadLimiter, async (req, res) => {
       });
     }
 
-    console.log(`[/api/avatar] Supabase upload success:`, uploadData);
+    console.log(`[/api/avatar] Supabase upload success:`, {
+      path: uploadData?.path,
+      fullPath: uploadData?.fullPath,
+    });
 
-    // Get permanent public URL
-    const { urlData } = supabase.storage.from("avatars").getPublicUrl(filePath);
+    // ✅ FIX 2: Correct destructuring for getPublicUrl() - returns {  publicUrl } DIRECTLY
+    const { publicUrl } = supabase.storage
+      .from("avatars")
+      .getPublicUrl(filePath);
 
-    const avatarUrl = urlData.publicUrl;
+    if (!publicUrl) {
+      console.error("[/api/avatar] ❌ getPublicUrl returned no publicUrl");
+      return res.status(500).json({
+        code: "SERVER_ERROR",
+        message: "Failed to generate avatar URL",
+      });
+    }
+
+    const avatarUrl = publicUrl;
     console.log(`[/api/avatar] Generated public URL: ${avatarUrl}`);
 
     // Update MongoDB with the new URL
@@ -172,7 +175,6 @@ router.post("/", avatarUploadLimiter, async (req, res) => {
       console.warn(
         `[/api/avatar] No user found with uid=${uid} to update avatar`,
       );
-      // Still return success since upload succeeded, but log warning
     }
 
     console.log(`[/api/avatar] ✅ Avatar uploaded successfully for uid=${uid}`);
@@ -191,11 +193,8 @@ router.post("/", avatarUploadLimiter, async (req, res) => {
 });
 
 // ── DELETE /api/avatar ─────────────────────────────────────────────────────────
-// Deletes image from Supabase and clears URL in MongoDB.
-// ✅ Also rate limited
 router.delete("/", avatarUploadLimiter, async (req, res) => {
   try {
-    // ✅ FIX: Extract uid same way as POST
     const uid = req.user?.sub || req.user?.uid || req.user?.id;
 
     if (!uid) {
@@ -209,7 +208,6 @@ router.delete("/", avatarUploadLimiter, async (req, res) => {
 
     const supabase = getSupabase();
 
-    // List files in user's avatar folder to find the one to delete
     const { files, error: listError } = await supabase.storage
       .from("avatars")
       .list(uid, { limit: 10, search: "avatar." });
@@ -239,7 +237,6 @@ router.delete("/", avatarUploadLimiter, async (req, res) => {
       }
     }
 
-    // Clear URL in MongoDB regardless of storage success (idempotent)
     const db = await getDB();
     await db
       .collection("users")

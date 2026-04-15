@@ -223,7 +223,7 @@ export default function SettingsScreen() {
 
     const result = await ImagePicker.launchImageLibraryAsync({
       // ✅ FIX: Use correct enum value for Expo ImagePicker
-      mediaTypes: ImagePicker.MediaType.Images,
+      mediaTypes: ["images"],
       allowsEditing: true,
       aspect: [1, 1],
       quality: 0.8,
