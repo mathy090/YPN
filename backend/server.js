@@ -7,7 +7,7 @@ const { MongoClient } = require("mongodb");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const jwt = require("jsonwebtoken");
-const rateLimit = require("express-rate-limit"); // 🔥 New: Rate Limiting
+const rateLimit = require("express-rate-limit");
 
 // Import Routes
 const {
@@ -48,8 +48,8 @@ admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 // ── Express App Setup ────────────────────────────────────────────────────────
 const app = express();
 
-// 🔥 FIX: Trust Render's Proxy (Fixes X-Forwarded-For error)
-app.set('trust proxy', 1);
+// 🔥 FIX 1: Trust Render's Proxy (Fixes X-Forwarded-For error)
+app.set("trust proxy", 1);
 
 app.use(cors());
 app.use(express.json());
@@ -319,6 +319,7 @@ function registerRoutes() {
       }
 
       // 3. Issue custom backend JWT with custom claims + expiry
+      // 🔥 This uses the BACKEND_JWT_SECRET from your Render Env Vars
       const backendJwt = jwt.sign(
         {
           sub: uid, // Firebase UID as subject
