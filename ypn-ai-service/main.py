@@ -5,8 +5,8 @@ import base64
 import asyncio
 import httpx
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
-
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status, HTTPException, Header
+from fastapi.responses import JSONResponse
 from vosk import Model, KaldiRecognizer
 
 from upstash_redis import Redis
@@ -124,6 +124,46 @@ Context:
 User:
 {user_text}
 """
+
+
+# ── 🔥 NEW: HTTP Chat Endpoint for TeamYPN.tsx ───────────────────────────────
+@app.post("/chat")
+async def http_chat(
+    request_body: dict, 
+    authorization: str = Header(None)
+):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+    
+    token = authorization.split("Bearer ")[1]
+    
+    # 1. Verify User
+    user_info = await verify_token_with_backend(token)
+    if not user_info:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    uid = user_info.get("uid")
+    user_text = request_body.get("message", "").strip()
+    
+    if not user_text:
+        return JSONResponse(content={"reply": ""})
+
+    # 2. Process Message
+    add_message(uid, "user", user_text)
+    prompt = build_prompt(uid, user_text)
+    
+    # 3. Get AI Response
+    response_text = await run_ai(prompt)
+    
+    # 4. Save AI Response
+    add_message(uid, "ai", response_text)
+    supabase.table("messages").insert({
+        "user_id": uid,
+        "role": "ai",
+        "content": response_text.strip()
+    }).execute()
+    
+    return JSONResponse(content={"reply": response_text})
 
 
 # ── WebSocket: Auth-First, Then Stream ────────────────────────────────────────

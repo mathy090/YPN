@@ -1,5 +1,5 @@
 // src/screens/TeamYPN.tsx
-// Firebase ID Token Auth for HTTP AI Requests
+// Refactored to call YPN Main.py (FastAPI) with Hybrid Auth
 
 import { Ionicons } from "@expo/vector-icons";
 import { BlurView } from "expo-blur";
@@ -40,9 +40,10 @@ import {
   clearTeamYPNUnreadBadge,
   incrementUnreadBadge,
 } from "../utils/teamYPNBadge";
-import { clearToken, getToken } from "../utils/tokenManager"; // 🔥 Firebase token utils
+import { clearAllTokens, getValidBackendToken } from "../utils/tokenManager"; // 🔥 Hybrid Auth Utils
 import VoiceCallScreen from "./VoiceCallScreen";
 
+// 🔥 Point to your Python FastAPI Backend
 const AI_API_URL = `${process.env.EXPO_PUBLIC_AI_URL}/chat`;
 const CACHE_KEY = "chat_team-ypn";
 const UNDO_MS = 3000;
@@ -218,35 +219,45 @@ export default function TeamYPNScreen() {
     setTimeout(() => listRef.current?.scrollToEnd({ animated }), 80);
   }, []);
 
-  // 🔥 Fetch AI with Firebase ID Token Auth
+  // 🔥 Fetch AI with Hybrid Auth (Auto-refreshes Backend JWT)
   const fetchAIReply = async (text: string): Promise<string> => {
-    const token = await getToken();
-    if (!token) {
-      throw new Error("NO_TOKEN");
+    try {
+      // Get valid token (refreshes automatically if expired)
+      const token = await getValidBackendToken();
+
+      const res = await fetch(AI_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`, // 🔥 Uses Backend JWT
+        },
+        body: JSON.stringify({ message: text }),
+      });
+
+      // Handle 401 instantly: clear tokens + redirect
+      if (res.status === 401) {
+        await clearAllTokens();
+        router.replace("/auth/otp");
+        throw new Error("AUTH_EXPIRED");
+      }
+
+      if (!res.ok) {
+        throw new Error(`AI ${res.status}`);
+      }
+
+      const data = await res.json();
+      return (data.reply ?? data.message ?? "Sorry, no response.") as string;
+    } catch (err: any) {
+      if (
+        err.message === "NO_FIREBASE_TOKEN" ||
+        err.message === "REFRESH_FAILED"
+      ) {
+        await clearAllTokens();
+        router.replace("/auth/otp");
+        throw new Error("AUTH_EXPIRED");
+      }
+      throw err;
     }
-
-    const res = await fetch(AI_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`, // 🔥 Firebase ID token only
-      },
-      body: JSON.stringify({ message: text }),
-    });
-
-    // 🔥 Handle 401 instantly: clear token + redirect
-    if (res.status === 401) {
-      await clearToken();
-      router.replace("/auth/otp");
-      throw new Error("AUTH_EXPIRED");
-    }
-
-    if (!res.ok) {
-      throw new Error(`AI ${res.status}`);
-    }
-
-    const data = await res.json();
-    return (data.reply ?? data.message ?? "Sorry, no response.") as string;
   };
 
   const sendMessage = useCallback(
@@ -316,7 +327,7 @@ export default function TeamYPNScreen() {
           setAiTyping(false);
 
           // 🔥 Handle auth expiration (already redirected)
-          if (err.message === "AUTH_EXPIRED" || err.message === "NO_TOKEN") {
+          if (err.message === "AUTH_EXPIRED") {
             return;
           }
 
