@@ -9,15 +9,20 @@ const KEYS = {
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL;
 
-// Save BOTH tokens after login/refresh
+// Save BOTH tokens (Overwrites existing values automatically)
 export const saveTokens = async (
   firebaseToken: string,
   backendJwt: string,
   expiryMs: number,
 ) => {
-  await SecureStore.setItemAsync(KEYS.FIREBASE_ID_TOKEN, firebaseToken);
-  await SecureStore.setItemAsync(KEYS.BACKEND_JWT, backendJwt);
-  await SecureStore.setItemAsync(KEYS.TOKEN_EXPIRY, expiryMs.toString());
+  try {
+    // SecureStore.setItemAsync overwrites if the key already exists
+    await SecureStore.setItemAsync(KEYS.FIREBASE_ID_TOKEN, firebaseToken);
+    await SecureStore.setItemAsync(KEYS.BACKEND_JWT, backendJwt);
+    await SecureStore.setItemAsync(KEYS.TOKEN_EXPIRY, expiryMs.toString());
+  } catch (e) {
+    console.error("Error saving tokens:", e);
+  }
 };
 
 // Get valid backend JWT (auto-refreshes if expiring soon)
@@ -48,15 +53,22 @@ export const getValidBackendToken = async (): Promise<string> => {
     });
 
     if (!res.ok) {
+      // If refresh fails, clear everything to force re-login
       await clearAllTokens();
       throw new Error("REFRESH_FAILED");
     }
 
     const { backend_jwt, expires_in } = await res.json();
+
+    // Calculate new expiry
     const newExpiry = Date.now() + expires_in * 1000;
+
+    // 🔥 Overwrite old tokens with new ones
     await saveTokens(firebaseToken, backend_jwt, newExpiry);
+
     return backend_jwt;
   } catch (err) {
+    // If network error or server error, clear tokens to be safe
     await clearAllTokens();
     throw new Error("REFRESH_FAILED");
   }
@@ -68,11 +80,15 @@ export const authHeaders = async (): Promise<{ Authorization: string }> => {
   return { Authorization: `Bearer ${token}` };
 };
 
-// Clear ALL tokens on logout
+// Clear ALL tokens on logout or error
 export const clearAllTokens = async () => {
-  await SecureStore.deleteItemAsync(KEYS.FIREBASE_ID_TOKEN);
-  await SecureStore.deleteItemAsync(KEYS.BACKEND_JWT);
-  await SecureStore.deleteItemAsync(KEYS.TOKEN_EXPIRY);
+  try {
+    await SecureStore.deleteItemAsync(KEYS.FIREBASE_ID_TOKEN);
+    await SecureStore.deleteItemAsync(KEYS.BACKEND_JWT);
+    await SecureStore.deleteItemAsync(KEYS.TOKEN_EXPIRY);
+  } catch (e) {
+    console.error("Error clearing tokens:", e);
+  }
 };
 
 // Legacy support (optional)

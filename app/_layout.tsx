@@ -1,136 +1,89 @@
 // app/_layout.tsx
-import { useFocusEffect } from "@react-navigation/native";
-import {
-  Stack,
-  usePathname,
-  useRootNavigationState,
-  useRouter,
-} from "expo-router";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Stack, useRootNavigationState, useRouter } from "expo-router";
+import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
+import { SessionExpiredProvider } from "../src/context/SessionExpiredContext";
+import { useSessionHeartbeat } from "../src/hooks/useSessionHeartbeat";
 import { useAuth } from "../src/store/authStore";
-import { getLastRoute, saveLastRoute } from "../src/utils/cacheAppState";
-
-// List of routes that are considered "pre-auth" or public
-const PUBLIC_ROUTES = ["welcome", "auth/otp", "auth/phone", "index"];
+import { getLastRoute } from "../src/utils/cacheAppState";
 
 export default function RootLayout() {
   const router = useRouter();
   const navState = useRootNavigationState();
-  const pathname = usePathname();
-  const { bootAndVerify } = useAuth();
-
-  const [booting, setBooting] = useState(true);
+  const { checkAuth, isAuthenticated, isChecking } = useAuth();
+  const [showExpired, setShowExpired] = useState(false);
   const didBoot = useRef(false);
 
-  // Cache the current route whenever it changes
-  useFocusEffect(
-    useCallback(() => {
-      if (pathname) {
-        saveLastRoute(pathname);
-      }
-    }, [pathname]),
-  );
+  // 🔥 Start heartbeat only when authenticated
+  useSessionHeartbeat(isAuthenticated);
 
   useEffect(() => {
-    if (!navState?.key) return;
-    if (didBoot.current) return;
+    if (!navState?.key || didBoot.current) return;
     didBoot.current = true;
 
-    const handleBoot = async () => {
-      const result = await bootAndVerify();
-
-      if (result.ok) {
-        // User is authenticated
-        const lastRoute = await getLastRoute();
-
-        // Determine where to go
-        let targetRoute = "/tabs/discord"; // Default home
-
-        if (lastRoute && !PUBLIC_ROUTES.some((r) => lastRoute.includes(r))) {
-          // If last route was a protected page (e.g., TeamYPN), go there
-          targetRoute = lastRoute;
-        } else if (!result.hasProfile) {
-          // If profile not complete, force device setup
-          targetRoute = "/auth/device";
-        }
-
-        router.replace(targetRoute as any);
-      } else {
-        // User is NOT authenticated
-        router.replace("/welcome");
+    const boot = async () => {
+      const valid = await checkAuth();
+      if (!valid) {
+        setShowExpired(true);
+        return;
       }
 
-      setBooting(false);
+      // Preload last session
+      const lastRoute = await getLastRoute();
+      const publicRoutes = ["/welcome", "/auth/otp", "/auth/phone"];
+
+      if (lastRoute && !publicRoutes.includes(lastRoute)) {
+        router.replace(lastRoute as any);
+      } else {
+        router.replace("/tabs/discord");
+      }
     };
 
-    handleBoot();
+    boot();
   }, [navState?.key]);
 
+  if (isChecking) {
+    return (
+      <View style={styles.splash}>
+        <ActivityIndicator size="large" color="#1DB954" />
+        <Text style={styles.msg}>Verifying session…</Text>
+      </View>
+    );
+  }
+
   return (
-    <>
+    <SessionExpiredProvider
+      show={showExpired}
+      onHide={() => {
+        setShowExpired(false);
+        router.replace("/auth/otp");
+      }}
+    >
       <Stack
-        screenOptions={{
-          headerShown: false,
-          animation: "slide_from_right",
-          gestureEnabled: true,
-        }}
+        screenOptions={{ headerShown: false, animation: "slide_from_right" }}
       >
-        <Stack.Screen name="index" options={{ headerShown: false }} />
-        <Stack.Screen
-          name="tabs"
-          options={{ headerShown: false, animation: "none" }}
-        />
+        <Stack.Screen name="index" />
+        <Stack.Screen name="tabs" options={{ animation: "none" }} />
         <Stack.Screen
           name="discord"
-          options={{
-            headerShown: false,
-            animation: "slide_from_bottom",
-            presentation: "fullScreenModal",
-          }}
+          options={{ presentation: "fullScreenModal" }}
         />
-        <Stack.Screen
-          name="discordChannel"
-          options={{ headerShown: false, animation: "slide_from_right" }}
-        />
-        <Stack.Screen
-          name="chat"
-          options={{ headerShown: false, animation: "slide_from_right" }}
-        />
-        <Stack.Screen
-          name="welcome"
-          options={{ headerShown: false, animation: "fade" }}
-        />
-        <Stack.Screen name="auth" options={{ headerShown: false }} />
-        <Stack.Screen
-          name="TeamYPN"
-          options={{ headerShown: false, animation: "slide_from_right" }}
-        />
+        <Stack.Screen name="welcome" options={{ animation: "fade" }} />
+        <Stack.Screen name="auth" />
+        <Stack.Screen name="TeamYPN" />
+        <Stack.Screen name="settings" />
       </Stack>
-
-      {booting && (
-        <View style={styles.splash}>
-          <ActivityIndicator size="large" color="#1DB954" />
-          <Text style={styles.msg}>Loading YPN...</Text>
-        </View>
-      )}
-    </>
+    </SessionExpiredProvider>
   );
 }
 
 const styles = StyleSheet.create({
   splash: {
-    ...StyleSheet.absoluteFillObject,
+    flex: 1,
     backgroundColor: "#000",
     justifyContent: "center",
     alignItems: "center",
     gap: 16,
-    zIndex: 9999,
   },
-  msg: {
-    color: "#B3B3B3",
-    fontSize: 14,
-    textAlign: "center",
-    paddingHorizontal: 32,
-  },
+  msg: { color: "#B3B3B3", fontSize: 14, textAlign: "center" },
 });

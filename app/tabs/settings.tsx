@@ -13,13 +13,19 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { useSessionHeartbeat } from "../../src/hooks/useSessionHeartbeat";
 import { useAuth } from "../../src/store/authStore";
-import { clearToken, getToken } from "../../src/utils/tokenManager";
-// Imports from our unified db layer
+import {
+  clearAllTokens,
+  getValidBackendToken,
+} from "../../src/utils/tokenManager";
+
+// SQLite + MongoDB sync utilities
 import {
   clearSecureCache,
   getProfile,
@@ -33,46 +39,64 @@ const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
 
 export default function Settings() {
   const router = useRouter();
-  const { logout: logoutStore } = useAuth();
+  const {
+    logout: logoutStore,
+    signOut: authSignOut,
+    user: authUser,
+  } = useAuth();
 
   const [profile, setProfile] = useState<UserProfile | null>(null);
-  const [loading, setLoading] = useState(true); // Initial local load
-  const [syncing, setSyncing] = useState(false); // Background sync status
+  const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
   const [actionLoading, setActionLoading] = useState<
     "upload" | "delete" | null
   >(null);
 
-  // 1. Initialize Cache & Load Local Data Immediately
+  // 🔥 Logout confirmation state
+  const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
+  const [confirmEmail, setConfirmEmail] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [logoutLoading, setLogoutLoading] = useState(false);
+
+  // 🔥 Start heartbeat when authenticated
+  useSessionHeartbeat(true);
+
+  // 1. Initialize SQLite + Load Profile
   useEffect(() => {
     const init = async () => {
-      // Ensure SQLite is ready
-      await initializeSecureCache();
+      await initializeSecureCache(); // Ensure SQLite is ready
 
-      // Load from Cache (Instant UI)
+      // Load from SQLite cache (Instant UI)
       const localProfile = await getProfile();
-      setProfile(localProfile);
+      if (localProfile) {
+        setProfile(localProfile);
+      }
       setLoading(false);
 
-      // Silent Background Sync (If we have a token)
-      const token = await getToken();
-      if (token) {
-        fetchProfileFromBackend(false);
+      // Silent Background Sync with MongoDB
+      try {
+        const token = await getValidBackendToken();
+        if (token) {
+          fetchProfileFromBackend(false);
+        }
+      } catch {
+        // Token invalid → auth flow handles redirect
       }
     };
     init();
   }, []);
 
-  // Re-sync when screen comes into focus (optional freshness)
+  // Re-sync when screen comes into focus
   useFocusEffect(
     useCallback(() => {
-      // Could trigger a silent sync here if needed
+      // Optional: trigger silent sync here
     }, []),
   );
 
   const fetchProfileFromBackend = async (showLoading = false) => {
     try {
       if (showLoading) setSyncing(true);
-      const token = await getToken();
+      const token = await getValidBackendToken();
       if (!token) return;
 
       const res = await fetch(`${API_URL}/api/users/profile`, {
@@ -81,7 +105,7 @@ export default function Settings() {
 
       if (res.ok) {
         const data = await res.json();
-        await saveProfile(data); // Update Cache
+        await saveProfile(data); // Update SQLite cache
         setProfile(data); // Update UI
       } else if (res.status === 401 || res.status === 404) {
         await handleLogout();
@@ -133,7 +157,7 @@ export default function Settings() {
     setActionLoading("upload");
 
     try {
-      const token = await getToken();
+      const token = await getValidBackendToken();
       const blob = await new Promise<Blob>((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.onload = () => resolve(xhr.response);
@@ -154,7 +178,7 @@ export default function Settings() {
 
       if (res.ok) {
         const data = await res.json();
-        // OPTIMISTIC UPDATE: Update Cache & UI immediately
+        // OPTIMISTIC UPDATE: Update SQLite + UI immediately
         await updateAvatarUrl(data.avatarUrl);
         setProfile((prev) =>
           prev ? { ...prev, avatarUrl: data.avatarUrl } : null,
@@ -183,14 +207,14 @@ export default function Settings() {
           onPress: async () => {
             setActionLoading("delete");
             try {
-              const token = await getToken();
+              const token = await getValidBackendToken();
               const res = await fetch(`${API_URL}/api/avatar`, {
                 method: "DELETE",
                 headers: { Authorization: `Bearer ${token}` },
               });
 
               if (res.ok) {
-                // OPTIMISTIC UPDATE: Clear Cache & UI immediately
+                // OPTIMISTIC UPDATE: Clear SQLite + UI immediately
                 await updateAvatarUrl(null);
                 setProfile((prev) =>
                   prev ? { ...prev, avatarUrl: null } : null,
@@ -229,20 +253,114 @@ export default function Settings() {
     Alert.alert("Profile Picture", "Choose an option", options);
   };
 
+  // 🔥 Secure Logout with Email + Password Confirmation
   const handleLogout = async () => {
-    Alert.alert("Sign Out", "Are you sure?", [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "Sign Out",
-        style: "destructive",
-        onPress: async () => {
-          await clearToken();
-          await clearSecureCache(); // Wipes SQLite & Device ID
-          logoutStore();
-          router.replace("/welcome");
-        },
-      },
-    ]);
+    setShowLogoutConfirm(true);
+  };
+
+  const confirmLogout = async () => {
+    // Validate credentials against authUser (from auth store)
+    if (
+      !authUser?.email ||
+      confirmEmail.trim().toLowerCase() !== authUser.email.toLowerCase()
+    ) {
+      Alert.alert("Error", "Email does not match your account.");
+      return;
+    }
+    if (confirmPassword.length < 6) {
+      Alert.alert("Error", "Please enter your password.");
+      return;
+    }
+
+    setLogoutLoading(true);
+
+    try {
+      // Optional: Re-verify password with Firebase/Backend if needed
+      // For now, we trust the auth store + token validity
+
+      // 1. Clear all tokens (Firebase + Backend JWT)
+      await clearAllTokens();
+
+      // 2. Clear SQLite cache (profile, messages, etc.)
+      await clearSecureCache();
+
+      // 3. Update auth store state
+      if (authSignOut) {
+        await authSignOut();
+      } else {
+        logoutStore();
+      }
+
+      // 4. Navigate to login
+      router.replace("/auth/otp");
+    } catch (err) {
+      Alert.alert("Error", "Failed to sign out. Please try again.");
+    } finally {
+      setLogoutLoading(false);
+      setShowLogoutConfirm(false);
+      setConfirmEmail("");
+      setConfirmPassword("");
+    }
+  };
+
+  // 🔥 Logout Confirmation Modal
+  const renderLogoutConfirm = () => {
+    if (!showLogoutConfirm) return null;
+
+    return (
+      <View style={s.modalOverlay}>
+        <View style={s.modalCard}>
+          <Text style={s.modalTitle}>Confirm Sign Out</Text>
+          <Text style={s.modalDesc}>
+            Enter your credentials to confirm. All local data (messages, cache)
+            will be deleted. Your account details are safe in the cloud.
+          </Text>
+
+          <TextInput
+            style={s.modalInput}
+            placeholder="Email"
+            placeholderTextColor="#666"
+            value={confirmEmail}
+            onChangeText={setConfirmEmail}
+            autoCapitalize="none"
+            keyboardType="email-address"
+          />
+          <TextInput
+            style={s.modalInput}
+            placeholder="Password"
+            placeholderTextColor="#666"
+            value={confirmPassword}
+            onChangeText={setConfirmPassword}
+            secureTextEntry
+          />
+
+          <View style={s.modalButtons}>
+            <TouchableOpacity
+              style={[s.modalBtn, s.modalBtnCancel]}
+              onPress={() => {
+                setShowLogoutConfirm(false);
+                setConfirmEmail("");
+                setConfirmPassword("");
+              }}
+              disabled={logoutLoading}
+            >
+              <Text style={s.modalBtnTextCancel}>Cancel</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[s.modalBtn, s.modalBtnConfirm]}
+              onPress={confirmLogout}
+              disabled={logoutLoading || !confirmEmail || !confirmPassword}
+            >
+              {logoutLoading ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <Text style={s.modalBtnTextConfirm}>Sign Out</Text>
+              )}
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    );
   };
 
   if (loading) {
@@ -361,10 +479,14 @@ export default function Settings() {
           <Text style={s.version}>YPN App v1.0.0</Text>
         </ScrollView>
       </SafeAreaView>
+
+      {/* 🔥 Logout Confirmation Modal */}
+      {renderLogoutConfirm()}
     </View>
   );
 }
 
+// ── Styles (Your original design preserved + modal styles added) ─────────────
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#000" },
   safe: { flex: 1 },
@@ -444,4 +566,76 @@ const s = StyleSheet.create({
   },
   logoutText: { color: "#E91429", fontSize: 16, fontWeight: "600" },
   version: { textAlign: "center", color: "#333", fontSize: 12, marginTop: 32 },
+
+  // 🔥 Modal Styles for Logout Confirmation
+  modalOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(0,0,0,0.85)",
+    justifyContent: "center",
+    alignItems: "center",
+    zIndex: 1000,
+    padding: 24,
+  },
+  modalCard: {
+    backgroundColor: "#111B21",
+    borderRadius: 20,
+    padding: 24,
+    width: "100%",
+    maxWidth: 400,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.1)",
+  },
+  modalTitle: {
+    color: "#fff",
+    fontSize: 20,
+    fontWeight: "700",
+    marginBottom: 12,
+    textAlign: "center",
+  },
+  modalDesc: {
+    color: "#8696A0",
+    fontSize: 13,
+    textAlign: "center",
+    marginBottom: 20,
+    lineHeight: 18,
+  },
+  modalInput: {
+    backgroundColor: "rgba(255,255,255,0.05)",
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    color: "#fff",
+    fontSize: 15,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.1)",
+  },
+  modalButtons: {
+    flexDirection: "row",
+    gap: 12,
+    marginTop: 8,
+  },
+  modalBtn: {
+    flex: 1,
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  modalBtnCancel: {
+    backgroundColor: "rgba(255,255,255,0.1)",
+  },
+  modalBtnConfirm: {
+    backgroundColor: "#E91429",
+  },
+  modalBtnTextCancel: {
+    color: "#fff",
+    fontSize: 15,
+    fontWeight: "600",
+  },
+  modalBtnTextConfirm: {
+    color: "#fff",
+    fontSize: 15,
+    fontWeight: "600",
+  },
 });

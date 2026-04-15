@@ -27,11 +27,9 @@ const {
   initNewsArchive,
 } = require("./src/routes/newsRoutes");
 const mediaRoutes = require("./src/routes/mediaRoutes");
-// 🔥 Import avatar routes module (with init function)
-const {
-  router: avatarRouter,
-  init: initAvatarRoutes,
-} = require("./src/routes/avatarRoutes");
+
+// 🔥 Import avatar routes as a plain router (no init function)
+const avatarRoutes = require("./src/routes/avatarRoutes");
 
 // ── Firebase Admin Setup ─────────────────────────────────────────────────────
 if (!process.env.FIREBASE_ADMIN_KEY) {
@@ -56,14 +54,16 @@ const app = express();
 app.set("trust proxy", 1);
 
 app.use(cors());
-app.use(express.json());
 
-// 🔥 Avatar routes need raw body parsing for image uploads (not JSON)
-// We apply this ONLY to /api/avatar routes
+// 🔥 IMPORTANT: Apply raw body parsing ONLY to /api/avatar routes BEFORE json()
+// This allows avatarRoutes to read raw image buffers
 app.use(
   "/api/avatar",
   express.raw({ type: ["image/*", "application/octet-stream"], limit: "5mb" }),
 );
+
+// Apply JSON parsing to all other routes
+app.use(express.json());
 
 // ── 🔥 Rate Limiting Configuration ──────────────────────────────────────────
 
@@ -181,8 +181,7 @@ async function connectDB() {
     initNewsArchive(db);
     initDriveVideos(db);
 
-    // 🔥 Initialize avatar routes with db (for MongoDB updates)
-    initAvatarRoutes(db);
+    // 🔥 NO init call for avatarRoutes - it handles DB internally via getDB()
 
     registerRoutes();
   } catch (err) {
@@ -562,7 +561,7 @@ function registerRoutes() {
 
   // ── Mount External Routes ──────────────────────────────────────────────────
   // 🔥 Avatar routes: protected + raw body parsing already applied above
-  app.use("/api/avatar", verifyBackendToken, avatarRouter);
+  app.use("/api/avatar", verifyBackendToken, avatarRoutes);
 
   app.use("/api/videos/drive", driveVideoRoutes);
   app.use("/api/videos", videoRoutes);
