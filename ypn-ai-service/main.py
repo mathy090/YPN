@@ -12,8 +12,8 @@ from firebase_admin import credentials, auth
 from vosk import Model, KaldiRecognizer
 
 from upstash_redis import Redis
-
 from supabase import create_client
+
 from retrievers import retrieve
 from prompts import SYSTEM_PROMPT
 
@@ -30,7 +30,7 @@ if not firebase_admin._apps:
 
 
 # ─────────────────────────────────────────────
-# REDIS (STATE + VAD BRAIN)
+# REDIS
 # ─────────────────────────────────────────────
 redis = Redis(
     url=os.getenv("UPSTASH_REDIS_REST_URL"),
@@ -67,7 +67,7 @@ def verify_token(token: str):
 
 
 # ─────────────────────────────────────────────
-# AI ENGINE (replace later with GPT/Groq)
+# AI ENGINE (placeholder)
 # ─────────────────────────────────────────────
 async def run_ai(prompt: str):
     await asyncio.sleep(0.2)
@@ -82,13 +82,11 @@ def add_message(uid, role, text):
     data = redis.get(key)
 
     chat = json.loads(data) if data else []
-
     chat.append({"role": role, "text": text, "t": time.time()})
 
-    chat = chat[-20:]  # keep window
+    chat = chat[-20:]
 
     redis.set(key, json.dumps(chat))
-
     return chat
 
 
@@ -98,7 +96,7 @@ def get_chat(uid):
 
 
 # ─────────────────────────────────────────────
-# VAD (SILENCE DETECTION)
+# VAD
 # ─────────────────────────────────────────────
 def update_audio_time(uid):
     redis.set(f"last_audio:{uid}", time.time())
@@ -106,19 +104,16 @@ def update_audio_time(uid):
 
 def is_user_silent(uid, threshold=0.8):
     last = redis.get(f"last_audio:{uid}")
-
     if not last:
         return False
-
     return (time.time() - float(last)) > threshold
 
 
 # ─────────────────────────────────────────────
-# PROMPT BUILDER
+# PROMPT
 # ─────────────────────────────────────────────
 def build_prompt(uid, user_text):
     chat = get_chat(uid)
-
     context = retrieve(user_text, chat)
 
     return f"""
@@ -136,7 +131,7 @@ User:
 
 
 # ─────────────────────────────────────────────
-# APP
+# WEB SOCKET
 # ─────────────────────────────────────────────
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
@@ -152,31 +147,24 @@ async def ws(websocket: WebSocket):
 
         uid = user["uid"] if user else "test_user"
 
-        # init redis keys
         redis.setnx(f"chat:{uid}", json.dumps([]))
 
         recognizer = KaldiRecognizer(model, 16000)
+        pending_text = ""
 
-        pending_text = ""   # holds partial speech buffer
-
-        # ─────────────────────────────
-        # MAIN LOOP
-        # ─────────────────────────────
         while True:
             data = await websocket.receive_json()
             msg_type = data.get("type")
 
             user_text = None
 
-            # ───────── TEXT ─────────
+            # TEXT
             if msg_type == "text":
                 user_text = data.get("message", "").strip()
 
-            # ───────── AUDIO PCM ─────────
+            # AUDIO
             elif msg_type == "audio":
-
                 pcm = base64.b64decode(data["audio"])
-
                 update_audio_time(uid)
 
                 if recognizer.AcceptWaveform(pcm):
@@ -191,13 +179,11 @@ async def ws(websocket: WebSocket):
                         "text": pending_text
                     })
 
-                    # 🔥 CHECK SILENCE → AUTO TRIGGER AI
-                    if is_user_silent(uid):
-                        if pending_text:
-                            user_text = pending_text
-                            pending_text = ""
+                    if is_user_silent(uid) and pending_text:
+                        user_text = pending_text
+                        pending_text = ""
 
-            # ───────── INTERRUPT ─────────
+            # INTERRUPT
             elif msg_type == "interrupt":
                 redis.set(f"interrupt:{uid}", "1")
                 continue
@@ -205,29 +191,20 @@ async def ws(websocket: WebSocket):
             if not user_text:
                 continue
 
-            # ───────── STORE USER MESSAGE ─────────
             add_message(uid, "user", user_text)
 
             prompt = build_prompt(uid, user_text)
 
-            await websocket.send_json({
-                "type": "state",
-                "value": "thinking"
-            })
+            await websocket.send_json({"type": "state", "value": "thinking"})
 
-            # ───────── AI STREAM START ─────────
             response = await run_ai(prompt)
 
-            await websocket.send_json({
-                "type": "state",
-                "value": "speaking"
-            })
+            await websocket.send_json({"type": "state", "value": "speaking"})
 
             ai_text = ""
 
             for word in response.split():
 
-                # check interrupt
                 if redis.get(f"interrupt:{uid}") == "1":
                     redis.delete(f"interrupt:{uid}")
                     break
@@ -241,7 +218,6 @@ async def ws(websocket: WebSocket):
 
                 await asyncio.sleep(0.03)
 
-            # ───────── SAVE AI ─────────
             add_message(uid, "ai", ai_text)
 
             supabase.table("messages").insert({
@@ -250,14 +226,8 @@ async def ws(websocket: WebSocket):
                 "content": ai_text
             }).execute()
 
-            await websocket.send_json({
-                "type": "done"
-            })
-
-            await websocket.send_json({
-                "type": "state",
-                "value": "listening"
-            })
+            await websocket.send_json({"type": "done"})
+            await websocket.send_json({"type": "state", "value": "listening"})
 
 
     except WebSocketDisconnect:
