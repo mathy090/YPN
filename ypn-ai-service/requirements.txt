@@ -6,3 +6,4 @@ cohere
 vosk-model-small-en-us-0.15
 python-multipart
 websockets
+redis
