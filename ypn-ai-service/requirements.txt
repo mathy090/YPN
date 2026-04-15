@@ -9,4 +9,4 @@ vosk
 python-multipart
 websockets
 supabase 
-redis
+upstash_redis
