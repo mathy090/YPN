@@ -73,6 +73,11 @@ export default function SettingsScreen() {
   const [isUploadingAvatar, setIsUploadingAvatar] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
 
+  // 🔥 NEW: Avatar URL Input State (for manual URL entry)
+  const [showAvatarUrlModal, setShowAvatarUrlModal] = useState(false);
+  const [avatarUrlInput, setAvatarUrlInput] = useState("");
+  const [isUpdatingAvatarUrl, setIsUpdatingAvatarUrl] = useState(false);
+
   // ✅ Load profile from MongoDB on mount
   useEffect(() => {
     let isMounted = true;
@@ -209,7 +214,106 @@ export default function SettingsScreen() {
     return token;
   };
 
-  // ✅ Handle avatar selection and instant upload
+  // 🔥 NEW: Handle manual avatar URL update (calls /api/users/profile)
+  const handleUpdateAvatarUrl = async () => {
+    const trimmedUrl = avatarUrlInput.trim();
+
+    // Basic URL validation
+    if (!trimmedUrl || !/^https?:\/\/.+/.test(trimmedUrl)) {
+      Alert.alert(
+        "Invalid URL",
+        "Please enter a valid http/https URL for your avatar.",
+        [{ text: "OK" }],
+      );
+      return;
+    }
+
+    setIsUpdatingAvatarUrl(true);
+    setUploadError(null);
+
+    try {
+      const token = await getValidToken();
+      if (!token)
+        throw new Error("Authentication required. Please sign in again.");
+
+      console.log("[Settings] Updating avatar URL via profile endpoint...");
+
+      // ✅ Call /api/users/profile to update avatarUrl in MongoDB
+      const response = await fetch(`${API_URL}/api/users/profile`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ avatarUrl: trimmedUrl }),
+      });
+
+      const responseData = await response.json().catch(() => ({}));
+
+      console.log("[Settings] Avatar URL update response:", {
+        status: response.status,
+        ok: response.ok,
+        data: responseData,
+      });
+
+      if (!response.ok) {
+        if (response.status === 401) {
+          throw new Error("Session expired. Please sign in again.");
+        }
+        if (response.status === 409) {
+          throw new Error(responseData.message || "Username/profile conflict");
+        }
+        throw new Error(responseData.message || "Failed to update avatar URL");
+      }
+
+      // ✅ Add cache-busting param to force fresh load
+      const avatarUrlWithCacheBust = `${trimmedUrl}?v=${Date.now()}`;
+
+      // ✅ Update local state IMMEDIATELY for instant preview
+      setProfile((prev) =>
+        prev ? { ...prev, avatarUrl: avatarUrlWithCacheBust } : null,
+      );
+
+      // ✅ Update SQLite cache
+      const currentProfile = profile || (await getCachedProfile());
+      await saveProfileToCache({
+        uid: responseData.user?.uid || currentProfile?.uid,
+        username: currentProfile?.username || "",
+        email: currentProfile?.email || "",
+        avatarUrl: avatarUrlWithCacheBust,
+        hasProfile: currentProfile?.hasProfile,
+      } as UserProfileCache);
+
+      console.log(
+        "[Settings] ✅ Avatar URL updated in MongoDB and cached:",
+        avatarUrlWithCacheBust,
+      );
+
+      // Close modal and reset input
+      setShowAvatarUrlModal(false);
+      setAvatarUrlInput("");
+
+      Alert.alert("Success", "Avatar updated successfully!", [{ text: "OK" }]);
+    } catch (error: any) {
+      console.error("[Settings] Avatar URL update error:", {
+        message: error.message,
+        name: error.name,
+      });
+      setUploadError("Failed to update avatar URL. Please try again.");
+
+      Alert.alert(
+        "Update Failed",
+        error.message.includes("sign in")
+          ? "Your session expired. Please sign in again to continue."
+          : error.message,
+        [{ text: "OK" }],
+      );
+    } finally {
+      setIsUpdatingAvatarUrl(false);
+    }
+  };
+
+  // ✅ Handle avatar selection and instant upload (image file → /api/avatar)
   const handlePickAndUploadAvatar = async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== "granted") {
@@ -222,7 +326,6 @@ export default function SettingsScreen() {
     }
 
     const result = await ImagePicker.launchImageLibraryAsync({
-      // ✅ FIX: Use correct enum value for Expo ImagePicker
       mediaTypes: ["images"],
       allowsEditing: true,
       aspect: [1, 1],
@@ -239,18 +342,6 @@ export default function SettingsScreen() {
       if (!token)
         throw new Error("Authentication required. Please sign in again.");
 
-      // ✅ DEBUG: Decode JWT to verify it contains uid (sub field)
-      try {
-        const tokenPayload = JSON.parse(atob(token.split(".")[1]));
-        console.log("[Settings] Avatar upload token payload:", {
-          sub: tokenPayload.sub, // ✅ This is the Firebase UID
-          email: tokenPayload.email,
-          hasTokenVersion: "tokenVersion" in tokenPayload,
-        });
-      } catch (e) {
-        console.warn("[Settings] Could not decode token payload:", e);
-      }
-
       const imageUri = result.assets[0].uri;
       const mimeType = result.assets[0].mimeType || "image/jpeg";
 
@@ -259,6 +350,7 @@ export default function SettingsScreen() {
 
       console.log("[Settings] Uploading avatar to backend...");
 
+      // ✅ Upload to /api/avatar (public endpoint, returns hosted URL)
       const uploadResponse = await fetch(`${API_URL}/api/avatar`, {
         method: "POST",
         headers: {
@@ -295,28 +387,26 @@ export default function SettingsScreen() {
         throw new Error("Backend did not return avatar URL");
       }
 
-      // ✅ FIX: Add cache-busting param to force fresh load of new avatar
-      // This ensures Supabase CDN and React Native Image fetch the new file
+      // ✅ Add cache-busting param
       const avatarUrlWithCacheBust = `${avatarUrl}?v=${Date.now()}`;
 
-      // ✅ Update local state IMMEDIATELY with cache-busted URL for instant preview
+      // ✅ Update local state IMMEDIATELY
       setProfile((prev) =>
         prev ? { ...prev, avatarUrl: avatarUrlWithCacheBust } : null,
       );
 
-      // ✅ Update SQLite cache with cache-busted URL
-      // This ensures the new avatar persists across app restarts
+      // ✅ Update SQLite cache
       const currentProfile = profile || (await getCachedProfile());
       await saveProfileToCache({
         uid: uid || currentProfile?.uid,
         username: currentProfile?.username || "",
         email: currentProfile?.email || "",
-        avatarUrl: avatarUrlWithCacheBust, // ✅ Cache the cache-busted URL
+        avatarUrl: avatarUrlWithCacheBust,
         hasProfile: currentProfile?.hasProfile,
       } as UserProfileCache);
 
       console.log(
-        "[Settings] ✅ Avatar uploaded, cached (with cache-bust), and preview updated:",
+        "[Settings] ✅ Avatar uploaded, cached, and preview updated:",
         avatarUrlWithCacheBust,
       );
     } catch (error: any) {
@@ -338,6 +428,32 @@ export default function SettingsScreen() {
     } finally {
       setIsUploadingAvatar(false);
     }
+  };
+
+  // ✅ Handle "Change Avatar" - opens option modal
+  const handleChangeAvatar = () => {
+    Alert.alert(
+      "Change Avatar",
+      "Choose how you want to update your profile picture:",
+      [
+        {
+          text: "📁 Upload from Gallery",
+          onPress: () => {
+            Alert.dismiss();
+            handlePickAndUploadAvatar();
+          },
+        },
+        {
+          text: "🔗 Enter URL",
+          onPress: () => {
+            Alert.dismiss();
+            setAvatarUrlInput(profile?.avatarUrl || "");
+            setShowAvatarUrlModal(true);
+          },
+        },
+        { text: "Cancel", style: "cancel" },
+      ],
+    );
   };
 
   // ✅ Handle "Sign Out" button tap
@@ -478,13 +594,12 @@ export default function SettingsScreen() {
           {/* Avatar: from MongoDB avatarUrl, or placeholder if null */}
           <View style={styles.avatarSection}>
             <View style={styles.avatarContainer}>
-              {isUploadingAvatar ? (
+              {isUploadingAvatar || isUpdatingAvatarUrl ? (
                 <View style={[styles.avatar, styles.avatarPlaceholder]}>
                   <ActivityIndicator color={COLORS.primary} size="large" />
                 </View>
               ) : profile?.avatarUrl ? (
                 // ✅ Show avatar from MongoDB with error handling
-                // ✅ FIX: Add key prop to force re-render when avatarUrl changes
                 <Image
                   key={profile.avatarUrl} // ✅ Forces fresh load when URL changes
                   source={{ uri: profile.avatarUrl }}
@@ -512,21 +627,25 @@ export default function SettingsScreen() {
               {/* Change Photo Button */}
               <TouchableOpacity
                 style={styles.changeAvatarButton}
-                onPress={handlePickAndUploadAvatar}
-                disabled={isUploadingAvatar}
+                onPress={handleChangeAvatar}
+                disabled={isUploadingAvatar || isUpdatingAvatarUrl}
                 activeOpacity={0.7}
               >
                 <Ionicons
-                  name={isUploadingAvatar ? "hourglass" : "camera"}
+                  name={
+                    isUploadingAvatar || isUpdatingAvatarUrl
+                      ? "hourglass"
+                      : "camera"
+                  }
                   size={18}
                   color="#000"
                 />
               </TouchableOpacity>
             </View>
 
-            {isUploadingAvatar && (
+            {(isUploadingAvatar || isUpdatingAvatarUrl) && (
               <Text style={[styles.uploadStatus, { color: COLORS.primary }]}>
-                Uploading...
+                Updating...
               </Text>
             )}
             {uploadError && (
@@ -651,6 +770,146 @@ export default function SettingsScreen() {
           </Text>
         </View>
       </ScrollView>
+
+      {/* 🔥 NEW: Avatar URL Input Modal */}
+      <Modal
+        visible={showAvatarUrlModal}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowAvatarUrlModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, { backgroundColor: COLORS.card }]}>
+            <View style={styles.modalHeader}>
+              <Text style={[styles.modalTitle, { color: COLORS.text }]}>
+                Set Avatar URL
+              </Text>
+              <TouchableOpacity
+                onPress={() => setShowAvatarUrlModal(false)}
+                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+              >
+                <Ionicons name="close" size={24} color={COLORS.textSecondary} />
+              </TouchableOpacity>
+            </View>
+
+            <Text
+              style={[styles.modalSubtitle, { color: COLORS.textSecondary }]}
+            >
+              Enter a direct image URL (PNG, JPG, WebP) to use as your profile
+              picture.
+            </Text>
+
+            <View style={styles.inputGroup}>
+              <Text
+                style={[styles.inputLabel, { color: COLORS.textSecondary }]}
+              >
+                IMAGE URL
+              </Text>
+              <View
+                style={[
+                  styles.inputRow,
+                  {
+                    borderColor: avatarUrlInput
+                      ? COLORS.primary
+                      : COLORS.border,
+                  },
+                ]}
+              >
+                <Ionicons
+                  name="link-outline"
+                  size={18}
+                  color={avatarUrlInput ? COLORS.primary : COLORS.textSecondary}
+                />
+                <TextInput
+                  value={avatarUrlInput}
+                  onChangeText={setAvatarUrlInput}
+                  placeholder="https://example.com/avatar.png"
+                  placeholderTextColor={COLORS.textSecondary}
+                  style={[styles.input, { color: COLORS.text }]}
+                  keyboardType="url"
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  editable={!isUpdatingAvatarUrl}
+                  onSubmitEditing={handleUpdateAvatarUrl}
+                  returnKeyType="done"
+                />
+              </View>
+              <Text style={[styles.inputHint, { color: COLORS.textSecondary }]}>
+                Must start with https:// and point to a valid image file.
+              </Text>
+            </View>
+
+            {/* Preview Section */}
+            {avatarUrlInput ? (
+              <View style={styles.previewSection}>
+                <Text
+                  style={[styles.previewLabel, { color: COLORS.textSecondary }]}
+                >
+                  Preview:
+                </Text>
+                <View style={styles.previewContainer}>
+                  <Image
+                    source={{ uri: avatarUrlInput }}
+                    style={styles.previewImage}
+                    resizeMode="cover"
+                    onError={() => {
+                      console.warn(
+                        "[Settings] Preview load failed for:",
+                        avatarUrlInput,
+                      );
+                    }}
+                  />
+                </View>
+              </View>
+            ) : null}
+
+            {uploadError ? (
+              <Text style={[styles.modalError, { color: COLORS.error }]}>
+                {uploadError}
+              </Text>
+            ) : null}
+
+            <View style={styles.modalButtons}>
+              <TouchableOpacity
+                style={[styles.modalButton, styles.cancelButton]}
+                onPress={() => {
+                  setShowAvatarUrlModal(false);
+                  setAvatarUrlInput("");
+                  setUploadError(null);
+                }}
+                disabled={isUpdatingAvatarUrl}
+              >
+                <Text
+                  style={[
+                    styles.modalButtonText,
+                    { color: COLORS.textSecondary },
+                  ]}
+                >
+                  Cancel
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.modalButton,
+                  styles.confirmButton,
+                  (!avatarUrlInput || isUpdatingAvatarUrl) &&
+                    styles.confirmButtonDisabled,
+                ]}
+                onPress={handleUpdateAvatarUrl}
+                disabled={!avatarUrlInput || isUpdatingAvatarUrl}
+              >
+                {isUpdatingAvatarUrl ? (
+                  <ActivityIndicator color="#000" size="small" />
+                ) : (
+                  <Text style={[styles.modalButtonText, { color: "#000" }]}>
+                    Save Avatar
+                  </Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
 
       {/* ✅ Password Confirmation Modal for Sign Out */}
       <Modal visible={showPasswordModal} transparent animationType="fade">
@@ -914,7 +1173,7 @@ const styles = StyleSheet.create({
   versionText: { fontSize: 12, fontWeight: "500" },
   versionSubText: { fontSize: 11, opacity: 0.7, marginTop: 4 },
 
-  // Modal
+  // Modals
   modalOverlay: {
     flex: 1,
     backgroundColor: "rgba(0,0,0,0.7)",
@@ -922,11 +1181,22 @@ const styles = StyleSheet.create({
     alignItems: "center",
     padding: 20,
   },
-  modalContent: { width: "100%", maxWidth: 400, borderRadius: 20, padding: 24 },
+  modalContent: {
+    width: "100%",
+    maxWidth: 400,
+    borderRadius: 20,
+    padding: 24,
+    maxHeight: "85%",
+  },
+  modalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 16,
+  },
   modalTitle: {
     fontSize: 20,
     fontWeight: "bold",
-    marginBottom: 8,
     textAlign: "center",
   },
   modalSubtitle: {
@@ -951,6 +1221,36 @@ const styles = StyleSheet.create({
     height: 50,
   },
   input: { flex: 1, fontSize: 15, marginLeft: 10 },
+  inputHint: {
+    fontSize: 11,
+    marginTop: 6,
+    marginLeft: 4,
+  },
+
+  // Preview Section for Avatar URL
+  previewSection: {
+    marginBottom: 16,
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: "rgba(255,255,255,0.05)",
+  },
+  previewLabel: {
+    fontSize: 12,
+    marginBottom: 8,
+    fontWeight: "600",
+  },
+  previewContainer: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    overflow: "hidden",
+    backgroundColor: "rgba(0,0,0,0.2)",
+  },
+  previewImage: {
+    width: "100%",
+    height: "100%",
+  },
+
   modalError: { fontSize: 12, marginBottom: 16, textAlign: "center" },
   modalButtons: {
     flexDirection: "row",

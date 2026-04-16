@@ -1,7 +1,9 @@
 // app/auth/device.tsx
-// Photo is stored locally on pick.
-// Upload + profile save both happen only when user presses "Get Started".
+// ✅ Flow: Avatar upload (PUBLIC) → Profile save (AUTHENTICATED)
+// ✅ Network error handling: "Poor internet connection" vs "Session expired"
+
 import { Ionicons } from "@expo/vector-icons";
+import NetInfo from "@react-native-community/netinfo";
 import * as ImagePicker from "expo-image-picker";
 import { LinearGradient } from "expo-linear-gradient";
 import { useLocalSearchParams, useRouter } from "expo-router";
@@ -22,7 +24,6 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { authHeaders } from "../../src/utils/tokenManager";
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
 const TOAST_DURATION = 4000;
@@ -41,12 +42,9 @@ type UsernameStatus =
   | "invalid"
   | "error";
 
-// "none"   → no photo selected
-// "picked" → photo chosen locally, will upload on submit
 type PhotoState = "none" | "picked";
-
 type StepStatus = "idle" | "loading" | "done" | "error";
-type ToastType = "network" | "server" | null;
+type ToastType = "network" | "server" | "auth" | null;
 type Step = { key: string; label: string; status: StepStatus };
 
 // ── Toast ──────────────────────────────────────────────────────────────────
@@ -77,11 +75,26 @@ function Toast({
     ]).start();
   }, [visible]);
 
-  const isNetwork = type === "network";
-  const bg = isNetwork ? "#1a1000" : "#1a0000";
-  const border = isNetwork ? "#FFA500" : "#E91429";
-  const color = isNetwork ? "#FFA500" : "#E91429";
-  const icon = isNetwork ? "wifi-off-outline" : "alert-circle-outline";
+  const config = {
+    network: {
+      bg: "#1a1000",
+      border: "#FFA500",
+      color: "#FFA500",
+      icon: "wifi-off-outline",
+    },
+    server: {
+      bg: "#1a0000",
+      border: "#E91429",
+      color: "#E91429",
+      icon: "alert-circle-outline",
+    },
+    auth: {
+      bg: "#1a001a",
+      border: "#9333ea",
+      color: "#9333ea",
+      icon: "lock-closed-outline",
+    },
+  }[type || "server"];
 
   return (
     <Animated.View
@@ -89,15 +102,15 @@ function Toast({
       style={[
         ts.wrap,
         {
-          backgroundColor: bg,
-          borderColor: border,
+          backgroundColor: config.bg,
+          borderColor: config.border,
           opacity,
           transform: [{ translateY }],
         },
       ]}
     >
-      <Ionicons name={icon as any} size={18} color={color} />
-      <Text style={[ts.text, { color }]}>{message}</Text>
+      <Ionicons name={config.icon as any} size={18} color={config.color} />
+      <Text style={[ts.text, { color: config.color }]}>{message}</Text>
     </Animated.View>
   );
 }
@@ -318,7 +331,6 @@ export default function Device() {
   const [usernameStatus, setUsernameStatus] = useState<UsernameStatus>("idle");
   const [usernameMsg, setUsernameMsg] = useState("");
 
-  // Photo: stored locally only until submit
   const [photoState, setPhotoState] = useState<PhotoState>("none");
   const [avatarLocalUri, setAvatarLocalUri] = useState<string | null>(null);
   const [avatarMime, setAvatarMime] = useState<string>("image/jpeg");
@@ -338,7 +350,6 @@ export default function Device() {
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Username available + not mid-submit
   const usernameReady = usernameStatus === "available";
   const canSubmit = usernameReady && !showProgress;
 
@@ -349,7 +360,6 @@ export default function Device() {
     };
   }, []);
 
-  // ── Toast helper ─────────────────────────────────────────────────────────
   const showToast = useCallback((type: ToastType, message: string) => {
     if (toastTimer.current) clearTimeout(toastTimer.current);
     setToast({ type, message });
@@ -360,7 +370,6 @@ export default function Device() {
     );
   }, []);
 
-  // ── Step helper ───────────────────────────────────────────────────────────
   const setStep = useCallback(
     (key: string, status: StepStatus, label?: string) => {
       setSteps((prev) =>
@@ -372,7 +381,34 @@ export default function Device() {
     [],
   );
 
-  // ── Pick photo — local preview only, no upload ────────────────────────────
+  // 🔥 Check if error is network-related (no internet)
+  const isNetworkError = (error: any): boolean => {
+    // Fetch network errors (TypeError in browser, various in RN)
+    if (error?.type === "NetworkError" || error?.type === "network")
+      return true;
+    if (error?.message?.includes("Network request failed")) return true;
+    if (error?.message?.includes("Failed to fetch")) return true;
+    if (error?.message?.includes("timeout")) return true;
+    // React Native NetInfo check (if available)
+    if (typeof NetInfo?.fetch === "function") {
+      // We can't await here, but the error patterns above usually catch it
+    }
+    return false;
+  };
+
+  // 🔥 Get Firebase ID token for AUTH-PROTECTED endpoints only
+  const getFirebaseToken = useCallback(async (): Promise<string | null> => {
+    try {
+      const auth = getAuth();
+      const user = auth.currentUser;
+      if (!user) return null;
+      return await user.getIdToken(true);
+    } catch (error) {
+      console.warn("[Device] Failed to get Firebase token:", error);
+      return null;
+    }
+  }, []);
+
   const handlePickAvatar = useCallback(async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== "granted") {
@@ -388,7 +424,6 @@ export default function Device() {
     });
 
     if (result.canceled || !result.assets?.[0]) return;
-
     const asset = result.assets[0];
 
     if (asset.fileSize && asset.fileSize > MAX_PHOTO_BYTES) {
@@ -396,76 +431,107 @@ export default function Device() {
       return;
     }
 
-    // Store locally — upload happens in handleSubmit
     setAvatarLocalUri(asset.uri);
     setAvatarMime(asset.mimeType ?? guessMime(asset.uri));
     setPhotoState("picked");
   }, [showToast]);
 
-  // ── Username availability check ───────────────────────────────────────────
-  const onUsernameChange = useCallback((raw: string) => {
-    const cleaned = raw.toLowerCase().replace(/[^a-z0-9_]/g, "");
-    setUsername(cleaned);
+  // ── Username availability check (AUTH-PROTECTED) ─────────────────────────
+  const onUsernameChange = useCallback(
+    async (raw: string) => {
+      const cleaned = raw.toLowerCase().replace(/[^a-z0-9_]/g, "");
+      setUsername(cleaned);
 
-    if (debounceRef.current) clearTimeout(debounceRef.current);
+      if (debounceRef.current) clearTimeout(debounceRef.current);
 
-    if (cleaned.length === 0) {
-      setUsernameStatus("idle");
-      setUsernameMsg("");
-      return;
-    }
-    if (cleaned.length < 3) {
-      setUsernameStatus("typing");
-      setUsernameMsg("At least 3 characters required.");
-      return;
-    }
-    if (cleaned.length > 20) {
-      setUsernameStatus("invalid");
-      setUsernameMsg("Maximum 20 characters.");
-      return;
-    }
-
-    // Cache hit
-    if (usernameCache.has(cleaned)) {
-      const available = usernameCache.get(cleaned)!;
-      setUsernameStatus(available ? "available" : "taken");
-      setUsernameMsg(
-        available ? "Username is available" : "Username already taken.",
-      );
-      return;
-    }
-
-    setUsernameStatus("checking");
-    setUsernameMsg("Checking availability…");
-
-    debounceRef.current = setTimeout(async () => {
-      try {
-        const res = await fetch(
-          `${API_URL}/api/auth/check-username?username=${encodeURIComponent(cleaned)}`,
-        );
-        const data = await res.json().catch(() => ({}));
-
-        if (!res.ok) {
-          setUsernameStatus(
-            data.code === "INVALID_FORMAT" ? "invalid" : "error",
-          );
-          setUsernameMsg(data.message ?? "Could not check username.");
-          return;
-        }
-
-        usernameCache.set(cleaned, data.available);
-        setUsernameStatus(data.available ? "available" : "taken");
-        setUsernameMsg(
-          data.available ? "Username is available" : "Username already taken.",
-        );
-      } catch {
-        setUsernameStatus("error");
-        setUsernameMsg("No connection. Try again.");
+      if (cleaned.length === 0) {
+        setUsernameStatus("idle");
+        setUsernameMsg("");
+        return;
       }
-    }, 600);
-  }, []);
+      if (cleaned.length < 3) {
+        setUsernameStatus("typing");
+        setUsernameMsg("At least 3 characters required.");
+        return;
+      }
+      if (cleaned.length > 20) {
+        setUsernameStatus("invalid");
+        setUsernameMsg("Maximum 20 characters.");
+        return;
+      }
 
-  // ── Submit: upload photo then save profile ────────────────────────────────
+      // Cache hit
+      if (usernameCache.has(cleaned)) {
+        const available = usernameCache.get(cleaned)!;
+        setUsernameStatus(available ? "available" : "taken");
+        setUsernameMsg(
+          available ? "Username is available" : "Username already taken.",
+        );
+        return;
+      }
+
+      setUsernameStatus("checking");
+      setUsernameMsg("Checking availability…");
+
+      debounceRef.current = setTimeout(async () => {
+        try {
+          const firebaseToken = await getFirebaseToken();
+          if (!firebaseToken) {
+            setUsernameStatus("error");
+            setUsernameMsg("Session expired. Please sign in again.");
+            return;
+          }
+
+          const res = await fetch(
+            `${API_URL}/api/auth/check-username?username=${encodeURIComponent(cleaned)}`,
+            {
+              headers: {
+                Authorization: `Bearer ${firebaseToken}`,
+                "Content-Type": "application/json",
+              },
+            },
+          );
+          const data = await res.json().catch(() => ({}));
+
+          if (!res.ok) {
+            if (res.status === 401) {
+              setUsernameStatus("error");
+              setUsernameMsg("Session expired. Please sign in again.");
+              return;
+            }
+            setUsernameStatus(
+              data.code === "INVALID_FORMAT" ? "invalid" : "error",
+            );
+            setUsernameMsg(data.message ?? "Could not check username.");
+            return;
+          }
+
+          usernameCache.set(cleaned, data.available);
+          setUsernameStatus(data.available ? "available" : "taken");
+          setUsernameMsg(
+            data.available
+              ? "Username is available"
+              : "Username already taken.",
+          );
+        } catch (error: any) {
+          console.error("[Device] Username check error:", error);
+
+          // 🔥 NETWORK ERROR DETECTION
+          if (isNetworkError(error)) {
+            setUsernameStatus("error");
+            setUsernameMsg("Poor internet connection. Try again later.");
+            showToast("network", "Poor internet connection. Try again later.");
+          } else {
+            setUsernameStatus("error");
+            setUsernameMsg("No connection. Try again.");
+          }
+        }
+      }, 600);
+    },
+    [getFirebaseToken, showToast],
+  );
+
+  // ── Submit: Upload avatar (PUBLIC) → Save profile (AUTHENTICATED) ────────
   const handleSubmit = useCallback(async () => {
     if (!canSubmit) return;
 
@@ -473,18 +539,17 @@ export default function Device() {
     const userEmail = authUser?.email || (params.userEmail as string);
 
     if (!userEmail) {
-      showToast("server", "Session expired. Please sign in again.");
+      showToast("auth", "Session expired. Please sign in again.");
       return;
     }
 
-    // Reset steps for this attempt
     setSteps([
       { key: "photo", label: "Uploading photo...", status: "idle" },
       { key: "save", label: "Saving account...", status: "idle" },
     ]);
     setShowProgress(true);
 
-    // ── Step 1: Upload photo (only now, on submit) ──────────────────────────
+    // ── STEP 1: Upload avatar to PUBLIC endpoint (/api/avatar) ─────────────
     let finalAvatarUrl: string | null = null;
 
     if (photoState === "none") {
@@ -492,16 +557,15 @@ export default function Device() {
     } else {
       setStep("photo", "loading", "Uploading photo...");
       try {
-        finalAvatarUrl = await uploadAvatarToSupabase(
-          avatarLocalUri!,
-          avatarMime,
-        );
+        finalAvatarUrl = await uploadAvatarPublic(avatarLocalUri!, avatarMime);
         setStep("photo", "done", "Uploaded ✓");
       } catch (err: any) {
         setStep("photo", "error", "Upload failed");
         setShowProgress(false);
-        if (err?.message === "network") {
-          showToast("network", "No internet — photo upload failed.");
+
+        // 🔥 NETWORK ERROR vs SERVER ERROR
+        if (isNetworkError(err)) {
+          showToast("network", "Poor internet connection. Try again later.");
         } else if (err?.message === "size") {
           showToast("server", "Photo must be under 5 MB.");
         } else {
@@ -511,21 +575,27 @@ export default function Device() {
       }
     }
 
-    // ── Step 2: Save profile (backend atomic lock) ──────────────────────────
+    // ── STEP 2: Save profile metadata to AUTHENTICATED endpoint ────────────
     setStep("save", "loading");
     try {
-      const headers = await authHeaders();
+      const firebaseToken = await getFirebaseToken();
+      if (!firebaseToken) {
+        throw new Error("Authentication required");
+      }
+
       const payload: Record<string, string> = {
         username: username.trim().toLowerCase(),
         name: username.trim(),
         email: userEmail,
       };
-      // Store the full Supabase public URL as avatarFileId
-      if (finalAvatarUrl) payload.avatarFileId = finalAvatarUrl;
+      if (finalAvatarUrl) payload.avatarUrl = finalAvatarUrl;
 
       const res = await fetch(`${API_URL}/api/users/profile`, {
         method: "POST",
-        headers: { ...headers, "Content-Type": "application/json" },
+        headers: {
+          Authorization: `Bearer ${firebaseToken}`,
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify(payload),
       });
       const body = await res.json().catch(() => ({}));
@@ -541,6 +611,8 @@ export default function Device() {
         } else if (body.code === "USERNAME_LOCKED") {
           showToast("server", "Account already set up. Redirecting…");
           setTimeout(() => router.replace("/tabs/discord"), 1800);
+        } else if (res.status === 401) {
+          showToast("auth", "Session expired. Please sign in again.");
         } else if (res.status >= 500) {
           showToast("server", "Server error. Please try again.");
         } else {
@@ -550,10 +622,18 @@ export default function Device() {
       }
 
       setStep("save", "done", "Saved ✓");
-    } catch {
+    } catch (error: any) {
       setStep("save", "error", "Failed");
       setShowProgress(false);
-      showToast("network", "No internet. Check connection and retry.");
+
+      // 🔥 NETWORK ERROR vs AUTH ERROR
+      if (isNetworkError(error)) {
+        showToast("network", "Poor internet connection. Try again later.");
+      } else if (error.message === "Authentication required") {
+        showToast("auth", "Session expired. Please sign in again.");
+      } else {
+        showToast("network", "Poor internet connection. Try again later.");
+      }
       return;
     }
 
@@ -568,6 +648,7 @@ export default function Device() {
     setStep,
     router,
     params,
+    getFirebaseToken,
   ]);
 
   // ── Derived UI values ─────────────────────────────────────────────────────
@@ -714,18 +795,14 @@ export default function Device() {
         </KeyboardAvoidingView>
       </SafeAreaView>
 
-      {/* Progress overlay */}
       {showProgress && <ProgressScreen steps={steps} />}
-
-      {/* Toast */}
       <Toast type={toast.type} message={toast.message} visible={toastVisible} />
     </View>
   );
 }
 
-// ── Avatar upload via backend → Supabase Storage ───────────────────────────
-// Returns the full Supabase public URL (stored as avatarFileId in MongoDB)
-async function uploadAvatarToSupabase(
+// ── Avatar upload to PUBLIC endpoint (/api/avatar) ─────────────────────────
+async function uploadAvatarPublic(
   localUri: string,
   mimeType: string,
 ): Promise<string> {
@@ -742,35 +819,48 @@ async function uploadAvatarToSupabase(
 
   if (blob.size > MAX_PHOTO_BYTES) throw new Error("size");
 
-  const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
-  let headers: Record<string, string>;
+  const headers: Record<string, string> = {
+    "Content-Type": safeMime,
+    "Content-Length": String(blob.size),
+  };
+
+  // Optional: attach token if available (non-breaking)
   try {
-    const { authHeaders } = await import("../../src/utils/tokenManager");
-    headers = await authHeaders();
+    const auth = getAuth();
+    const user = auth.currentUser;
+    if (user) {
+      const token = await user.getIdToken(true);
+      headers.Authorization = `Bearer ${token}`;
+    }
   } catch {
-    throw new Error("network");
+    console.warn("[Device] Avatar upload: proceeding without token");
   }
 
   let res: Response;
   try {
     res = await fetch(`${API_URL}/api/avatar`, {
       method: "POST",
-      headers: {
-        ...headers,
-        "Content-Type": safeMime,
-        "Content-Length": String(blob.size),
-      },
+      headers,
       body: blob,
     });
-  } catch {
-    throw new Error("network");
+  } catch (error: any) {
+    // 🔥 Re-throw with network marker for frontend detection
+    if (
+      error?.message?.includes("Failed to fetch") ||
+      error?.type === "NetworkError"
+    ) {
+      throw {
+        ...error,
+        type: "NetworkError",
+        message: "Network request failed",
+      };
+    }
+    throw error;
   }
 
   if (!res.ok) throw new Error("server");
 
   const body = await res.json().catch(() => ({}));
-
-  // Supabase returns avatarUrl directly as a full public CDN URL
   if (!body.avatarUrl) throw new Error("server");
 
   return body.avatarUrl;

@@ -5,7 +5,11 @@ import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
 import { SessionExpiredProvider } from "../src/context/SessionExpiredContext";
 import { useSessionHeartbeat } from "../src/hooks/useSessionHeartbeat";
 import { useAuth } from "../src/store/authStore";
+import { getCachedProfile } from "../src/utils/cache";
 import { getLastRoute } from "../src/utils/cacheAppState";
+import { getBackendToken } from "../src/utils/tokenManager";
+
+const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
 
 export default function RootLayout() {
   const router = useRouter();
@@ -38,8 +42,31 @@ export default function RootLayout() {
           return;
         }
 
-        // ✅ AUTH SUCCESS
-        console.log("[RootLayout] Auth successful. Restoring session.");
+        // ✅ AUTH SUCCESS - Now check if profile exists in MongoDB
+        console.log("[RootLayout] Auth successful. Checking profile setup...");
+
+        // 🔥 Check if user has completed profile setup (username set in MongoDB)
+        const hasProfile = await checkProfileSetup();
+
+        if (!hasProfile) {
+          // ❌ User authenticated but NO profile in MongoDB → redirect to setup
+          console.log(
+            "[RootLayout] Profile not set up. Redirecting to /auth/device",
+          );
+
+          // Get user email from cache or token for pre-filling device screen
+          const cached = await getCachedProfile();
+          const userEmail = cached?.email || "";
+
+          router.replace({
+            pathname: "/auth/device",
+            params: { userEmail },
+          } as any);
+          return;
+        }
+
+        // ✅ Profile exists → restore normal session
+        console.log("[RootLayout] Profile found. Restoring session.");
 
         // Preload last session
         const lastRoute = await getLastRoute();
@@ -48,6 +75,7 @@ export default function RootLayout() {
           "/auth/otp",
           "/auth/phone",
           "/auth/login",
+          "/auth/device",
         ];
 
         if (lastRoute && !publicRoutes.includes(lastRoute)) {
@@ -65,6 +93,73 @@ export default function RootLayout() {
 
     boot();
   }, [navState?.key]);
+
+  // 🔥 NEW: Check if user has completed profile setup in MongoDB
+  const checkProfileSetup = async (): Promise<boolean> => {
+    try {
+      // 1. Try cached profile first (offline support)
+      const cached = await getCachedProfile();
+      if (cached?.username && cached?.email) {
+        console.log("[RootLayout] Using cached profile:", cached.username);
+        return true;
+      }
+
+      // 2. Fetch fresh profile from backend
+      const backendToken = await getBackendToken();
+      if (!backendToken) {
+        console.warn("[RootLayout] No backend token for profile check");
+        return false;
+      }
+
+      const response = await fetch(`${API_URL}/api/users/profile`, {
+        headers: {
+          Authorization: `Bearer ${backendToken}`,
+          "Content-Type": "application/json",
+        },
+      });
+
+      // Handle 404 = profile not found in MongoDB
+      if (response.status === 404) {
+        console.log("[RootLayout] Profile not found in MongoDB (404)");
+        return false;
+      }
+
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        console.warn("[RootLayout] Profile fetch failed:", err.message);
+        // If token expired, let auth flow handle re-auth
+        if (response.status === 401) return false;
+        // For other errors, assume profile exists to avoid redirect loops
+        return true;
+      }
+
+      const profile = await response.json();
+
+      // 🔥 Key check: does profile have a username? (profile completion flag)
+      const hasUsername =
+        !!profile?.username && profile.username.trim().length > 0;
+
+      console.log("[RootLayout] Profile check:", {
+        uid: profile?.uid,
+        hasUsername,
+        username: profile?.username,
+      });
+
+      return hasUsername;
+    } catch (error) {
+      // Network error / offline: check cache as fallback
+      console.warn("[RootLayout] Profile check error (offline?):", error);
+
+      const cached = await getCachedProfile();
+      if (cached?.username) {
+        console.log("[RootLayout] Using cached username while offline");
+        return true;
+      }
+
+      // If truly no data, assume profile not set up
+      return false;
+    }
+  };
 
   // Show Splash Screen while checking
   if (isChecking) {
