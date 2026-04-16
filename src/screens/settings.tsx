@@ -295,18 +295,30 @@ export default function SettingsScreen() {
         throw new Error("Backend did not return avatar URL");
       }
 
-      // ✅ Update local state and cache with new avatar
-      setProfile((prev) => (prev ? { ...prev, avatarUrl } : null));
+      // ✅ FIX: Add cache-busting param to force fresh load of new avatar
+      // This ensures Supabase CDN and React Native Image fetch the new file
+      const avatarUrlWithCacheBust = `${avatarUrl}?v=${Date.now()}`;
 
-      // Update cache with full profile structure
-      const cachedProfile = await getCachedProfile();
+      // ✅ Update local state IMMEDIATELY with cache-busted URL for instant preview
+      setProfile((prev) =>
+        prev ? { ...prev, avatarUrl: avatarUrlWithCacheBust } : null,
+      );
+
+      // ✅ Update SQLite cache with cache-busted URL
+      // This ensures the new avatar persists across app restarts
+      const currentProfile = profile || (await getCachedProfile());
       await saveProfileToCache({
-        ...(cachedProfile || {}),
-        avatarUrl,
-        uid: uid || cachedProfile?.uid,
+        uid: uid || currentProfile?.uid,
+        username: currentProfile?.username || "",
+        email: currentProfile?.email || "",
+        avatarUrl: avatarUrlWithCacheBust, // ✅ Cache the cache-busted URL
+        hasProfile: currentProfile?.hasProfile,
       } as UserProfileCache);
 
-      console.log("[Settings] ✅ Avatar uploaded and cached:", avatarUrl);
+      console.log(
+        "[Settings] ✅ Avatar uploaded, cached (with cache-bust), and preview updated:",
+        avatarUrlWithCacheBust,
+      );
     } catch (error: any) {
       console.error("[Settings] Avatar upload error:", {
         message: error.message,
@@ -472,7 +484,9 @@ export default function SettingsScreen() {
                 </View>
               ) : profile?.avatarUrl ? (
                 // ✅ Show avatar from MongoDB with error handling
+                // ✅ FIX: Add key prop to force re-render when avatarUrl changes
                 <Image
+                  key={profile.avatarUrl} // ✅ Forces fresh load when URL changes
                   source={{ uri: profile.avatarUrl }}
                   style={styles.avatar}
                   resizeMode="cover"

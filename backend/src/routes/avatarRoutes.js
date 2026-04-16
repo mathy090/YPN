@@ -9,7 +9,31 @@ const rateLimit = require("express-rate-limit");
 const router = express.Router();
 
 const MAX_BYTES = 5 * 1024 * 1024;
-const ALLOWED_MIME = ["image/jpeg", "image/png", "image/webp"];
+// ✅ FIX: Allow ALL common image formats
+const ALLOWED_MIME = [
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+  "image/bmp",
+  "image/tiff",
+  "image/heic",
+  "image/heif",
+];
+
+// Map MIME types to file extensions
+const MIME_TO_EXT = {
+  "image/jpeg": "jpg",
+  "image/jpg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+  "image/gif": "gif",
+  "image/bmp": "bmp",
+  "image/tiff": "tiff",
+  "image/heic": "heic",
+  "image/heif": "heif",
+};
 
 // ── 🔥 Rate Limiter for Avatar Uploads ───────────────────────────────────────
 const avatarUploadLimiter = rateLimit({
@@ -17,7 +41,7 @@ const avatarUploadLimiter = rateLimit({
   max: 3,
   message: {
     code: "RATE_LIMITED",
-    message: "Too many avatar uploads. Please try again later.",
+    message: "Too many avatar uploads. Please wait a few minutes.",
   },
   keyGenerator: (req) =>
     req.user?.sub || req.user?.uid || req.ip || "anonymous",
@@ -78,13 +102,18 @@ router.post("/", avatarUploadLimiter, async (req, res) => {
 
     console.log(`[/api/avatar] Processing upload for uid=${uid}`);
 
-    const mimeType = (req.headers["content-type"] ?? "").split(";")[0].trim();
+    const mimeType = (req.headers["content-type"] ?? "")
+      .split(";")[0]
+      .trim()
+      .toLowerCase();
     const contentLength = parseInt(req.headers["content-length"] ?? "0", 10);
 
+    // ✅ FIX: Allow all common image formats
     if (!ALLOWED_MIME.includes(mimeType)) {
+      console.warn("[/api/avatar] Unsupported MIME type:", mimeType);
       return res.status(400).json({
         code: "INVALID_TYPE",
-        message: "Only JPEG, PNG or WebP photos are allowed.",
+        message: `Unsupported image format: ${mimeType}. Allowed: ${ALLOWED_MIME.join(", ")}`,
       });
     }
 
@@ -109,18 +138,21 @@ router.post("/", avatarUploadLimiter, async (req, res) => {
       });
     }
 
-    const ext = mimeType.split("/")[1] ?? "jpg";
+    // ✅ FIX: Use correct extension from MIME type (not hardcoded)
+    const ext = MIME_TO_EXT[mimeType] || "jpg";
     const filePath = `${uid}/avatar.${ext}`;
 
-    console.log(`[/api/avatar] Uploading to Supabase: ${filePath}`);
+    console.log(
+      `[/api/avatar] Uploading to Supabase: ${filePath} (MIME: ${mimeType})`,
+    );
 
     const supabase = getSupabase();
 
-    // ✅ FIX: Supabase upload() returns { data: { path }, error }
+    // ✅ FIX: Pass correct contentType to Supabase so it serves correct headers
     const uploadResult = await supabase.storage
       .from("avatars")
       .upload(filePath, buffer, {
-        contentType: mimeType,
+        contentType: mimeType, // ✅ Critical: Ensures correct Content-Type header
         upsert: true,
         cacheControl: "3600",
       });
@@ -156,7 +188,7 @@ router.post("/", avatarUploadLimiter, async (req, res) => {
       `[/api/avatar] Supabase upload success: path=${uploadResult.data.path}`,
     );
 
-    // ✅ FIX: Supabase getPublicUrl() returns { data: { publicUrl } }
+    // ✅ FIX: getPublicUrl returns { data: { publicUrl } }
     const urlResult = supabase.storage.from("avatars").getPublicUrl(filePath);
 
     console.log("[/api/avatar] getPublicUrl result:", {
