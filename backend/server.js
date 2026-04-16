@@ -3,7 +3,7 @@
 require("dotenv").config();
 
 const express = require("express");
-const { MongoClient } = require("mongodb");
+const { MongoClient, ObjectId } = require("mongodb");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const jwt = require("jsonwebtoken");
@@ -60,6 +60,7 @@ app.set("trust proxy", 1);
 app.use(cors());
 
 // 🔥 IMPORTANT: Apply raw body parsing ONLY to /api/avatar routes BEFORE json()
+// ✅ REMOVED AUTH: Avatar routes are now public
 app.use(
   "/api/avatar",
   express.raw({ type: ["image/*", "application/octet-stream"], limit: "5mb" }),
@@ -117,7 +118,7 @@ async function verifyFirebaseToken(req, res, next) {
   }
 }
 
-// ── Middleware: Verify Backend JWT (Hybrid Auth) - ✅ FIXED ─────────────────
+// ── Middleware: Verify Backend JWT (Hybrid Auth) ────────────────────────────
 function verifyBackendToken(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer ")) {
@@ -128,59 +129,39 @@ function verifyBackendToken(req, res, next) {
 
   const token = authHeader.split("Bearer ")[1];
 
-  // ✅ DEBUG: Log token info for troubleshooting
-  console.log("[verifyBackendToken] Verifying:", {
-    tokenStart: token?.substring(0, 30) + "...",
-    hasSecret: !!process.env.BACKEND_JWT_SECRET,
-    issuer: "ypn-backend",
-    audience: "ypn-app",
-  });
-
   jwt.verify(
     token,
     process.env.BACKEND_JWT_SECRET,
     {
       issuer: "ypn-backend",
       audience: "ypn-app",
-      clockTolerance: 30, // ✅ FIX: Allow 30-second clock skew
-      algorithms: ["HS256"], // ✅ FIX: Explicitly specify algorithm
+      clockTolerance: 30,
+      algorithms: ["HS256"],
     },
     (err, decoded) => {
       if (err) {
-        // ✅ DEBUG: Log specific error details
-        console.error("[verifyBackendToken] JWT verification failed:", {
-          errorName: err.name,
-          errorMessage: err.message,
-          errorType: err.constructor?.name,
-        });
-
         if (err.name === "TokenExpiredError") {
           return res.status(401).json({
             message: "Token expired. Please sign in again.",
             code: "TOKEN_EXPIRED",
           });
         }
-
         if (err.name === "JsonWebTokenError") {
           return res.status(403).json({
             message: "Invalid token signature or format.",
             code: "INVALID_TOKEN",
           });
         }
-
         if (err.name === "NotBeforeError") {
           return res.status(401).json({
             message: "Token not yet valid.",
             code: "TOKEN_NOT_YET_VALID",
           });
         }
-
         return res
           .status(403)
           .json({ message: "Invalid token", code: "INVALID_TOKEN" });
       }
-
-      console.log("[verifyBackendToken] ✅ Verified for user:", decoded.sub);
       req.user = decoded;
       next();
     },
@@ -213,7 +194,6 @@ async function connectDB() {
     initKeyStore(db);
     initNewsArchive(db);
     initDriveVideos(db);
-    // 🔥 NEW: Initialize sign-out store
     initSignoutStore(db);
 
     registerRoutes();
@@ -228,11 +208,11 @@ function registerRoutes() {
   // ── POST /api/auth/status (Heartbeat/Presence) ────────────────────
   app.post("/api/auth/status", verifyBackendToken, async (req, res) => {
     try {
-      const userId = req.user.id;
+      const userId = req.user.sub;
       const { status } = req.body;
 
       await db.collection("users").updateOne(
-        { _id: new require("mongodb").ObjectId(userId) },
+        { uid: userId },
         {
           $set: {
             lastSeen: new Date(),
@@ -309,14 +289,13 @@ function registerRoutes() {
         });
       }
 
-      // Upsert user document with tokenVersion field for sign-out invalidation
+      // Upsert user document - simplified schema: uid, email, username, avatarUrl
       await db.collection("users").updateOne(
         { uid },
         {
           $set: { uid, email: userRecord.email, updatedAt: new Date() },
           $setOnInsert: {
             createdAt: new Date(),
-            tokenVersion: 0, // ✅ Initialize token version for new users
           },
         },
         { upsert: true },
@@ -324,7 +303,7 @@ function registerRoutes() {
 
       const userProfile = await db
         .collection("users")
-        .findOne({ uid }, { projection: { username: 1, tokenVersion: 1 } });
+        .findOne({ uid }, { projection: { username: 1 } });
       const hasProfile = !!userProfile?.username;
 
       res.json({
@@ -338,7 +317,7 @@ function registerRoutes() {
     }
   });
 
-  // ── POST /api/auth/refresh (Hybrid Auth) - ✅ FIXED EXPIRY ───────────────
+  // ── POST /api/auth/refresh (Hybrid Auth) ───────────────────────────────
   app.post("/api/auth/refresh", async (req, res) => {
     const { firebase_id_token } = req.body;
 
@@ -352,74 +331,48 @@ function registerRoutes() {
       const decoded = await admin.auth().verifyIdToken(firebase_id_token);
       const { uid, email, name, picture } = decoded;
 
-      const userProfile = await db
-        .collection("users")
-        .findOne(
-          { uid },
-          {
-            projection: {
-              username: 1,
-              role: 1,
-              isBanned: 1,
-              hasProfile: 1,
-              tokenVersion: 1,
-            },
+      const userProfile = await db.collection("users").findOne(
+        { uid },
+        {
+          projection: {
+            username: 1,
           },
-        );
+        },
+      );
 
-      if (userProfile?.isBanned) {
-        return res
-          .status(403)
-          .json({ message: "Account suspended", code: "ACCOUNT_SUSPENDED" });
-      }
-
-      // ✅ FIX: Parse expiresIn correctly - handle both string ("7d") and number (seconds)
       let expiresInValue;
       const expiryConfig = process.env.BACKEND_JWT_EXPIRY || "7d";
 
       if (typeof expiryConfig === "string" && expiryConfig.includes("d")) {
-        // String format like "7d" - convert to seconds
         expiresInValue = parseInt(expiryConfig) * 24 * 60 * 60;
       } else {
-        // Already in seconds or parseable number
         expiresInValue = parseInt(expiryConfig) || 7 * 24 * 60 * 60;
       }
 
-      // ✅ FIX: Include tokenVersion in JWT payload for sign-out invalidation
       const backendJwt = jwt.sign(
         {
           sub: uid,
           email,
           name: name || "",
           picture: picture || "",
-          role: userProfile?.role || "user",
           hasProfile: !!userProfile?.username,
-          tokenVersion: userProfile?.tokenVersion ?? 0, // ✅ Include version
         },
         process.env.BACKEND_JWT_SECRET,
         {
-          expiresIn: expiresInValue, // ✅ Use parsed seconds value
+          expiresIn: expiresInValue,
           issuer: "ypn-backend",
           audience: "ypn-app",
-          algorithm: "HS256", // ✅ Explicitly specify
+          algorithm: "HS256",
         },
       );
 
-      console.log("[/api/auth/refresh] Issued JWT:", {
-        uid,
-        expiresIn: expiresInValue,
-        expiresInDays: (expiresInValue / 86400).toFixed(1),
-        tokenVersion: userProfile?.tokenVersion ?? 0,
-      });
-
       res.json({
         backend_jwt: backendJwt,
-        expires_in: expiresInValue, // ✅ Return seconds (not string)
+        expires_in: expiresInValue,
         user: {
           uid,
           email,
           name: name || "",
-          role: userProfile?.role || "user",
           hasProfile: !!userProfile?.username,
         },
       });
@@ -441,123 +394,161 @@ function registerRoutes() {
     }
   });
 
-  // ── GET /api/auth/verify-username-ownership ────────────────────────────────
-  app.get(
-    "/api/auth/verify-username-ownership",
-    verifyFirebaseToken,
-    async (req, res) => {
-      try {
-        const { uid } = req.user;
-        const requestedUsername = (req.query.username ?? "")
-          .toString()
-          .trim()
-          .toLowerCase();
+  // ── GET /api/auth/check-username ────────────────────────────────
+  // 🔥 NEW: Check username availability with ownership verification
+  app.get("/api/auth/check-username", verifyFirebaseToken, async (req, res) => {
+    try {
+      const { uid } = req.user; // Firebase UID from token
+      const requestedUsername = (req.query.username ?? "")
+        .toString()
+        .trim()
+        .toLowerCase();
 
-        if (!requestedUsername) {
-          return res
-            .status(400)
-            .json({ message: "Username parameter required." });
-        }
-
-        const userWithThisName = await db
-          .collection("users")
-          .findOne({ username: requestedUsername }, { projection: { uid: 1 } });
-
-        if (!userWithThisName) {
-          return res.json({ owned: true, message: "Username available." });
-        }
-
-        if (userWithThisName.uid === uid) {
-          return res.json({ owned: true, message: "Username verified." });
-        } else {
-          return res.status(403).json({
-            owned: false,
-            message: "This username belongs to another account.",
-            code: "NOT_OWNER",
-          });
-        }
-      } catch (err) {
-        console.error("[verify-ownership]", err);
-        res.status(500).json({ message: "Internal server error." });
+      if (!requestedUsername || !/^[a-z0-9_]{3,20}$/.test(requestedUsername)) {
+        return res.status(400).json({
+          available: false,
+          message:
+            "Username must be 3-20 chars: letters, numbers, underscores only.",
+        });
       }
-    },
-  );
 
-  // ── POST /api/users/profile ────────────────────────────────────────────────
+      // 🔍 Check if username exists in DB
+      const existingUser = await db
+        .collection("users")
+        .findOne({ username: requestedUsername }, { projection: { uid: 1 } });
+
+      if (!existingUser) {
+        // ✅ Username doesn't exist → available for anyone
+        return res.json({ available: true, message: "Username available." });
+      }
+
+      // 🔐 Username exists - check if it belongs to current user
+      if (existingUser.uid === uid) {
+        return res.json({ available: true, message: "This is your username." });
+      } else {
+        // ❌ Username taken by another account
+        return res.status(409).json({
+          available: false,
+          message: "Username already taken.",
+          code: "USERNAME_TAKEN",
+        });
+      }
+    } catch (err) {
+      console.error("[/api/auth/check-username] Error:", err);
+      res.status(500).json({ message: "Internal server error." });
+    }
+  });
+
+  // ── POST /api/users/profile ─────────────────────────────────────
+  // 🔥 Simplified: username (required), email (from token), avatarUrl (optional)
   app.post("/api/users/profile", verifyFirebaseToken, async (req, res) => {
     try {
-      const { uid, email } = req.user;
-      const { name, username: rawUsername, avatarUrl } = req.body ?? {};
+      const { uid, email: firebaseEmail } = req.user; // From Firebase token
+      const { username: rawUsername, avatarUrl } = req.body ?? {};
 
-      if (!name?.trim()) {
-        return res
-          .status(400)
-          .json({ code: "MISSING_NAME", message: "Name is required." });
-      }
-
+      // 🔥 Validate username format
       const cleanUsername = (rawUsername ?? "").toString().trim().toLowerCase();
       if (!cleanUsername || !/^[a-z0-9_]{3,20}$/.test(cleanUsername)) {
         return res.status(400).json({
           code: "INVALID_USERNAME",
-          message: "3–20 characters. Letters, numbers, underscores only.",
+          message:
+            "Username: 3–20 chars, lowercase letters/numbers/underscores only.",
         });
       }
 
+      // 🔥 Email comes from Firebase token (trusted), not request body
       const updatePayload = {
-        name: name.trim(),
-        email,
+        email: firebaseEmail,
         updatedAt: new Date(),
       };
 
-      if (avatarUrl !== undefined) {
-        updatePayload.avatarUrl = avatarUrl;
+      // ✅ Avatar is optional - only update if provided
+      if (avatarUrl !== undefined && avatarUrl !== null) {
+        updatePayload.avatarUrl = avatarUrl.toString().trim();
       }
 
       const currentUser = await db.collection("users").findOne({ uid });
-      if (!currentUser) {
-        return res
-          .status(404)
-          .json({ code: "USER_NOT_FOUND", message: "User not found." });
-      }
 
-      if (!currentUser.username) {
+      // 🔥 First-time profile setup: set username
+      if (!currentUser?.username) {
+        // Attempt atomic update with username uniqueness check
         const result = await db.collection("users").findOneAndUpdate(
-          { uid, username: { $exists: false } },
+          {
+            uid,
+            $or: [{ username: { $exists: false } }, { username: null }],
+          },
           {
             $set: {
               ...updatePayload,
               username: cleanUsername,
-              hasProfile: true,
             },
           },
-          { returnDocument: "after" },
+          {
+            returnDocument: "after",
+            projection: { username: 1, email: 1, avatarUrl: 1, uid: 1 },
+          },
         );
 
-        if (!result) {
+        if (!result?.value) {
+          // 🔥 Race condition: check if username was taken by someone else
+          const conflict = await db
+            .collection("users")
+            .findOne(
+              { username: cleanUsername, uid: { $ne: uid } },
+              { projection: { uid: 1 } },
+            );
+          if (conflict) {
+            return res.status(409).json({
+              code: "USERNAME_TAKEN",
+              message: "Username already taken by another account.",
+            });
+          }
           return res
-            .status(409)
-            .json({ code: "USERNAME_TAKEN", message: "Username taken." });
-        }
-      } else {
-        if (rawUsername && rawUsername.toLowerCase() !== currentUser.username) {
-          return res.status(409).json({
-            code: "USERNAME_LOCKED",
-            message: "Username cannot be changed once set.",
-          });
+            .status(500)
+            .json({
+              code: "UPDATE_FAILED",
+              message: "Could not create profile.",
+            });
         }
 
-        await db
-          .collection("users")
-          .updateOne({ uid }, { $set: updatePayload });
+        return res.status(201).json({
+          success: true,
+          user: {
+            uid: result.value.uid,
+            username: result.value.username,
+            email: result.value.email,
+            avatarUrl: result.value.avatarUrl,
+          },
+        });
       }
 
-      res.json({ success: true });
+      // 🔥 Profile already exists - username is locked (cannot be changed)
+      if (rawUsername && rawUsername.toLowerCase() !== currentUser.username) {
+        return res.status(409).json({
+          code: "USERNAME_LOCKED",
+          message: "Username cannot be changed after initial setup.",
+        });
+      }
+
+      // ✅ Update only avatar (if provided) and metadata
+      await db.collection("users").updateOne({ uid }, { $set: updatePayload });
+
+      res.json({
+        success: true,
+        user: {
+          uid,
+          username: currentUser.username,
+          email: firebaseEmail,
+          avatarUrl: updatePayload.avatarUrl || currentUser.avatarUrl,
+        },
+      });
     } catch (err) {
-      console.error("/api/users/profile error:", err);
+      console.error("[POST /api/users/profile] Error:", err);
       if (err.code === 11000) {
-        return res
-          .status(409)
-          .json({ code: "USERNAME_TAKEN", message: "Username already taken." });
+        return res.status(409).json({
+          code: "USERNAME_TAKEN",
+          message: "Username already exists in database.",
+        });
       }
       res
         .status(500)
@@ -565,37 +556,36 @@ function registerRoutes() {
     }
   });
 
-  // ── GET /api/users/profile ─────────────────────────────────────────────────
+  // ── GET /api/users/profile ─────────────────────────────────────
+  // 🔥 Simplified projection: only uid, username, email, avatarUrl
   app.get("/api/users/profile", verifyBackendToken, async (req, res) => {
-    // ✅ CHANGED: Use verifyBackendToken instead of verifyFirebaseToken
-    // This ensures backend JWT is validated (with tokenVersion check)
     try {
       const user = await db.collection("users").findOne(
-        { uid: req.user.sub }, // ✅ Use 'sub' from backend JWT, not 'uid'
+        { uid: req.user.sub },
         {
           projection: {
             _id: 0,
             uid: 1,
-            email: 1,
-            name: 1,
             username: 1,
-            avatarUrl: 1,
-            hasProfile: 1,
-            tokenVersion: 1,
+            email: 1,
+            avatarUrl: 1, // ✅ Optional field
           },
         },
       );
-      if (!user) return res.status(404).json({ message: "Profile not found" });
+
+      if (!user) {
+        return res.status(404).json({ message: "Profile not found" });
+      }
+
       res.json(user);
     } catch (e) {
-      console.error("[/api/users/profile] Error:", e);
-      res.status(500).json({ message: e.message });
+      console.error("[GET /api/users/profile] Error:", e);
+      res.status(500).json({ message: "Internal server error" });
     }
   });
 
-  // ── GET /api/users/search ──────────────────────────────────────────────────
+  // ── GET /api/users/search ─────────────────────────────────────
   app.get("/api/users/search", verifyBackendToken, async (req, res) => {
-    // ✅ CHANGED: Use verifyBackendToken for consistency
     try {
       const q = (req.query.q ?? "").toString().trim();
       if (!q || q.length < 2)
@@ -605,14 +595,11 @@ function registerRoutes() {
         .collection("users")
         .find(
           {
-            $or: [
-              { name: { $regex: q, $options: "i" } },
-              { username: { $regex: q, $options: "i" } },
-            ],
-            uid: { $ne: req.user.sub }, // ✅ Use 'sub' from backend JWT
+            $or: [{ username: { $regex: q, $options: "i" } }],
+            uid: { $ne: req.user.sub },
           },
           {
-            projection: { _id: 0, uid: 1, name: 1, username: 1, avatarUrl: 1 },
+            projection: { _id: 0, uid: 1, username: 1, email: 1, avatarUrl: 1 },
             limit: 20,
           },
         )
@@ -620,7 +607,41 @@ function registerRoutes() {
 
       res.json(users);
     } catch (e) {
-      res.status(500).json({ message: e.message });
+      console.error("[/api/users/search] Error:", e);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  // ── GET /api/users/:username ──────────────────────────────────
+  // 🔥 NEW: Get public profile by username
+  app.get("/api/users/:username", async (req, res) => {
+    try {
+      const username = req.params.username.toString().trim().toLowerCase();
+
+      if (!username || !/^[a-z0-9_]{3,20}$/.test(username)) {
+        return res.status(400).json({ message: "Invalid username format" });
+      }
+
+      const user = await db.collection("users").findOne(
+        { username },
+        {
+          projection: {
+            _id: 0,
+            uid: 1,
+            username: 1,
+            avatarUrl: 1,
+          },
+        },
+      );
+
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      res.json(user);
+    } catch (e) {
+      console.error("[GET /api/users/:username] Error:", e);
+      res.status(500).json({ message: "Internal server error" });
     }
   });
 
@@ -628,7 +649,9 @@ function registerRoutes() {
   app.use("/api/auth", verifyBackendToken, signoutRoutes);
 
   // ── Mount External Routes ──────────────────────────────────────────────────
-  app.use("/api/avatar", verifyBackendToken, avatarRoutes);
+  // ✅ REMOVED AUTH: Avatar routes are now public (no verifyBackendToken)
+  app.use("/api/avatar", avatarRoutes);
+
   app.use("/api/videos/drive", driveVideoRoutes);
   app.use("/api/videos", videoRoutes);
   app.use("/api/discord", discordRoutes);
@@ -643,17 +666,15 @@ function registerRoutes() {
 // ── Start Server ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 10000;
 
-// ✅ DEBUG: Log JWT config at startup
-console.log("🔐 JWT Configuration:", {
-  hasSecret: !!process.env.BACKEND_JWT_SECRET,
-  secretLength: process.env.BACKEND_JWT_SECRET?.length,
-  expiry: process.env.BACKEND_JWT_EXPIRY,
-  issuer: "ypn-backend",
-  audience: "ypn-app",
-});
-
 connectDB().then(() => {
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`🚀 YPN Backend running on port ${PORT}`);
   });
+});
+
+// Graceful shutdown
+process.on("SIGINT", async () => {
+  console.log("🛑 Shutting down gracefully...");
+  await client.close();
+  process.exit(0);
 });

@@ -9,7 +9,7 @@ const rateLimit = require("express-rate-limit");
 const router = express.Router();
 
 const MAX_BYTES = 5 * 1024 * 1024;
-// ✅ FIX: Allow ALL common image formats
+// ✅ Allow ALL common image formats
 const ALLOWED_MIME = [
   "image/jpeg",
   "image/jpg",
@@ -36,6 +36,7 @@ const MIME_TO_EXT = {
 };
 
 // ── 🔥 Rate Limiter for Avatar Uploads ───────────────────────────────────────
+// Key by uid from request body/query (since no auth)
 const avatarUploadLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 3,
@@ -43,8 +44,9 @@ const avatarUploadLimiter = rateLimit({
     code: "RATE_LIMITED",
     message: "Too many avatar uploads. Please wait a few minutes.",
   },
+  // ✅ Key by uid from body/query or fallback to IP
   keyGenerator: (req) =>
-    req.user?.sub || req.user?.uid || req.ip || "anonymous",
+    req.body?.uid || req.query?.uid || req.ip || "anonymous",
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -79,28 +81,32 @@ async function getDB() {
 }
 
 // ── POST /api/avatar ───────────────────────────────────────────────────────────
+// ✅ NO AUTH REQUIRED - uid sent in request body or query param
+// Rate limited by uid to prevent abuse
 router.post("/", avatarUploadLimiter, async (req, res) => {
   try {
-    const uid = req.user?.sub || req.user?.uid || req.user?.id;
+    // ✅ FIX: Get uid from request body OR query param (sent by frontend)
+    const uid = req.body?.uid || req.query?.uid;
 
     console.log("[/api/avatar] Request received:", {
-      hasUser: !!req.user,
-      userSub: req.user?.sub,
-      userEmail: req.user?.email,
-      extractedUid: uid,
+      hasUid: !!uid,
+      uidLength: uid?.length,
+      uidSource: req.body?.uid ? "body" : req.query?.uid ? "query" : "none",
       contentType: req.headers["content-type"],
       contentLength: req.headers["content-length"],
     });
 
-    if (!uid) {
-      console.error("[/api/avatar] ❌ Could not extract uid from JWT");
-      return res.status(401).json({
-        code: "UNAUTHORIZED",
-        message: "Invalid authentication token - missing user identifier",
+    if (!uid || typeof uid !== "string" || uid.trim() === "") {
+      console.error("[/api/avatar] ❌ Missing or invalid uid");
+      return res.status(400).json({
+        code: "MISSING_UID",
+        message:
+          "User identifier (uid) is required in request body or query param",
       });
     }
 
-    console.log(`[/api/avatar] Processing upload for uid=${uid}`);
+    const cleanUid = uid.trim();
+    console.log(`[/api/avatar] Processing upload for uid=${cleanUid}`);
 
     const mimeType = (req.headers["content-type"] ?? "")
       .split(";")[0]
@@ -108,7 +114,7 @@ router.post("/", avatarUploadLimiter, async (req, res) => {
       .toLowerCase();
     const contentLength = parseInt(req.headers["content-length"] ?? "0", 10);
 
-    // ✅ FIX: Allow all common image formats
+    // ✅ Allow all common image formats
     if (!ALLOWED_MIME.includes(mimeType)) {
       console.warn("[/api/avatar] Unsupported MIME type:", mimeType);
       return res.status(400).json({
@@ -138,9 +144,9 @@ router.post("/", avatarUploadLimiter, async (req, res) => {
       });
     }
 
-    // ✅ FIX: Use correct extension from MIME type (not hardcoded)
+    // ✅ Use correct extension from MIME type
     const ext = MIME_TO_EXT[mimeType] || "jpg";
-    const filePath = `${uid}/avatar.${ext}`;
+    const filePath = `${cleanUid}/avatar.${ext}`;
 
     console.log(
       `[/api/avatar] Uploading to Supabase: ${filePath} (MIME: ${mimeType})`,
@@ -148,7 +154,7 @@ router.post("/", avatarUploadLimiter, async (req, res) => {
 
     const supabase = getSupabase();
 
-    // ✅ FIX: Pass correct contentType to Supabase so it serves correct headers
+    // ✅ Upload to Supabase with correct contentType
     const uploadResult = await supabase.storage
       .from("avatars")
       .upload(filePath, buffer, {
@@ -188,7 +194,7 @@ router.post("/", avatarUploadLimiter, async (req, res) => {
       `[/api/avatar] Supabase upload success: path=${uploadResult.data.path}`,
     );
 
-    // ✅ FIX: getPublicUrl returns { data: { publicUrl } }
+    // ✅ Get public URL from Supabase
     const urlResult = supabase.storage.from("avatars").getPublicUrl(filePath);
 
     console.log("[/api/avatar] getPublicUrl result:", {
@@ -209,27 +215,43 @@ router.post("/", avatarUploadLimiter, async (req, res) => {
     const avatarUrl = urlResult.data.publicUrl;
     console.log(`[/api/avatar] Generated public URL: ${avatarUrl}`);
 
-    // Update MongoDB with the new URL
-    const db = await getDB();
-    const updateResult = await db
-      .collection("users")
-      .updateOne({ uid }, { $set: { avatarUrl, updatedAt: new Date() } });
+    // ✅ OPTIONAL: Update MongoDB with the new URL (non-fatal if fails)
+    // Device screen can also do this via /api/users/profile after upload
+    try {
+      const db = await getDB();
+      const updateResult = await db
+        .collection("users")
+        .updateOne(
+          { uid: cleanUid },
+          { $set: { avatarUrl, updatedAt: new Date() } },
+        );
 
-    console.log(`[/api/avatar] MongoDB update result:`, {
-      matchedCount: updateResult.matchedCount,
-      modifiedCount: updateResult.modifiedCount,
-      uid,
-      avatarUrl,
-    });
+      console.log(`[/api/avatar] MongoDB update result:`, {
+        matchedCount: updateResult.matchedCount,
+        modifiedCount: updateResult.modifiedCount,
+        uid: cleanUid,
+        avatarUrl,
+      });
 
-    if (updateResult.matchedCount === 0) {
+      if (updateResult.matchedCount === 0) {
+        console.warn(
+          `[/api/avatar] No user found with uid=${cleanUid} to update avatar (non-fatal)`,
+        );
+      }
+    } catch (dbErr) {
+      // Non-fatal: avatar uploaded to Supabase even if MongoDB update fails
       console.warn(
-        `[/api/avatar] No user found with uid=${uid} to update avatar`,
+        "[/api/avatar] MongoDB update failed (non-fatal):",
+        dbErr.message,
       );
     }
 
-    console.log(`[/api/avatar] ✅ Avatar uploaded successfully for uid=${uid}`);
-    res.status(201).json({ avatarUrl, uid });
+    console.log(
+      `[/api/avatar] ✅ Avatar uploaded successfully for uid=${cleanUid}`,
+    );
+
+    // ✅ Return the public URL (frontend will append ?v=timestamp for cache-busting)
+    res.status(201).json({ avatarUrl, uid: cleanUid });
   } catch (err) {
     console.error("[/api/avatar] Upload error:", {
       message: err.message,
@@ -244,24 +266,27 @@ router.post("/", avatarUploadLimiter, async (req, res) => {
 });
 
 // ── DELETE /api/avatar ─────────────────────────────────────────────────────────
+// ✅ NO AUTH REQUIRED - uid sent in request body or query param
 router.delete("/", avatarUploadLimiter, async (req, res) => {
   try {
-    const uid = req.user?.sub || req.user?.uid || req.user?.id;
+    const uid = req.body?.uid || req.query?.uid;
 
-    if (!uid) {
-      return res.status(401).json({
-        code: "UNAUTHORIZED",
-        message: "Invalid authentication token - missing user identifier",
+    if (!uid || typeof uid !== "string" || uid.trim() === "") {
+      return res.status(400).json({
+        code: "MISSING_UID",
+        message:
+          "User identifier (uid) is required in request body or query param",
       });
     }
 
-    console.log(`[/api/avatar DELETE] Removing avatar for uid=${uid}`);
+    const cleanUid = uid.trim();
+    console.log(`[/api/avatar DELETE] Removing avatar for uid=${cleanUid}`);
 
     const supabase = getSupabase();
 
     const listResult = await supabase.storage
       .from("avatars")
-      .list(uid, { limit: 10, search: "avatar." });
+      .list(cleanUid, { limit: 10, search: "avatar." });
 
     if (listResult.error) {
       console.warn(
@@ -271,7 +296,7 @@ router.delete("/", avatarUploadLimiter, async (req, res) => {
     }
 
     if (listResult.data && listResult.data.length > 0) {
-      const filesToDelete = listResult.data.map((f) => `${uid}/${f.name}`);
+      const filesToDelete = listResult.data.map((f) => `${cleanUid}/${f.name}`);
       console.log(`[/api/avatar DELETE] Deleting files:`, filesToDelete);
 
       const removeResult = await supabase.storage
@@ -288,18 +313,26 @@ router.delete("/", avatarUploadLimiter, async (req, res) => {
       }
     }
 
-    const db = await getDB();
-    await db
-      .collection("users")
-      .updateOne(
-        { uid },
-        { $unset: { avatarUrl: "" }, $set: { updatedAt: new Date() } },
+    // ✅ OPTIONAL: Clear URL in MongoDB (non-fatal if fails)
+    try {
+      const db = await getDB();
+      await db
+        .collection("users")
+        .updateOne(
+          { uid: cleanUid },
+          { $unset: { avatarUrl: "" }, $set: { updatedAt: new Date() } },
+        );
+      console.log(
+        `[/api/avatar DELETE] ✅ MongoDB avatarUrl cleared for uid=${cleanUid}`,
       );
+    } catch (dbErr) {
+      console.warn(
+        "[/api/avatar DELETE] MongoDB clear failed (non-fatal):",
+        dbErr.message,
+      );
+    }
 
-    console.log(
-      `[/api/avatar DELETE] ✅ MongoDB avatarUrl cleared for uid=${uid}`,
-    );
-    res.json({ success: true, uid });
+    res.json({ success: true, uid: cleanUid });
   } catch (err) {
     console.error("[/api/avatar DELETE] Error:", err.message);
     res.status(500).json({

@@ -3,23 +3,49 @@ const mongoose = require("mongoose");
 
 const userSchema = new mongoose.Schema(
   {
-    uid: { type: String, unique: true, sparse: true, index: true }, // Firebase UID
-    phone: { type: String, unique: true, sparse: true, index: true }, // Legacy OTP
-    email: { type: String, lowercase: true, trim: true, index: true },
-
-    username: {
+    // ✅ REQUIRED: Firebase UID (unique identifier)
+    uid: {
       type: String,
-      lowercase: true,
-      trim: true,
+      required: true,
       unique: true,
-      sparse: true, // Allows null until set
-      match: [/^[a-z0-9_]{3,20}$/, "is invalid"],
+      index: true,
+      trim: true,
     },
 
-    name: { type: String, trim: true },
-    avatarUrl: { type: String, default: "" },
+    // ✅ REQUIRED: Email (lowercase, trimmed)
+    email: {
+      type: String,
+      required: true,
+      lowercase: true,
+      trim: true,
+      index: true,
+    },
 
-    // 🔥 New Fields for Presence/Status
+    // ✅ REQUIRED: Username (unique, one per account)
+    username: {
+      type: String,
+      required: true, // ✅ Now required (was sparse/optional before)
+      unique: true, // ✅ Enforces one username per account globally
+      lowercase: true,
+      trim: true,
+      match: [/^[a-z0-9_]{3,20}$/, "is invalid"], // ✅ Same validation as before
+      index: true,
+    },
+
+    // ✅ OPTIONAL: Avatar URL (can be null/empty)
+    avatarUrl: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+
+    // ✅ OPTIONAL: Display name (can be same as username or different)
+    name: {
+      type: String,
+      trim: true,
+    },
+
+    // 🔥 Presence/Status Fields (optional, for future use)
     status: {
       type: String,
       enum: ["online", "offline", "idle", "busy"],
@@ -30,6 +56,7 @@ const userSchema = new mongoose.Schema(
       default: Date.now,
     },
 
+    // 🔥 Account Status Fields
     isVerified: { type: Boolean, default: false },
     isBanned: { type: Boolean, default: false },
     role: {
@@ -38,11 +65,30 @@ const userSchema = new mongoose.Schema(
       default: "user",
     },
 
-    // OTP Fields
-    otp: { type: String, select: false },
-    otpExpires: { type: Date, select: false },
+    // 🔥 Token Version for Sign-Out Invalidation
+    tokenVersion: { type: Number, default: 0 },
   },
-  { timestamps: true },
+  {
+    timestamps: true,
+    // ✅ Ensure username is always lowercase before saving
+    toJSON: {
+      transform: (doc, ret) => {
+        if (ret.username) ret.username = ret.username.toLowerCase();
+        return ret;
+      },
+    },
+  },
 );
+
+// ✅ Pre-save hook to enforce lowercase username (extra safety)
+userSchema.pre("save", function (next) {
+  if (this.username) {
+    this.username = this.username.toLowerCase();
+  }
+  next();
+});
+
+// ✅ Compound index for faster username+uid lookups
+userSchema.index({ username: 1, uid: 1 }, { unique: true });
 
 module.exports = mongoose.model("User", userSchema);
