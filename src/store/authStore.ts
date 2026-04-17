@@ -1,17 +1,24 @@
 // src/store/authStore.ts
 import { router } from "expo-router";
+import { getAuth } from "firebase/auth";
 import { create } from "zustand";
 import {
+  bindSessionToUID,
   clearAllTokens,
   getBackendToken,
+  getStoredUID,
   getTokenExpiry,
   getUserData,
+  isAuthError,
+  isNetworkError,
   OfflineError,
   refreshTokens,
   saveTokens,
   startBackgroundRetry,
   stopBackgroundRetry,
+  UIDMismatchError,
   UserData,
+  validateUIDBinding
 } from "../utils/tokenManager";
 
 interface AuthState {
@@ -40,28 +47,45 @@ export const useAuth = create<AuthState>((set, get) => ({
   isSessionExpired: false,
   user: null,
 
-  // ✅ Login Function for REST API
+  // ✅ Login: Firebase auth + UID binding + token exchange
   login: async (email: string, password: string) => {
     set({ isChecking: true });
     try {
       const API_URL = process.env.EXPO_PUBLIC_API_URL;
       if (!API_URL) throw new Error("API_URL_NOT_SET");
 
-      const response = await fetch(`${API_URL}/api/auth/login`, {
+      // Firebase sign in
+      const auth = getAuth();
+      const result = await auth.signInWithEmailAndPassword(email, password);
+      const user = result.user;
+
+      if (!user.emailVerified) {
+        await auth.signOut();
+        throw new Error("Email not verified");
+      }
+
+      // 🔥 Bind session to this Firebase UID (prevents cross-user leakage)
+      await bindSessionToUID(user.uid);
+
+      // Exchange Firebase token for backend JWT
+      const firebaseToken = await user.getIdToken();
+      const response = await fetch(`${API_URL}/api/auth/refresh`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify({ firebase_id_token: firebaseToken }),
       });
 
       if (!response.ok) {
         const err = await response
           .json()
-          .catch(() => ({ message: "Login failed" }));
-        throw new Error(err.message || "Invalid credentials");
+          .catch(() => ({ message: "Token exchange failed" }));
+        throw new Error(err.message || "Failed to obtain backend token");
       }
 
-      const data = await response.json();
-      await saveTokens(data);
+      const TokenResponse = await response.json();
+
+      // 🔥 Save tokens with UID validation
+      await saveTokens(data, user.uid);
 
       set({
         isAuthenticated: true,
@@ -74,21 +98,55 @@ export const useAuth = create<AuthState>((set, get) => ({
       return true;
     } catch (error: any) {
       set({ isChecking: false });
+
+      // 🔥 Clear tokens on auth failure to prevent stale session
+      if (isAuthError(error) || error.message?.includes("Email not verified")) {
+        await clearAllTokens();
+      }
+
       throw error;
     }
   },
 
-  // ✅ Check Auth
+  // ✅ Check Auth: UID binding + auto-refresh
   checkAuth: async () => {
     set({ isChecking: true });
     stopBackgroundRetry();
 
     const attemptAuth = async () => {
       let token = await getBackendToken();
+      const storedUID = await getStoredUID();
 
+      // 🔥 Validate UID binding first
+      const auth = getAuth();
+      const currentUser = auth.currentUser;
+
+      if (currentUser && storedUID) {
+        const uidValid = await validateUIDBinding(currentUser.uid);
+        if (!uidValid) {
+          console.warn("[AuthStore] UID mismatch detected - clearing session");
+          await clearAllTokens();
+          throw new UIDMismatchError(storedUID, currentUser.uid);
+        }
+      }
+
+      // Auto-refresh if token missing/expired
       if (!token) {
-        const refreshedData = await refreshTokens();
-        await saveTokens(refreshedData);
+        console.log("[AuthStore] Token missing/expired, attempting refresh...");
+
+        // Try to get fresh Firebase token for refresh
+        let firebaseToken: string | undefined;
+        if (currentUser) {
+          try {
+            firebaseToken = await currentUser.getIdToken(true);
+            console.log("[AuthStore] Got fresh Firebase token for refresh");
+          } catch (e) {
+            console.warn("[AuthStore] Could not get Firebase token:", e);
+          }
+        }
+
+        const refreshedData = await refreshTokens(firebaseToken);
+        await saveTokens(refreshedData, refreshedData.user.uid);
         token = refreshedData.backend_jwt;
       }
 
@@ -108,7 +166,8 @@ export const useAuth = create<AuthState>((set, get) => ({
       get().startHeartbeat();
       return true;
     } catch (error: any) {
-      if (error instanceof OfflineError) {
+      // 🔥 Network error: keep cached session, retry in background
+      if (error instanceof OfflineError || isNetworkError(error)) {
         console.warn("[AuthStore] Offline. Keeping cached session.");
         const cachedUser = await getUserData();
         set({
@@ -131,11 +190,10 @@ export const useAuth = create<AuthState>((set, get) => ({
         return true;
       }
 
-      if (
-        error.message === "NO_REFRESH_TOKEN" ||
-        error.message === "NO_VALID_TOKEN"
-      ) {
-        console.log("[AuthStore] No session found. Redirecting to Welcome.");
+      // 🔥 Auth error: clear session, redirect to login
+      if (isAuthError(error) || error instanceof UIDMismatchError) {
+        console.log("[AuthStore] Auth failed. Clearing session.");
+        await clearAllTokens();
         set({
           isAuthenticated: false,
           isChecking: false,
@@ -145,6 +203,7 @@ export const useAuth = create<AuthState>((set, get) => ({
         return false;
       }
 
+      // 🔥 Token expired but refresh failed: mark for re-auth
       console.warn(
         "[AuthStore] Session expired or invalid. Marking for re-auth.",
       );
@@ -158,14 +217,12 @@ export const useAuth = create<AuthState>((set, get) => ({
     }
   },
 
-  // ✅ Start sign out flow (shows password modal)
   requestSignOut: () => {
     console.log(
       "[AuthStore] Sign out requested - awaiting password confirmation",
     );
   },
 
-  // ✅ Execute sign out AFTER password verification - ✅ FIXED
   confirmSignOut: async (
     email: string,
     password: string,
@@ -177,16 +234,12 @@ export const useAuth = create<AuthState>((set, get) => ({
       const API_URL = process.env.EXPO_PUBLIC_API_URL;
       if (!API_URL) throw new Error("API_URL_NOT_SET");
 
-      // ✅ STEP 1: Get the CURRENT valid backend JWT for Authorization header
-      console.log("[AuthStore] Fetching current backend token for sign-out...");
+      // Get current valid backend JWT
       let currentToken = await getBackendToken();
-
-      // If no valid token, try to refresh first
       if (!currentToken) {
-        console.log("[AuthStore] No valid token found, attempting refresh...");
         try {
           const refreshedData = await refreshTokens();
-          await saveTokens(refreshedData);
+          await saveTokens(refreshedData, refreshedData.user.uid);
           currentToken = await getBackendToken();
         } catch (refreshError: any) {
           console.warn(
@@ -201,25 +254,12 @@ export const useAuth = create<AuthState>((set, get) => ({
         throw new Error("Could not obtain valid authentication token");
       }
 
-      console.log("[AuthStore] Token ready for sign-out request");
-
-      // ✅ STEP 2: Get user UID for the request body
       const userData = await getUserData();
       const firebaseUid = userData?.uid || get()?.user?.uid;
-
-      if (!firebaseUid) {
-        console.warn(
-          "[AuthStore] Could not determine firebase_uid, using email only",
-        );
-      }
-
-      // ✅ STEP 3: Call backend sign-out endpoint WITH proper Authorization header
-      console.log("[AuthStore] Calling POST /api/auth/signout...");
 
       const signoutResponse = await fetch(`${API_URL}/api/auth/signout`, {
         method: "POST",
         headers: {
-          // ✅ CRITICAL: Send backend JWT in Authorization header
           Authorization: `Bearer ${currentToken}`,
           "Content-Type": "application/json",
         },
@@ -231,15 +271,6 @@ export const useAuth = create<AuthState>((set, get) => ({
 
       const signoutData = await signoutResponse.json().catch(() => ({}));
 
-      console.log("[AuthStore] Sign-out response:", {
-        status: signoutResponse.status,
-        ok: signoutResponse.ok,
-        success: signoutData.success,
-        message: signoutData.message,
-        code: signoutData.code,
-      });
-
-      // ✅ STEP 4: Handle response
       if (!signoutResponse.ok) {
         if (signoutResponse.status === 401) {
           throw new Error("Invalid credentials. Please check your password.");
@@ -247,12 +278,7 @@ export const useAuth = create<AuthState>((set, get) => ({
         if (signoutResponse.status === 403) {
           throw new Error("Authentication failed. Please sign in again.");
         }
-        if (signoutData.code === "USER_NOT_FOUND") {
-          // User not found is OK - proceed with local cleanup (idempotent sign-out)
-          console.warn(
-            "[AuthStore] User not found in DB, proceeding with local sign-out",
-          );
-        } else {
+        if (signoutData.code !== "USER_NOT_FOUND") {
           throw new Error(
             signoutData.message || "Sign-out failed. Please try again.",
           );
@@ -263,15 +289,9 @@ export const useAuth = create<AuthState>((set, get) => ({
         "[AuthStore] ✅ Backend sign-out verified. Proceeding with local cleanup...",
       );
 
-      // ✅ STEP 5: Clear local database (MANDATORY)
       await clearLocalDb();
-      console.log("[AuthStore] Local database cleared");
-
-      // ✅ STEP 6: Clear all tokens from SecureStore
       await clearAllTokens();
-      console.log("[AuthStore] Secure tokens cleared");
 
-      // ✅ STEP 7: Stop heartbeat and reset state
       get().stopHeartbeat();
       set({
         isAuthenticated: false,
@@ -280,39 +300,48 @@ export const useAuth = create<AuthState>((set, get) => ({
         user: null,
       });
 
-      // ✅ STEP 8: Redirect to login/welcome
       router.replace("/welcome");
-
       console.log("[AuthStore] ✅ Sign out complete - redirected to /welcome");
     } catch (error: any) {
       console.error("[AuthStore] Sign out verification failed:", error.message);
-      // Don't clear anything if verification fails - let user retry
-      throw error; // Let UI show the error
+      throw error;
     }
   },
 
-  // ✅ Cancel pending sign out
   cancelSignOut: () => {
     console.log("[AuthStore] Sign out cancelled");
   },
 
-  // ✅ Heartbeat: Mark expired but DON'T auto-logout
+  // ✅ Heartbeat: Auto-refresh before expiry
   startHeartbeat: () => {
     if (heartbeatInterval) clearInterval(heartbeatInterval);
-    console.log("[AuthStore] Heartbeat started (safe mode).");
+    console.log("[AuthStore] Heartbeat started (auto-refresh mode).");
 
     heartbeatInterval = setInterval(async () => {
       const expiry = await getTokenExpiry();
       const now = Date.now();
       const timeLeft = expiry - now;
 
-      if (timeLeft < 5 * 60 * 1000 && timeLeft > 0) {
+      // 🔥 Pre-emptive refresh 10 minutes before expiry
+      if (timeLeft < 10 * 60 * 1000 && timeLeft > 0) {
         console.log("[AuthStore] Token expiring soon. Silent refresh...");
         try {
-          const refreshedData = await refreshTokens();
-          await saveTokens(refreshedData);
-        } catch (e) {
-          console.warn("[AuthStore] Silent refresh failed.", e);
+          const auth = getAuth();
+          const currentUser = auth.currentUser;
+          let firebaseToken: string | undefined;
+
+          if (currentUser) {
+            firebaseToken = await currentUser
+              .getIdToken(true)
+              .catch(() => undefined);
+          }
+
+          const refreshedData = await refreshTokens(firebaseToken);
+          await saveTokens(refreshedData, refreshedData.user.uid);
+          console.log("[AuthStore] ✅ Silent refresh successful");
+        } catch (e: any) {
+          console.warn("[AuthStore] Silent refresh failed:", e.message);
+          // Don't logout here - let next API call handle it
         }
       } else if (timeLeft <= 0) {
         console.log(

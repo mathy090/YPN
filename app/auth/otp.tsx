@@ -26,6 +26,9 @@ const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
 const FIREBASE_WEB_API_KEY =
   process.env.EXPO_PUBLIC_FIREBASE_WEB_API_KEY || "YOUR_WEB_API_KEY";
 
+// 🔐 Explicit 7-day expiry in seconds
+const TOKEN_EXPIRY_SECONDS = 7 * 24 * 60 * 60; // 604800 seconds
+
 export default function OTP() {
   const router = useRouter();
 
@@ -83,7 +86,7 @@ export default function OTP() {
         throw new Error("INVALID_CREDENTIALS");
       }
 
-      const firebaseIdToken = restData.idToken; // ✅ This is a STRING
+      const firebaseIdToken = restData.idToken;
       const uid = restData.localId;
 
       // 🔥 2. Exchange Firebase ID Token for Backend JWT
@@ -102,7 +105,7 @@ export default function OTP() {
       const backendData = await backendRes.json();
 
       // ✅ EXTRACT & VALIDATE RESPONSE
-      const { backend_jwt, expires_in, user, refresh_token } = backendData;
+      const { backend_jwt, user, refresh_token } = backendData;
 
       if (!backend_jwt || typeof backend_jwt !== "string") {
         console.error(
@@ -111,24 +114,20 @@ export default function OTP() {
         );
         throw new Error("INVALID_BACKEND_RESPONSE");
       }
-      if (typeof expires_in !== "number") {
-        console.error("[otp.tsx] Invalid expires_in from server:", expires_in);
-        throw new Error("INVALID_BACKEND_RESPONSE");
-      }
       if (!user || typeof user !== "object") {
         console.error("[otp.tsx] Invalid user data from server:", user);
         throw new Error("INVALID_BACKEND_RESPONSE");
       }
 
-      // 🔥 3. Store tokens using OBJECT syntax (recommended)
-      console.log("[otp.tsx] Saving tokens...");
+      // 🔥 3. Store tokens with EXPLICIT 7-DAY EXPIRY
+      console.log("[otp.tsx] Saving tokens (7-day expiry)...");
 
       await saveTokens({
         backend_jwt: String(backend_jwt).trim(),
         refresh_token: refresh_token
           ? String(refresh_token).trim()
           : String(firebaseIdToken).trim(), // Fallback to Firebase token
-        expires_in: Number(expires_in),
+        expires_in: TOKEN_EXPIRY_SECONDS, // ✅ Always 7 days (604800s)
         user: user,
       });
 
