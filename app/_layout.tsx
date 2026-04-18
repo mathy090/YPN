@@ -15,7 +15,7 @@ import { getLastRoute } from "../src/utils/cacheAppState";
 import { getUserData } from "../src/utils/tokenManager";
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
-const REFRESH_TOKEN_KEY = "refreshToken"; // 🔑 MUST match your actual key
+const REFRESH_TOKEN_KEY = "app.refresh_token"; // ✅ MUST match your actual key in tokenManager.ts
 
 export default function RootLayout() {
   const router = useRouter();
@@ -37,8 +37,18 @@ export default function RootLayout() {
     // ✅ Only check pathname AFTER navigation is ready
     if (!navState?.key) return;
 
-    // ✅ Normalize pathname check (Expo Router always uses leading slash)
-    if (pathname?.startsWith("/welcome")) return;
+    // ✅ Skip boot check if we're on public/auth routes (prevents loops)
+    const publicRoutes = [
+      "/welcome",
+      "/auth/otp",
+      "/auth/phone",
+      "/auth/login",
+      "/auth/device",
+    ];
+    if (publicRoutes.some((route) => pathname?.startsWith(route))) {
+      didBoot.current = true;
+      return;
+    }
 
     // 🔒 Lock immediately before any async work
     didBoot.current = true;
@@ -46,6 +56,9 @@ export default function RootLayout() {
 
     const boot = async () => {
       try {
+        // 🔥 ADD DELAY: Allow SecureStore writes to commit after login redirects
+        await new Promise((resolve) => setTimeout(resolve, 300));
+
         // 🔐 DIRECT SECURESTORE CHECK (bypasses any caching in getBackendToken)
         console.log(
           "[RootLayout] Checking SecureStore for:",

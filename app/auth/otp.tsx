@@ -20,7 +20,7 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { saveTokens } from "../../src/utils/tokenManager";
+import { saveTokens, UIDMismatchError } from "../../src/utils/tokenManager";
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
 const FIREBASE_WEB_API_KEY =
@@ -59,6 +59,7 @@ export default function OTP() {
       if (!netState.isConnected) throw new Error("NO_INTERNET");
 
       // 🔥 1. Sign in with Firebase REST API
+      console.log("[OTP] Attempting Firebase Login...");
       const restUrl = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_WEB_API_KEY}`;
 
       const restResponse = await fetch(restUrl, {
@@ -87,9 +88,17 @@ export default function OTP() {
       }
 
       const firebaseIdToken = restData.idToken;
-      const uid = restData.localId;
+      const firebaseUid = restData.localId; // ✅ Get Firebase UID immediately
+
+      if (!firebaseUid) {
+        console.error("[OTP] Firebase response missing localId");
+        throw new Error("AUTH_DATA_MISSING");
+      }
+
+      console.log("[OTP] Firebase Login Success. UID:", firebaseUid);
 
       // 🔥 2. Exchange Firebase ID Token for Backend JWT
+      console.log("[OTP] Exchanging for Backend JWT...");
       const backendRes = await fetch(`${API_URL}/api/auth/refresh`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -98,11 +107,19 @@ export default function OTP() {
 
       if (!backendRes.ok) {
         const errData = await backendRes.json().catch(() => ({}));
+        console.error(
+          "[OTP] Backend Refresh Failed:",
+          backendRes.status,
+          errData,
+        );
+
         if (backendRes.status === 403) throw new Error("ACCOUNT_SUSPENDED");
+        if (backendRes.status === 401) throw new Error("BACKEND_AUTH_FAILED");
         throw new Error("BACKEND_AUTH_FAILED");
       }
 
       const backendData = await backendRes.json();
+      console.log("[OTP] Backend Response Received");
 
       // ✅ EXTRACT & VALIDATE RESPONSE
       const { backend_jwt, user, refresh_token } = backendData;
@@ -114,29 +131,51 @@ export default function OTP() {
         );
         throw new Error("INVALID_BACKEND_RESPONSE");
       }
-      if (!user || typeof user !== "object") {
-        console.error("[otp.tsx] Invalid user data from server:", user);
+
+      if (!user || typeof user !== "object" || !user.uid) {
+        console.error(
+          "[otp.tsx] Invalid or missing user data from server:",
+          user,
+        );
         throw new Error("INVALID_BACKEND_RESPONSE");
       }
 
+      // ✅ CRITICAL: Ensure Backend UID matches Firebase UID
+      if (user.uid !== firebaseUid) {
+        console.warn(
+          `[OTP] UID Mismatch Warning! Firebase: ${firebaseUid}, Backend: ${user.uid}. Proceeding with Backend UID.`,
+        );
+      }
+
       // 🔥 3. Store tokens with EXPLICIT 7-DAY EXPIRY
-      console.log("[otp.tsx] Saving tokens (7-day expiry)...");
+      console.log("[otp.tsx] Saving tokens to SecureStore...");
 
-      await saveTokens({
-        backend_jwt: String(backend_jwt).trim(),
-        refresh_token: refresh_token
-          ? String(refresh_token).trim()
-          : String(firebaseIdToken).trim(), // Fallback to Firebase token
-        expires_in: TOKEN_EXPIRY_SECONDS, // ✅ Always 7 days (604800s)
-        user: user,
-      });
-
-      console.log("[otp.tsx] ✅ Tokens saved successfully");
+      try {
+        await saveTokens({
+          backend_jwt: String(backend_jwt).trim(),
+          // Use backend refresh token if available, otherwise fallback to Firebase ID token
+          refresh_token: refresh_token
+            ? String(refresh_token).trim()
+            : String(firebaseIdToken).trim(),
+          expires_in: TOKEN_EXPIRY_SECONDS, // ✅ Always 7 days (604800s)
+          user: user, // ✅ Must contain { uid, email, hasProfile, ... }
+        });
+        console.log("[otp.tsx] ✅ Tokens saved successfully");
+      } catch (saveError: any) {
+        console.error("[otp.tsx] Failed to save tokens:", saveError);
+        if (saveError instanceof UIDMismatchError) {
+          throw new Error("SESSION_CONFLICT");
+        }
+        throw new Error("TOKEN_SAVE_FAILED");
+      }
 
       // 🔥 4. Route based on profile status
+      // ✅ If account already exists (hasProfile is true), skip setup and go to Discord
       if (user.hasProfile) {
+        console.log("[OTP] User has profile. Redirecting to Discord.");
         router.replace("/(tabs)/discord");
       } else {
+        console.log("[OTP] User needs profile. Redirecting to Device Setup.");
         router.replace({
           pathname: "/auth/device",
           params: { userEmail: user.email, userUid: user.uid },
@@ -156,9 +195,11 @@ export default function OTP() {
       } else if (e.message === "ACCOUNT_SUSPENDED") {
         setError("This account has been suspended. Contact support.");
       } else if (e.message === "BACKEND_AUTH_FAILED") {
-        setError("Our side is having a problem, try again later.");
+        setError("Authentication failed. Please try again later.");
       } else if (e.message === "INVALID_BACKEND_RESPONSE") {
         setError("Server returned invalid data. Please contact support.");
+      } else if (e.message === "SESSION_CONFLICT") {
+        setError("Session conflict. Please restart the app.");
       } else if (
         e.message === "TOKEN_SAVE_FAILED" ||
         e.message.includes("SecureStore")

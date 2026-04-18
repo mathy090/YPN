@@ -27,6 +27,7 @@ const {
 } = require("./src/routes/newsRoutes");
 const mediaRoutes = require("./src/routes/mediaRoutes");
 const avatarRoutes = require("./src/routes/avatarRoutes"); // 🔓 Open API
+const updateAvatarRoutes = require("./src/routes/updateAvatarRoutes"); // ✅ NEW ROUTE
 
 const {
   router: signoutRoutes,
@@ -55,6 +56,14 @@ app.use(cors());
 // ✅ REMOVED: express.raw() middleware for /api/avatar
 // The avatar route now handles both raw body and FormData via multer
 app.use(express.json());
+
+// ✅ MIDDLEWARE: Inject DB instance into request object for routes to use
+app.use((req, res, next) => {
+  if (db) {
+    req.app.set("db", db);
+  }
+  next();
+});
 
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -526,6 +535,9 @@ function registerRoutes() {
   // Multer in avatarRoutes.js handles both FormData and raw body
   app.use("/api/avatar", avatarRoutes);
 
+  // ✅ NEW DEDICATED ROUTE: Public, email-based avatar update
+  app.use("/api/users/update-avatar", updateAvatarRoutes);
+
   app.use("/api/videos/drive", driveVideoRoutes);
   app.use("/api/videos", videoRoutes);
   app.use("/api/discord", discordRoutes);
@@ -619,7 +631,7 @@ connectDB().then(() => {
       `🔐 Protected routes: /api/auth/status, /api/users/profile (GET), /api/keys, /api/media`,
     );
     console.log(
-      `🌐 Public routes: /api/auth/login, /api/auth/refresh, /api/auth/check-username, /api/users/profile (POST), /api/avatar`,
+      `🌐 Public routes: /api/auth/login, /api/auth/refresh, /api/auth/check-username, /api/users/profile (POST), /api/avatar, /api/users/update-avatar`,
     );
   });
 });

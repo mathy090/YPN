@@ -75,18 +75,26 @@ export const getStoredUID = async (): Promise<string | null> => {
   return await SecureStore.getItemAsync(KEYS.UID);
 };
 
+// 🔥 REFACTORED: Auto-clears stale tokens on UID mismatch instead of throwing error
 export const saveTokens = async (data: TokenResponse): Promise<void> => {
   const uid = data.user?.uid;
 
   if (uid) {
     const storedUID = await SecureStore.getItemAsync(KEYS.UID);
+
+    // If there is a stored UID and it doesn't match the new one, clear everything first
     if (storedUID && storedUID !== uid) {
-      console.warn("[TokenMgr] Refusing to save tokens for mismatched UID");
-      throw new UIDMismatchError(storedUID, uid);
+      console.warn(
+        `[TokenMgr] UID Mismatch detected! Stored: ${storedUID}, New: ${uid}. Clearing stale session...`,
+      );
+      // Clear old tokens to prevent conflicts or security issues
+      await clearAllTokens();
     }
   }
 
   const expiryTimestamp = parseExpiryTimestamp(data);
+
+  console.log("[TokenMgr] Saving new session for UID:", uid);
 
   await Promise.all([
     SecureStore.setItemAsync(KEYS.BACKEND_JWT, String(data.backend_jwt).trim()),
@@ -100,9 +108,12 @@ export const saveTokens = async (data: TokenResponse): Promise<void> => {
         )
       : Promise.resolve(),
   ]);
+
+  console.log("[TokenMgr] Session saved successfully.");
 };
 
 export const clearAllTokens = async (): Promise<void> => {
+  console.log("[TokenMgr] Clearing all secure store tokens...");
   await Promise.all([
     SecureStore.deleteItemAsync(KEYS.BACKEND_JWT),
     SecureStore.deleteItemAsync(KEYS.REFRESH_TOKEN),
@@ -210,6 +221,7 @@ export const isNetworkError = (error: any): boolean => {
 };
 
 export const isAuthError = (error: any): boolean => {
+  // Note: UIDMismatchError is no longer thrown by saveTokens, but kept for compatibility
   if (error instanceof UIDMismatchError) return true;
   if (error?.message?.startsWith("AUTH_FAILED_")) return true;
   if (error?.message === "NO_REFRESH_TOKEN") return true;

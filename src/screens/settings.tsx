@@ -29,7 +29,6 @@ import {
   getBackendToken,
   OfflineError,
   refreshTokens,
-  saveTokens,
 } from "../utils/tokenManager";
 
 // ✅ HARDCODED THEME COLORS (Spotify-like Dark Theme)
@@ -46,6 +45,7 @@ const COLORS = {
 } as const;
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL || "";
+const MAX_PHOTO_BYTES = 5 * 1024 * 1024;
 
 export default function SettingsScreen() {
   const router = useRouter();
@@ -59,11 +59,15 @@ export default function SettingsScreen() {
   const [modalError, setModalError] = useState("");
   const [isRefreshing, setIsRefreshing] = useState(false);
 
+  // ✅ NEW: Avatar Selection Modal State
+  const [showAvatarModal, setShowAvatarModal] = useState(false);
+
   // Profile State from MongoDB (username, email, avatarUrl)
   const [profile, setProfile] = useState<{
     username: string;
     email: string;
     avatarUrl?: string | null;
+    uid?: string;
   } | null>(null);
 
   const [isLoadingProfile, setIsLoadingProfile] = useState(true);
@@ -72,11 +76,6 @@ export default function SettingsScreen() {
   // Avatar Upload State
   const [isUploadingAvatar, setIsUploadingAvatar] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
-
-  // 🔥 NEW: Avatar URL Input State (for manual URL entry)
-  const [showAvatarUrlModal, setShowAvatarUrlModal] = useState(false);
-  const [avatarUrlInput, setAvatarUrlInput] = useState("");
-  const [isUpdatingAvatarUrl, setIsUpdatingAvatarUrl] = useState(false);
 
   // ✅ Load profile from MongoDB on mount
   useEffect(() => {
@@ -93,6 +92,7 @@ export default function SettingsScreen() {
             username: cached.username,
             email: cached.email,
             avatarUrl: cached.avatarUrl,
+            uid: cached.uid,
           });
         }
 
@@ -129,6 +129,7 @@ export default function SettingsScreen() {
             username: freshProfile.username,
             email: freshProfile.email,
             avatarUrl: freshProfile.avatarUrl,
+            uid: freshProfile.uid,
           });
           setProfileError(null);
         }
@@ -169,7 +170,7 @@ export default function SettingsScreen() {
         },
       });
 
-      if (!response.ok) throw new Error("Failed to refresh profile");
+      if (!response.ok) throw new Error("No internet Connection");
 
       const freshProfile = await response.json();
       await saveProfileToCache({
@@ -184,10 +185,13 @@ export default function SettingsScreen() {
         username: freshProfile.username,
         email: freshProfile.email,
         avatarUrl: freshProfile.avatarUrl,
+        uid: freshProfile.uid,
       });
     } catch (error: any) {
       console.warn("[Settings] Refresh error:", error.message);
-      setProfileError("Failed to refresh. Showing cached data.");
+      setProfileError(
+        "Failed to refresh. Showing last updated profile picture.",
+      );
     } finally {
       setIsRefreshing(false);
     }
@@ -200,7 +204,9 @@ export default function SettingsScreen() {
     if (!token) {
       try {
         const refreshedData = await refreshTokens();
-        await saveTokens(refreshedData);
+        await import("../utils/tokenManager").then(({ saveTokens }) =>
+          saveTokens(refreshedData),
+        );
         token = refreshedData.backend_jwt;
       } catch (refreshError) {
         if (refreshError instanceof OfflineError) {
@@ -214,106 +220,55 @@ export default function SettingsScreen() {
     return token;
   };
 
-  // 🔥 NEW: Handle manual avatar URL update (calls /api/users/profile)
-  const handleUpdateAvatarUrl = async () => {
-    const trimmedUrl = avatarUrlInput.trim();
+  // 🔥 REFACTORED: Same avatar upload logic as device.tsx
+  const uploadAvatarToSupabase = async (
+    localUri: string,
+    mimeType: string,
+    uid: string,
+  ): Promise<string> => {
+    const formData = new FormData();
+    // @ts-ignore - React Native FormData accepts this format
+    formData.append("file", {
+      uri: localUri,
+      type: mimeType,
+      name: `avatar.${mimeType.split("/")[1] || "jpg"}`,
+    });
 
-    // Basic URL validation
-    if (!trimmedUrl || !/^https?:\/\/.+/.test(trimmedUrl)) {
-      Alert.alert(
-        "Invalid URL",
-        "Please enter a valid http/https URL for your avatar.",
-        [{ text: "OK" }],
-      );
-      return;
-    }
+    const uploadUrl = `${API_URL}/api/avatar?uid=${encodeURIComponent(uid)}`;
 
-    setIsUpdatingAvatarUrl(true);
-    setUploadError(null);
-
+    let res: Response;
     try {
-      const token = await getValidToken();
-      if (!token)
-        throw new Error("Authentication required. Please sign in again.");
-
-      console.log("[Settings] Updating avatar URL via profile endpoint...");
-
-      // ✅ Call /api/users/profile to update avatarUrl in MongoDB
-      const response = await fetch(`${API_URL}/api/users/profile`, {
+      res = await fetch(uploadUrl, {
         method: "POST",
+        body: formData,
         headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
+          Accept: "application/json",
         },
-        body: JSON.stringify({ avatarUrl: trimmedUrl }),
       });
-
-      const responseData = await response.json().catch(() => ({}));
-
-      console.log("[Settings] Avatar URL update response:", {
-        status: response.status,
-        ok: response.ok,
-        data: responseData,
-      });
-
-      if (!response.ok) {
-        if (response.status === 401) {
-          throw new Error("Session expired. Please sign in again.");
-        }
-        if (response.status === 409) {
-          throw new Error(responseData.message || "Username/profile conflict");
-        }
-        throw new Error(responseData.message || "Failed to update avatar URL");
-      }
-
-      // ✅ Add cache-busting param to force fresh load
-      const avatarUrlWithCacheBust = `${trimmedUrl}?v=${Date.now()}`;
-
-      // ✅ Update local state IMMEDIATELY for instant preview
-      setProfile((prev) =>
-        prev ? { ...prev, avatarUrl: avatarUrlWithCacheBust } : null,
-      );
-
-      // ✅ Update SQLite cache
-      const currentProfile = profile || (await getCachedProfile());
-      await saveProfileToCache({
-        uid: responseData.user?.uid || currentProfile?.uid,
-        username: currentProfile?.username || "",
-        email: currentProfile?.email || "",
-        avatarUrl: avatarUrlWithCacheBust,
-        hasProfile: currentProfile?.hasProfile,
-      } as UserProfileCache);
-
-      console.log(
-        "[Settings] ✅ Avatar URL updated in MongoDB and cached:",
-        avatarUrlWithCacheBust,
-      );
-
-      // Close modal and reset input
-      setShowAvatarUrlModal(false);
-      setAvatarUrlInput("");
-
-      Alert.alert("Success", "Avatar updated successfully!", [{ text: "OK" }]);
-    } catch (error: any) {
-      console.error("[Settings] Avatar URL update error:", {
-        message: error.message,
-        name: error.name,
-      });
-      setUploadError("Failed to update avatar URL. Please try again.");
-
-      Alert.alert(
-        "Update Failed",
-        error.message.includes("sign in")
-          ? "Your session expired. Please sign in again to continue."
-          : error.message,
-        [{ text: "OK" }],
-      );
-    } finally {
-      setIsUpdatingAvatarUrl(false);
+    } catch (e: any) {
+      throw new Error("network");
     }
+
+    if (!res.ok) {
+      const errorText = await res.text().catch(() => "unknown");
+      console.error(
+        "[Settings] Avatar upload server error:",
+        res.status,
+        errorText,
+      );
+      throw new Error("server");
+    }
+
+    const body = await res.json().catch(() => ({}));
+    if (!body.avatarUrl) {
+      console.error("[Settings] No avatarUrl in response:", body);
+      throw new Error("server");
+    }
+
+    return body.avatarUrl;
   };
 
-  // ✅ Handle avatar selection and instant upload (image file → /api/avatar)
+  // 🔥 REFACTORED: Handle avatar selection, upload, and profile update
   const handlePickAndUploadAvatar = async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== "granted") {
@@ -338,122 +293,119 @@ export default function SettingsScreen() {
     setUploadError(null);
 
     try {
-      const token = await getValidToken();
-      if (!token)
-        throw new Error("Authentication required. Please sign in again.");
+      // Get user info from profile or cache
+      const currentUser = profile || (await getCachedProfile());
+      if (!currentUser?.uid || !currentUser?.email) {
+        throw new Error("AUTH_REQUIRED");
+      }
 
       const imageUri = result.assets[0].uri;
       const mimeType = result.assets[0].mimeType || "image/jpeg";
 
+      // Validate file size
       const response = await fetch(imageUri);
       const blob = await response.blob();
+      if (blob.size > MAX_PHOTO_BYTES) {
+        throw new Error("FILE_TOO_LARGE");
+      }
 
-      console.log("[Settings] Uploading avatar to backend...");
+      console.log("[Settings] Uploading avatar to Supabase via backend...");
 
-      // ✅ Upload to /api/avatar (public endpoint, returns hosted URL)
-      const uploadResponse = await fetch(`${API_URL}/api/avatar`, {
+      // ✅ STEP 1: Upload image to Supabase via /api/avatar endpoint (same as device.tsx)
+      const supabaseUrl = await uploadAvatarToSupabase(
+        imageUri,
+        mimeType,
+        currentUser.uid,
+      );
+
+      console.log("[Settings] Avatar uploaded to Supabase:", supabaseUrl);
+
+      // ✅ STEP 2: Update MongoDB profile with new avatar URL via /api/users/profile (same as device.tsx)
+      console.log("[Settings] Updating MongoDB profile with new avatar URL...");
+
+      const updateResponse = await fetch(`${API_URL}/api/users/profile`, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": mimeType,
+          "Content-Type": "application/json",
         },
-        body: blob,
+        body: JSON.stringify({
+          // ✅ Send same payload structure as device.tsx
+          uid: currentUser.uid,
+          email: currentUser.email,
+          avatarUrl: supabaseUrl, // ✅ New Supabase URL
+        }),
       });
 
-      const uploadData = await uploadResponse.json().catch(() => ({}));
+      const updateData = await updateResponse.json().catch(() => ({}));
 
-      console.log("[Settings] Avatar upload response:", {
-        status: uploadResponse.status,
-        ok: uploadResponse.ok,
-        avatarUrl: uploadData.avatarUrl,
-        uid: uploadData.uid,
-        error: uploadData.message,
-        code: uploadData.code,
-      });
-
-      if (!uploadResponse.ok) {
-        if (uploadResponse.status === 401) {
-          throw new Error("Session expired. Please sign in again.");
-        }
-        if (uploadResponse.status === 429) {
-          throw new Error("Too many uploads. Please wait a few minutes.");
-        }
-        throw new Error(uploadData.message || "Failed to upload avatar");
+      if (!updateResponse.ok) {
+        console.error(
+          "[Settings] Profile update failed:",
+          updateResponse.status,
+          updateData,
+        );
+        throw new Error("UPDATE_FAILED");
       }
 
-      const { avatarUrl, uid } = uploadData;
+      // ✅ STEP 3: Add cache-busting param to force fresh load everywhere
+      const avatarUrlWithCacheBust = `${supabaseUrl}?v=${Date.now()}`;
 
-      if (!avatarUrl) {
-        throw new Error("Backend did not return avatar URL");
-      }
-
-      // ✅ Add cache-busting param
-      const avatarUrlWithCacheBust = `${avatarUrl}?v=${Date.now()}`;
-
-      // ✅ Update local state IMMEDIATELY
+      // ✅ STEP 4: Update local state IMMEDIATELY for instant preview
       setProfile((prev) =>
         prev ? { ...prev, avatarUrl: avatarUrlWithCacheBust } : null,
       );
 
-      // ✅ Update SQLite cache
-      const currentProfile = profile || (await getCachedProfile());
+      // ✅ STEP 5: Update SQLite/SecureStore cache
       await saveProfileToCache({
-        uid: uid || currentProfile?.uid,
-        username: currentProfile?.username || "",
-        email: currentProfile?.email || "",
+        uid: currentUser.uid,
+        username: currentUser.username || "",
+        email: currentUser.email,
         avatarUrl: avatarUrlWithCacheBust,
-        hasProfile: currentProfile?.hasProfile,
+        hasProfile: currentUser.hasProfile,
       } as UserProfileCache);
 
       console.log(
-        "[Settings] ✅ Avatar uploaded, cached, and preview updated:",
+        "[Settings] ✅ Avatar updated: Supabase + MongoDB + Cache + UI",
         avatarUrlWithCacheBust,
       );
+
+      // Close modal after success
+      setShowAvatarModal(false);
+      Alert.alert("Success", "Profile picture updated!", [{ text: "OK" }]);
     } catch (error: any) {
-      console.error("[Settings] Avatar upload error:", {
+      console.error("[Settings] Avatar update error:", {
         message: error.message,
         name: error.name,
       });
-      setUploadError("Failed to upload photo. Please try again.");
 
-      Alert.alert(
-        "Upload Failed",
-        error.message.includes("sign in")
-          ? "Your session expired. Please sign in again to continue."
-          : error.message.includes("Too many")
-            ? "Too many uploads. Please wait a few minutes."
-            : "Could not upload your photo. Please try again.",
-        [{ text: "OK" }],
-      );
+      // ✅ GENERIC USER-FRIENDLY ERRORS ONLY (no technical details)
+      const isNetwork =
+        error.message === "network" ||
+        error.message?.includes("fetch") ||
+        error.message?.includes("Failed to fetch") ||
+        error.message?.includes("timeout");
+
+      const isFileTooLarge = error.message === "FILE_TOO_LARGE";
+      const isAuthRequired = error.message === "AUTH_REQUIRED";
+
+      if (isNetwork) {
+        setUploadError("Poor internet connection. Try again later.");
+      } else if (isFileTooLarge) {
+        setUploadError("Photo must be under 5 MB.");
+      } else if (isAuthRequired) {
+        setUploadError("Please sign in again to continue.");
+      } else {
+        // Generic catch-all for any other server/API errors
+        setUploadError("Something went wrong. Please try again.");
+      }
     } finally {
       setIsUploadingAvatar(false);
     }
   };
 
-  // ✅ Handle "Change Avatar" - opens option modal
+  // ✅ Handle "Change Avatar" - opens custom Spotify-style modal
   const handleChangeAvatar = () => {
-    Alert.alert(
-      "Change Avatar",
-      "Choose how you want to update your profile picture:",
-      [
-        {
-          text: "📁 Upload from Gallery",
-          onPress: () => {
-            Alert.dismiss();
-            handlePickAndUploadAvatar();
-          },
-        },
-        {
-          text: "🔗 Enter URL",
-          onPress: () => {
-            Alert.dismiss();
-            setAvatarUrlInput(profile?.avatarUrl || "");
-            setShowAvatarUrlModal(true);
-          },
-        },
-        { text: "Cancel", style: "cancel" },
-      ],
-    );
+    setShowAvatarModal(true);
   };
 
   // ✅ Handle "Sign Out" button tap
@@ -594,12 +546,12 @@ export default function SettingsScreen() {
           {/* Avatar: from MongoDB avatarUrl, or placeholder if null */}
           <View style={styles.avatarSection}>
             <View style={styles.avatarContainer}>
-              {isUploadingAvatar || isUpdatingAvatarUrl ? (
+              {isUploadingAvatar ? (
                 <View style={[styles.avatar, styles.avatarPlaceholder]}>
                   <ActivityIndicator color={COLORS.primary} size="large" />
                 </View>
               ) : profile?.avatarUrl ? (
-                // ✅ Show avatar from MongoDB with error handling
+                // ✅ Show avatar from MongoDB with error handling + cache-bust
                 <Image
                   key={profile.avatarUrl} // ✅ Forces fresh load when URL changes
                   source={{ uri: profile.avatarUrl }}
@@ -628,24 +580,20 @@ export default function SettingsScreen() {
               <TouchableOpacity
                 style={styles.changeAvatarButton}
                 onPress={handleChangeAvatar}
-                disabled={isUploadingAvatar || isUpdatingAvatarUrl}
+                disabled={isUploadingAvatar}
                 activeOpacity={0.7}
               >
                 <Ionicons
-                  name={
-                    isUploadingAvatar || isUpdatingAvatarUrl
-                      ? "hourglass"
-                      : "camera"
-                  }
+                  name={isUploadingAvatar ? "hourglass" : "camera"}
                   size={18}
                   color="#000"
                 />
               </TouchableOpacity>
             </View>
 
-            {(isUploadingAvatar || isUpdatingAvatarUrl) && (
+            {isUploadingAvatar && (
               <Text style={[styles.uploadStatus, { color: COLORS.primary }]}>
-                Updating...
+                Uploading...
               </Text>
             )}
             {uploadError && (
@@ -771,21 +719,21 @@ export default function SettingsScreen() {
         </View>
       </ScrollView>
 
-      {/* 🔥 NEW: Avatar URL Input Modal */}
+      {/* ✅ CUSTOM SPOTIFY-STYLE MODAL: Avatar Selection */}
       <Modal
-        visible={showAvatarUrlModal}
+        visible={showAvatarModal}
         transparent
-        animationType="slide"
-        onRequestClose={() => setShowAvatarUrlModal(false)}
+        animationType="fade"
+        onRequestClose={() => setShowAvatarModal(false)}
       >
         <View style={styles.modalOverlay}>
           <View style={[styles.modalContent, { backgroundColor: COLORS.card }]}>
             <View style={styles.modalHeader}>
               <Text style={[styles.modalTitle, { color: COLORS.text }]}>
-                Set Avatar URL
+                Change Profile Picture
               </Text>
               <TouchableOpacity
-                onPress={() => setShowAvatarUrlModal(false)}
+                onPress={() => setShowAvatarModal(false)}
                 hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
               >
                 <Ionicons name="close" size={24} color={COLORS.textSecondary} />
@@ -795,118 +743,55 @@ export default function SettingsScreen() {
             <Text
               style={[styles.modalSubtitle, { color: COLORS.textSecondary }]}
             >
-              Enter a direct image URL (PNG, JPG, WebP) to use as your profile
-              picture.
+              Choose a photo from your gallery to update your profile picture.
             </Text>
 
-            <View style={styles.inputGroup}>
-              <Text
-                style={[styles.inputLabel, { color: COLORS.textSecondary }]}
-              >
-                IMAGE URL
-              </Text>
-              <View
-                style={[
-                  styles.inputRow,
-                  {
-                    borderColor: avatarUrlInput
-                      ? COLORS.primary
-                      : COLORS.border,
-                  },
-                ]}
-              >
-                <Ionicons
-                  name="link-outline"
-                  size={18}
-                  color={avatarUrlInput ? COLORS.primary : COLORS.textSecondary}
-                />
-                <TextInput
-                  value={avatarUrlInput}
-                  onChangeText={setAvatarUrlInput}
-                  placeholder="https://example.com/avatar.png"
-                  placeholderTextColor={COLORS.textSecondary}
-                  style={[styles.input, { color: COLORS.text }]}
-                  keyboardType="url"
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  editable={!isUpdatingAvatarUrl}
-                  onSubmitEditing={handleUpdateAvatarUrl}
-                  returnKeyType="done"
-                />
+            {/* Spotify-style option button */}
+            <TouchableOpacity
+              style={styles.modalOptionButton}
+              onPress={() => {
+                setShowAvatarModal(false);
+                handlePickAndUploadAvatar();
+              }}
+              activeOpacity={0.7}
+            >
+              <View style={styles.modalOptionIcon}>
+                <Ionicons name="images" size={24} color={COLORS.primary} />
               </View>
-              <Text style={[styles.inputHint, { color: COLORS.textSecondary }]}>
-                Must start with https:// and point to a valid image file.
-              </Text>
-            </View>
-
-            {/* Preview Section */}
-            {avatarUrlInput ? (
-              <View style={styles.previewSection}>
-                <Text
-                  style={[styles.previewLabel, { color: COLORS.textSecondary }]}
-                >
-                  Preview:
+              <View style={styles.modalOptionText}>
+                <Text style={[styles.modalOptionTitle, { color: COLORS.text }]}>
+                  📁 Choose from Gallery
                 </Text>
-                <View style={styles.previewContainer}>
-                  <Image
-                    source={{ uri: avatarUrlInput }}
-                    style={styles.previewImage}
-                    resizeMode="cover"
-                    onError={() => {
-                      console.warn(
-                        "[Settings] Preview load failed for:",
-                        avatarUrlInput,
-                      );
-                    }}
-                  />
-                </View>
-              </View>
-            ) : null}
-
-            {uploadError ? (
-              <Text style={[styles.modalError, { color: COLORS.error }]}>
-                {uploadError}
-              </Text>
-            ) : null}
-
-            <View style={styles.modalButtons}>
-              <TouchableOpacity
-                style={[styles.modalButton, styles.cancelButton]}
-                onPress={() => {
-                  setShowAvatarUrlModal(false);
-                  setAvatarUrlInput("");
-                  setUploadError(null);
-                }}
-                disabled={isUpdatingAvatarUrl}
-              >
                 <Text
                   style={[
-                    styles.modalButtonText,
+                    styles.modalOptionDesc,
                     { color: COLORS.textSecondary },
                   ]}
                 >
-                  Cancel
+                  Select a photo from your device
                 </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
+              </View>
+              <Ionicons
+                name="chevron-forward"
+                size={20}
+                color={COLORS.textSecondary}
+              />
+            </TouchableOpacity>
+
+            {/* Cancel button */}
+            <TouchableOpacity
+              style={[styles.modalButton, styles.modalCancelButton]}
+              onPress={() => setShowAvatarModal(false)}
+            >
+              <Text
                 style={[
-                  styles.modalButton,
-                  styles.confirmButton,
-                  (!avatarUrlInput || isUpdatingAvatarUrl) &&
-                    styles.confirmButtonDisabled,
+                  styles.modalButtonText,
+                  { color: COLORS.textSecondary },
                 ]}
-                onPress={handleUpdateAvatarUrl}
-                disabled={!avatarUrlInput || isUpdatingAvatarUrl}
               >
-                {isUpdatingAvatarUrl ? (
-                  <ActivityIndicator color="#000" size="small" />
-                ) : (
-                  <Text style={[styles.modalButtonText, { color: "#000" }]}>
-                    Save Avatar
-                  </Text>
-                )}
-              </TouchableOpacity>
-            </View>
+                Cancel
+              </Text>
+            </TouchableOpacity>
           </View>
         </View>
       </Modal>
@@ -1227,28 +1112,34 @@ const styles = StyleSheet.create({
     marginLeft: 4,
   },
 
-  // Preview Section for Avatar URL
-  previewSection: {
-    marginBottom: 16,
-    padding: 12,
+  // ✅ Spotify-style Avatar Modal Styles
+  modalOptionButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    padding: 16,
     borderRadius: 12,
     backgroundColor: "rgba(255,255,255,0.05)",
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: COLORS.border,
   },
-  previewLabel: {
-    fontSize: 12,
-    marginBottom: 8,
+  modalOptionIcon: {
+    width: 48,
+    height: 48,
+    borderRadius: 12,
+    backgroundColor: "rgba(29, 185, 84, 0.1)",
+    justifyContent: "center",
+    alignItems: "center",
+    marginRight: 16,
+  },
+  modalOptionText: { flex: 1 },
+  modalOptionTitle: {
+    fontSize: 16,
     fontWeight: "600",
+    marginBottom: 2,
   },
-  previewContainer: {
-    width: 80,
-    height: 80,
-    borderRadius: 40,
-    overflow: "hidden",
-    backgroundColor: "rgba(0,0,0,0.2)",
-  },
-  previewImage: {
-    width: "100%",
-    height: "100%",
+  modalOptionDesc: {
+    fontSize: 13,
   },
 
   modalError: { fontSize: 12, marginBottom: 16, textAlign: "center" },
@@ -1264,7 +1155,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     marginHorizontal: 4,
   },
-  cancelButton: { backgroundColor: "rgba(255,255,255,0.1)" },
+  modalCancelButton: { backgroundColor: "rgba(255,255,255,0.1)" },
   confirmButton: { backgroundColor: COLORS.primary },
   confirmButtonDisabled: { backgroundColor: COLORS.border, opacity: 0.6 },
   modalButtonText: { fontWeight: "600", fontSize: 14 },

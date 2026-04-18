@@ -527,7 +527,7 @@ export default function Device() {
           showToast("server", "Username taken. Try another.");
         } else if (body.code === "USERNAME_LOCKED") {
           showToast("server", "Account already set up. Redirecting…");
-          setTimeout(() => router.replace("/tabs/discord"), 1800);
+          setTimeout(() => router.replace("/(tabs)/discord"), 1800);
         } else if (res.status >= 500) {
           showToast("server", "Server error. Please try again.");
         } else {
@@ -544,7 +544,7 @@ export default function Device() {
       return;
     }
 
-    setTimeout(() => router.replace("/tabs/discord"), 2000);
+    setTimeout(() => router.replace("/(tabs)/discord"), 2000);
   }, [
     canSubmit,
     username,
