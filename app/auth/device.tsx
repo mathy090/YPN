@@ -22,7 +22,6 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { authHeaders } from "../../src/utils/tokenManager";
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
 const TOAST_DURATION = 4000;
@@ -41,10 +40,7 @@ type UsernameStatus =
   | "invalid"
   | "error";
 
-// "none"   → no photo selected
-// "picked" → photo chosen locally, will upload on submit
 type PhotoState = "none" | "picked";
-
 type StepStatus = "idle" | "loading" | "done" | "error";
 type ToastType = "network" | "server" | null;
 type Step = { key: string; label: string; status: StepStatus };
@@ -319,7 +315,6 @@ export default function Device() {
   const [usernameStatus, setUsernameStatus] = useState<UsernameStatus>("idle");
   const [usernameMsg, setUsernameMsg] = useState("");
 
-  // Photo: stored locally only until submit
   const [photoState, setPhotoState] = useState<PhotoState>("none");
   const [avatarLocalUri, setAvatarLocalUri] = useState<string | null>(null);
   const [avatarMime, setAvatarMime] = useState<string>("image/jpeg");
@@ -339,7 +334,6 @@ export default function Device() {
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Username available + not mid-submit
   const usernameReady = usernameStatus === "available";
   const canSubmit = usernameReady && !showProgress;
 
@@ -350,7 +344,6 @@ export default function Device() {
     };
   }, []);
 
-  // ── Toast helper ─────────────────────────────────────────────────────────
   const showToast = useCallback((type: ToastType, message: string) => {
     if (toastTimer.current) clearTimeout(toastTimer.current);
     setToast({ type, message });
@@ -361,7 +354,6 @@ export default function Device() {
     );
   }, []);
 
-  // ── Step helper ───────────────────────────────────────────────────────────
   const setStep = useCallback(
     (key: string, status: StepStatus, label?: string) => {
       setSteps((prev) =>
@@ -373,7 +365,6 @@ export default function Device() {
     [],
   );
 
-  // ── Pick photo — local preview only, no upload ────────────────────────────
   const handlePickAvatar = useCallback(async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== "granted") {
@@ -397,13 +388,11 @@ export default function Device() {
       return;
     }
 
-    // Store locally — upload happens in handleSubmit
     setAvatarLocalUri(asset.uri);
     setAvatarMime(asset.mimeType ?? guessMime(asset.uri));
     setPhotoState("picked");
   }, [showToast]);
 
-  // ── Username availability check ───────────────────────────────────────────
   const onUsernameChange = useCallback((raw: string) => {
     const cleaned = raw.toLowerCase().replace(/[^a-z0-9_]/g, "");
     setUsername(cleaned);
@@ -426,7 +415,6 @@ export default function Device() {
       return;
     }
 
-    // Cache hit
     if (usernameCache.has(cleaned)) {
       const available = usernameCache.get(cleaned)!;
       setUsernameStatus(available ? "available" : "taken");
@@ -466,26 +454,24 @@ export default function Device() {
     }, 600);
   }, []);
 
-  // ── Submit: upload photo then save profile ────────────────────────────────
   const handleSubmit = useCallback(async () => {
     if (!canSubmit) return;
 
     const authUser = getAuth().currentUser;
     const userEmail = authUser?.email || (params.userEmail as string);
+    const userUid = authUser?.uid || (params.userUid as string);
 
-    if (!userEmail) {
+    if (!userEmail || !userUid) {
       showToast("server", "Session expired. Please sign in again.");
       return;
     }
 
-    // Reset steps for this attempt
     setSteps([
       { key: "photo", label: "Uploading photo...", status: "idle" },
       { key: "save", label: "Saving account...", status: "idle" },
     ]);
     setShowProgress(true);
 
-    // ── Step 1: Upload photo (only now, on submit) ──────────────────────────
     let finalAvatarUrl: string | null = null;
 
     if (photoState === "none") {
@@ -496,6 +482,7 @@ export default function Device() {
         finalAvatarUrl = await uploadAvatarToSupabase(
           avatarLocalUri!,
           avatarMime,
+          userUid,
         );
         setStep("photo", "done", "Uploaded ✓");
       } catch (err: any) {
@@ -512,21 +499,19 @@ export default function Device() {
       }
     }
 
-    // ── Step 2: Save profile (backend atomic lock) ──────────────────────────
     setStep("save", "loading");
     try {
-      const headers = await authHeaders();
       const payload: Record<string, string> = {
+        uid: userUid,
         username: username.trim().toLowerCase(),
         name: username.trim(),
         email: userEmail,
       };
-      // Store the full Supabase public URL as avatarFileId
       if (finalAvatarUrl) payload.avatarFileId = finalAvatarUrl;
 
       const res = await fetch(`${API_URL}/api/users/profile`, {
         method: "POST",
-        headers: { ...headers, "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
       const body = await res.json().catch(() => ({}));
@@ -571,7 +556,6 @@ export default function Device() {
     params,
   ]);
 
-  // ── Derived UI values ─────────────────────────────────────────────────────
   const uColor: Record<UsernameStatus, string> = {
     idle: "#555",
     typing: "#555",
@@ -630,7 +614,6 @@ export default function Device() {
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator={false}
           >
-            {/* ── Avatar picker ─────────────────────────────────────────── */}
             <TouchableOpacity
               style={s.avatarWrap}
               onPress={handlePickAvatar}
@@ -661,7 +644,6 @@ export default function Device() {
             <Text style={s.title}>Choose your username</Text>
             <Text style={s.sub}>Enter a unique name to get started.</Text>
 
-            {/* ── Username input ────────────────────────────────────────── */}
             <View style={s.card}>
               <View style={s.cardEdge} />
               <Text style={s.label}>USERNAME</Text>
@@ -698,7 +680,6 @@ export default function Device() {
               </Text>
             </View>
 
-            {/* ── Submit ───────────────────────────────────────────────── */}
             <TouchableOpacity
               onPress={handleSubmit}
               disabled={!canSubmit}
@@ -715,10 +696,7 @@ export default function Device() {
         </KeyboardAvoidingView>
       </SafeAreaView>
 
-      {/* Progress overlay */}
       {showProgress && <ProgressScreen steps={steps} />}
-
-      {/* Toast */}
       <Toast type={toast.type} message={toast.message} visible={toastVisible} />
     </View>
   );
@@ -729,51 +707,74 @@ export default function Device() {
 async function uploadAvatarToSupabase(
   localUri: string,
   mimeType: string,
+  uid: string,
 ): Promise<string> {
-  const allowed = ["image/jpeg", "image/png", "image/webp"];
-  const safeMime = allowed.includes(mimeType) ? mimeType : "image/jpeg";
-
-  let blob: Blob;
-  try {
-    const r = await fetch(localUri);
-    blob = await r.blob();
-  } catch {
-    throw new Error("network");
-  }
-
-  if (blob.size > MAX_PHOTO_BYTES) throw new Error("size");
-
+  console.log("[uploadAvatar] Starting upload:", { 
+    localUri: localUri.slice(0, 50) + "...", 
+    mimeType, 
+    uid 
+  });
+  
   const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
-  let headers: Record<string, string>;
-  try {
-    const { authHeaders } = await import("../../src/utils/tokenManager");
-    headers = await authHeaders();
-  } catch {
-    throw new Error("network");
+  console.log("[uploadAvatar] API_URL:", API_URL);
+  
+  if (!API_URL) {
+    console.error("[uploadAvatar] EXPO_PUBLIC_API_URL is not set");
+    throw new Error("Configuration error: API_URL not set");
   }
+
+  // ✅ FIXED: Use FormData for React Native compatibility
+  const formData = new FormData();
+  
+  // @ts-ignore - React Native FormData accepts this format
+  formData.append("file", {
+    uri: localUri,
+    type: mimeType,
+    name: `avatar.${mimeType.split("/")[1] || "jpg"}`,
+  });
+
+  // ✅ Send uid via query string (no auth headers needed - public endpoint)
+  const uploadUrl = `${API_URL}/api/avatar?uid=${encodeURIComponent(uid)}`;
+  console.log("[uploadAvatar] Uploading to:", uploadUrl);
 
   let res: Response;
   try {
-    res = await fetch(`${API_URL}/api/avatar`, {
+    res = await fetch(uploadUrl, {
       method: "POST",
+      body: formData,
+      // ✅ DO NOT set Content-Type header - let fetch set it with boundary
       headers: {
-        ...headers,
-        "Content-Type": safeMime,
-        "Content-Length": String(blob.size),
+        "Accept": "application/json",
       },
-      body: blob,
     });
-  } catch {
+    
+    console.log("[uploadAvatar] Response status:", res.status);
+  } catch (e: any) {
+    console.error("[uploadAvatar] Fetch failed:", {
+      message: e?.message,
+      name: e?.name,
+      type: e?.type,
+    });
     throw new Error("network");
   }
 
-  if (!res.ok) throw new Error("server");
+  if (!res.ok) {
+    const errorText = await res.text().catch(() => "unknown");
+    console.error("[uploadAvatar] Server error:", res.status, errorText);
+    throw new Error("server");
+  }
 
-  const body = await res.json().catch(() => ({}));
+  const body = await res.json().catch((e) => {
+    console.error("[uploadAvatar] Failed to parse JSON:", e);
+    return {};
+  });
 
-  // Supabase returns avatarUrl directly as a full public CDN URL
-  if (!body.avatarUrl) throw new Error("server");
+  if (!body.avatarUrl) {
+    console.error("[uploadAvatar] No avatarUrl in response:", body);
+    throw new Error("server");
+  }
 
+  console.log("[uploadAvatar] Success:", body.avatarUrl);
   return body.avatarUrl;
 }
 

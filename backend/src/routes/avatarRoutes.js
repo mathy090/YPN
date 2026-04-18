@@ -3,8 +3,25 @@
 
 const express = require("express");
 const { createClient } = require("@supabase/supabase-js");
+const multer = require("multer"); // ✅ Add multer for FormData handling
 
 const router = express.Router();
+
+// Configure multer to store files in memory
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB
+  },
+  fileFilter: (req, file, cb) => {
+    const allowed = ["image/jpeg", "image/png", "image/webp"];
+    if (allowed.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error("INVALID_TYPE"), false);
+    }
+  },
+});
 
 const MAX_BYTES = 5 * 1024 * 1024;
 const ALLOWED_MIME = ["image/jpeg", "image/png", "image/webp"];
@@ -21,7 +38,6 @@ function getSupabase() {
   if (!url) throw new Error("SUPABASE_URL env var not set");
   if (!key) throw new Error("SUPABASE_SERVICE_ROLE_KEY env var not set");
 
-  console.log(`[Supabase] Initializing with URL: ${url}`);
   _supabase = createClient(url, key, {
     auth: { persistSession: false },
   });
@@ -35,7 +51,10 @@ function getUid(req) {
 }
 
 // ── POST /api/avatar ───────────────────────────────────────────────────────────
-router.post("/", async (req, res) => {
+// Accepts both:
+// 1. Raw body: Content-Type: image/jpeg
+// 2. FormData: Content-Type: multipart/form-data
+router.post("/", upload.single("file"), async (req, res) => {
   try {
     const uid = getUid(req);
 
@@ -46,9 +65,26 @@ router.post("/", async (req, res) => {
       });
     }
 
-    const mimeType = (req.headers["content-type"] ?? "").split(";")[0].trim();
-    const contentLength = parseInt(req.headers["content-length"] ?? "0", 10);
+    // ✅ Support both raw body and FormData
+    let buffer, mimeType;
 
+    if (req.file) {
+      // FormData upload
+      console.log("[Avatar] FormData upload detected");
+      buffer = req.file.buffer;
+      mimeType = req.file.mimetype;
+    } else {
+      // Raw body upload
+      console.log("[Avatar] Raw body upload detected");
+      const chunks = [];
+      for await (const chunk of req) {
+        chunks.push(chunk);
+      }
+      buffer = Buffer.concat(chunks);
+      mimeType = (req.headers["content-type"] ?? "").split(";")[0].trim();
+    }
+
+    // Validate MIME type
     if (!ALLOWED_MIME.includes(mimeType)) {
       return res.status(400).json({
         code: "INVALID_TYPE",
@@ -56,20 +92,7 @@ router.post("/", async (req, res) => {
       });
     }
 
-    if (contentLength > MAX_BYTES) {
-      return res.status(400).json({
-        code: "FILE_TOO_LARGE",
-        message: "Photo must be under 5 MB.",
-      });
-    }
-
-    // Read raw body into Buffer
-    const chunks = [];
-    for await (const chunk of req) {
-      chunks.push(chunk);
-    }
-    const buffer = Buffer.concat(chunks);
-
+    // Validate size
     if (buffer.length > MAX_BYTES) {
       return res.status(400).json({
         code: "FILE_TOO_LARGE",
@@ -77,17 +100,17 @@ router.post("/", async (req, res) => {
       });
     }
 
+    console.log(
+      `[Avatar] Upload params: uid=${uid}, size=${buffer.length}, mime=${mimeType}`,
+    );
+
     const ext = mimeType.split("/")[1] ?? "jpg";
     const safeUid = uid.trim().replace(/[^a-zA-Z0-9_-]/g, "");
     const filePath = `${safeUid}/avatar.${ext}`;
 
-    console.log(
-      `[Avatar] Upload attempt: uid=${safeUid}, path=${filePath}, mime=${mimeType}, size=${buffer.length}`,
-    );
-
     const supabase = getSupabase();
 
-    // ── Upload to Supabase Storage ───────────────────────────────────────────
+    // Upload to Supabase Storage
     const { uploadData, error: uploadError } = await supabase.storage
       .from("avatars")
       .upload(filePath, buffer, {
@@ -97,7 +120,7 @@ router.post("/", async (req, res) => {
       });
 
     if (uploadError) {
-      console.error("[Avatar] Upload failed:", uploadError);
+      console.error("[Avatar] Supabase upload error:", uploadError);
       return res.status(500).json({
         code: "UPLOAD_FAILED",
         message: uploadError.message || "Supabase upload failed",
@@ -106,7 +129,7 @@ router.post("/", async (req, res) => {
 
     console.log(`[Avatar] Upload successful:`, uploadData);
 
-    // ── Get public URL - FIXED: getPublicUrl returns { publicUrl } directly ─
+    // Get public URL
     const { publicUrl } = supabase.storage
       .from("avatars")
       .getPublicUrl(filePath);
@@ -123,6 +146,14 @@ router.post("/", async (req, res) => {
     res.status(201).json({ avatarUrl: publicUrl });
   } catch (err) {
     console.error("[Avatar] Unexpected error:", err);
+
+    if (err.message === "INVALID_TYPE" || err.code === "LIMIT_FILE_SIZE") {
+      return res.status(400).json({
+        code: "INVALID_TYPE",
+        message: "Only JPEG, PNG or WebP photos are allowed.",
+      });
+    }
+
     res.status(500).json({
       code: "SERVER_ERROR",
       message: "Sorry, this is on our side. Please try again later.",
