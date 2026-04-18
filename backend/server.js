@@ -312,6 +312,7 @@ function registerRoutes() {
       }
 
       // 2. Prepare Data
+      // Note: email is included here in $set, so we MUST NOT include it in $setOnInsert
       const updatePayload = {
         email,
         updatedAt: new Date(),
@@ -338,7 +339,8 @@ function registerRoutes() {
               username: cleanUsername,
               createdAt: new Date(), // Set creation date if new
             },
-            $setOnInsert: { uid, email }, // Ensure uid/email are set on insert
+            // ✅ FIXED: Removed 'email' from here to avoid conflict with $set
+            $setOnInsert: { uid },
           },
           {
             returnDocument: "after",
