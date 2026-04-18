@@ -52,11 +52,8 @@ const app = express();
 app.set("trust proxy", 1);
 app.use(cors());
 
-// 🔥 RAW body parser for avatar uploads - MUST come before express.json()
-app.use(
-  "/api/avatar",
-  express.raw({ type: ["image/*", "application/octet-stream"], limit: "5mb" }),
-);
+// ✅ REMOVED: express.raw() middleware for /api/avatar
+// The avatar route now handles both raw body and FormData via multer
 app.use(express.json());
 
 const generalLimiter = rateLimit({
@@ -153,12 +150,10 @@ function registerRoutes() {
             .status(403)
             .json({ message: "Account disabled", code: "USER_DISABLED" });
         }
-        return res
-          .status(401)
-          .json({
-            message: "Invalid credentials",
-            code: "INVALID_CREDENTIALS",
-          });
+        return res.status(401).json({
+          message: "Invalid credentials",
+          code: "INVALID_CREDENTIALS",
+        });
       }
       const idToken = restData.idToken;
       const uid = restData.localId;
@@ -238,19 +233,15 @@ function registerRoutes() {
         err.code === "auth/id-token-expired" ||
         err.code === "auth/argument-error"
       ) {
-        return res
-          .status(401)
-          .json({
-            message: "Firebase token expired",
-            code: "FIREBASE_TOKEN_EXPIRED",
-          });
-      }
-      res
-        .status(401)
-        .json({
-          message: "Invalid Firebase token",
-          code: "INVALID_FIREBASE_TOKEN",
+        return res.status(401).json({
+          message: "Firebase token expired",
+          code: "FIREBASE_TOKEN_EXPIRED",
         });
+      }
+      res.status(401).json({
+        message: "Invalid Firebase token",
+        code: "INVALID_FIREBASE_TOKEN",
+      });
     }
   });
 
@@ -299,12 +290,10 @@ function registerRoutes() {
         name,
       } = req.body ?? {};
       if (!uid || !email) {
-        return res
-          .status(400)
-          .json({
-            code: "MISSING_FIELDS",
-            message: "uid and email are required",
-          });
+        return res.status(400).json({
+          code: "MISSING_FIELDS",
+          message: "uid and email are required",
+        });
       }
       const cleanUsername = (rawUsername ?? "").toString().trim().toLowerCase();
       if (!cleanUsername || !/^[a-z0-9_]{3,20}$/.test(cleanUsername)) {
@@ -323,19 +312,17 @@ function registerRoutes() {
       }
       const currentUser = await db.collection("users").findOne({ uid });
       if (!currentUser?.username) {
-        const result = await db
-          .collection("users")
-          .findOneAndUpdate(
-            {
-              uid,
-              $or: [{ username: { $exists: false } }, { username: null }],
-            },
-            { $set: { ...updatePayload, username: cleanUsername } },
-            {
-              returnDocument: "after",
-              projection: { username: 1, email: 1, avatarUrl: 1, uid: 1 },
-            },
-          );
+        const result = await db.collection("users").findOneAndUpdate(
+          {
+            uid,
+            $or: [{ username: { $exists: false } }, { username: null }],
+          },
+          { $set: { ...updatePayload, username: cleanUsername } },
+          {
+            returnDocument: "after",
+            projection: { username: 1, email: 1, avatarUrl: 1, uid: 1 },
+          },
+        );
         if (!result?.value) {
           const conflict = await db
             .collection("users")
@@ -344,19 +331,15 @@ function registerRoutes() {
               { projection: { uid: 1 } },
             );
           if (conflict) {
-            return res
-              .status(409)
-              .json({
-                code: "USERNAME_TAKEN",
-                message: "Username already taken by another account",
-              });
-          }
-          return res
-            .status(500)
-            .json({
-              code: "UPDATE_FAILED",
-              message: "Could not create profile",
+            return res.status(409).json({
+              code: "USERNAME_TAKEN",
+              message: "Username already taken by another account",
             });
+          }
+          return res.status(500).json({
+            code: "UPDATE_FAILED",
+            message: "Could not create profile",
+          });
         }
         return res.status(201).json({
           success: true,
@@ -369,12 +352,10 @@ function registerRoutes() {
         });
       }
       if (rawUsername && rawUsername.toLowerCase() !== currentUser.username) {
-        return res
-          .status(409)
-          .json({
-            code: "USERNAME_LOCKED",
-            message: "Username cannot be changed after initial setup",
-          });
+        return res.status(409).json({
+          code: "USERNAME_LOCKED",
+          message: "Username cannot be changed after initial setup",
+        });
       }
       await db.collection("users").updateOne({ uid }, { $set: updatePayload });
       res.json({
@@ -389,12 +370,10 @@ function registerRoutes() {
     } catch (err) {
       console.error("[POST /api/users/profile] Error:", err);
       if (err.code === 11000) {
-        return res
-          .status(409)
-          .json({
-            code: "USERNAME_TAKEN",
-            message: "Username already exists in database",
-          });
+        return res.status(409).json({
+          code: "USERNAME_TAKEN",
+          message: "Username already exists in database",
+        });
       }
       res
         .status(500)
@@ -405,14 +384,12 @@ function registerRoutes() {
   // ── Protected: Get profile ────────────────────────────────────────────────
   app.get("/api/users/profile", verifyBackendToken, async (req, res) => {
     try {
-      const user = await db
-        .collection("users")
-        .findOne(
-          { uid: req.user.sub },
-          {
-            projection: { _id: 0, uid: 1, username: 1, email: 1, avatarUrl: 1 },
-          },
-        );
+      const user = await db.collection("users").findOne(
+        { uid: req.user.sub },
+        {
+          projection: { _id: 0, uid: 1, username: 1, email: 1, avatarUrl: 1 },
+        },
+      );
       if (!user) {
         return res
           .status(404)
@@ -478,6 +455,7 @@ function registerRoutes() {
   app.use("/api/auth", verifyBackendToken, signoutRoutes);
 
   // 🔓 OPEN AVATAR ROUTE: No auth middleware - completely public
+  // Multer in avatarRoutes.js handles both FormData and raw body
   app.use("/api/avatar", avatarRoutes);
 
   app.use("/api/videos/drive", driveVideoRoutes);
@@ -511,13 +489,11 @@ async function verifyFirebaseToken(req, res, next) {
   } catch (err) {
     console.warn("[verifyFirebaseToken] Error:", err.code, err.message);
     if (err.code === "auth/id-token-expired") {
-      return res
-        .status(401)
-        .json({
-          message: "Token expired",
-          code: "TOKEN_EXPIRED",
-          action: "refresh",
-        });
+      return res.status(401).json({
+        message: "Token expired",
+        code: "TOKEN_EXPIRED",
+        action: "refresh",
+      });
     }
     return res
       .status(401)
@@ -551,13 +527,11 @@ function verifyBackendToken(req, res, next) {
       if (err) {
         console.warn("[verifyBackendToken] Error:", err.name, err.message);
         if (err.name === "TokenExpiredError") {
-          return res
-            .status(401)
-            .json({
-              message: "Session expired",
-              code: "TOKEN_EXPIRED",
-              action: "refresh",
-            });
+          return res.status(401).json({
+            message: "Session expired",
+            code: "TOKEN_EXPIRED",
+            action: "refresh",
+          });
         }
         return res
           .status(403)
