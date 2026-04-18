@@ -21,6 +21,7 @@ function getSupabase() {
   if (!url) throw new Error("SUPABASE_URL env var not set");
   if (!key) throw new Error("SUPABASE_SERVICE_ROLE_KEY env var not set");
 
+  console.log(`[Supabase] Initializing with URL: ${url}`);
   _supabase = createClient(url, key, {
     auth: { persistSession: false },
   });
@@ -28,15 +29,12 @@ function getSupabase() {
   return _supabase;
 }
 
-// ── Helper: Get uid from request (no verification) ───────────────────────────
+// ── Helper: Get uid from request ─────────────────────────────────────────────
 function getUid(req) {
   return req.body?.uid || req.query?.uid || req.headers["x-uid"] || null;
 }
 
 // ── POST /api/avatar ───────────────────────────────────────────────────────────
-// 🔓 FULLY OPEN: No authentication, no token checks
-// Accepts uid via: body, query string, or X-Uid header
-// Returns: { avatarUrl: string }
 router.post("/", async (req, res) => {
   try {
     const uid = getUid(req);
@@ -80,13 +78,17 @@ router.post("/", async (req, res) => {
     }
 
     const ext = mimeType.split("/")[1] ?? "jpg";
-    const safeUid = uid.trim().replace(/[^a-zA-Z0-9_-]/g, ""); // Basic sanitization
+    const safeUid = uid.trim().replace(/[^a-zA-Z0-9_-]/g, "");
     const filePath = `${safeUid}/avatar.${ext}`;
+
+    console.log(
+      `[Avatar] Upload attempt: uid=${safeUid}, path=${filePath}, mime=${mimeType}, size=${buffer.length}`,
+    );
 
     const supabase = getSupabase();
 
-    // Upload to Supabase Storage
-    const { error: uploadError } = await supabase.storage
+    // ── Upload to Supabase Storage ───────────────────────────────────────────
+    const { uploadData, error: uploadError } = await supabase.storage
       .from("avatars")
       .upload(filePath, buffer, {
         contentType: mimeType,
@@ -95,22 +97,32 @@ router.post("/", async (req, res) => {
       });
 
     if (uploadError) {
-      console.error("[Avatar] Supabase upload error:", uploadError.message);
+      console.error("[Avatar] Upload failed:", uploadError);
       return res.status(500).json({
-        code: "SERVER_ERROR",
-        message: "Sorry, this is on our side. Please try again later.",
+        code: "UPLOAD_FAILED",
+        message: uploadError.message || "Supabase upload failed",
       });
     }
 
-    // Get public URL
-    const { urlData } = supabase.storage.from("avatars").getPublicUrl(filePath);
+    console.log(`[Avatar] Upload successful:`, uploadData);
 
-    const avatarUrl = urlData.publicUrl;
-    console.log(`[Avatar] uid=${safeUid} uploaded: ${avatarUrl}`);
+    // ── Get public URL - FIXED: getPublicUrl returns { publicUrl } directly ─
+    const { publicUrl } = supabase.storage
+      .from("avatars")
+      .getPublicUrl(filePath);
 
-    res.status(201).json({ avatarUrl });
+    if (!publicUrl) {
+      console.error("[Avatar] getPublicUrl returned no publicUrl");
+      return res.status(500).json({
+        code: "URL_GENERATION_FAILED",
+        message: "Could not generate public URL for avatar",
+      });
+    }
+
+    console.log(`[Avatar] Success: uid=${safeUid}, url=${publicUrl}`);
+    res.status(201).json({ avatarUrl: publicUrl });
   } catch (err) {
-    console.error("[Avatar] upload error:", err.message);
+    console.error("[Avatar] Unexpected error:", err);
     res.status(500).json({
       code: "SERVER_ERROR",
       message: "Sorry, this is on our side. Please try again later.",

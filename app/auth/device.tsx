@@ -81,7 +81,8 @@ function Toast({
   const bg = isNetwork ? "#1a1000" : "#1a0000";
   const border = isNetwork ? "#FFA500" : "#E91429";
   const color = isNetwork ? "#FFA500" : "#E91429";
-  const icon = isNetwork ? "wifi-off-outline" : "alert-circle-outline";
+  // ✅ FIXED: "wifi-off-outline" → "cloud-offline-outline" (valid Ionicons name)
+  const icon = isNetwork ? "cloud-offline-outline" : "alert-circle-outline";
 
   return (
     <Animated.View
@@ -381,7 +382,7 @@ export default function Device() {
     }
 
     const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaType.Images,
+      mediaTypes: ["images"],
       allowsEditing: true,
       aspect: [1, 1],
       quality: 0.85,
