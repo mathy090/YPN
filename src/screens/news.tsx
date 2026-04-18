@@ -2,7 +2,7 @@
 import { Ionicons } from "@expo/vector-icons";
 import NetInfo from "@react-native-community/netinfo";
 import * as WebBrowser from "expo-web-browser";
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -27,15 +27,10 @@ WebBrowser.maybeCompleteAuthSession();
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 const API_URL = process.env.EXPO_PUBLIC_API_URL;
+const NEWS_CACHE_KEY = "news_manifest";
+// ✅ FIX 1: Match backend L1 TTL (10 minutes)
+const CACHE_TTL = 10 * 60 * 1000;
 
-// L1 client-side in-memory cache (matches server refresh interval)
-const CLIENT_L1_TTL_MS = 60 * 60 * 1000; // 1 hour
-
-// L2 client-side SQLite/SecureStore cache (keeps articles between app restarts)
-const CLIENT_L2_TTL_MS = 48 * 60 * 60 * 1000; // 48 hours — matches server archive TTL
-const NEWS_CACHE_KEY = "news_manifest_v2";
-
-// ── Types ──────────────────────────────────────────────────────────────────────
 type NewsItem = {
   id: string;
   title: string;
@@ -47,22 +42,8 @@ type NewsItem = {
   description: string;
 };
 
-// ── L1: Module-level in-memory cache (survives re-renders, cleared on app restart) ──
-let _memCache: NewsItem[] | null = null;
-let _memCachedAt = 0;
-
-function memRead(): NewsItem[] | null {
-  if (!_memCache || Date.now() - _memCachedAt > CLIENT_L1_TTL_MS) return null;
-  return _memCache;
-}
-
-function memWrite(items: NewsItem[]) {
-  _memCache = items;
-  _memCachedAt = Date.now();
-}
-
-// ── L2: SQLite/SecureStore persistent cache ───────────────────────────────────
-async function diskRead(): Promise<NewsItem[] | null> {
+// ── Cache Helpers ──────────────────────────────────────────────────────────────
+async function readNewsCache(): Promise<NewsItem[] | null> {
   try {
     const data = await getSecureCache(NEWS_CACHE_KEY);
     return Array.isArray(data) ? data : null;
@@ -71,15 +52,14 @@ async function diskRead(): Promise<NewsItem[] | null> {
   }
 }
 
-async function diskWrite(items: NewsItem[]) {
+async function writeNewsCache(items: NewsItem[]) {
   try {
-    await setSecureCache(NEWS_CACHE_KEY, items, CLIENT_L2_TTL_MS);
+    await setSecureCache(NEWS_CACHE_KEY, items, CACHE_TTL);
   } catch (e) {
-    console.warn("[News] Disk cache write failed:", e);
+    console.warn("[News] Failed to write cache:", e);
   }
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────────
 function relativeTime(ts: number): string {
   const diff = Date.now() - ts;
   const m = Math.floor(diff / 60000);
@@ -94,7 +74,7 @@ function relativeTime(ts: number): string {
   return `${Math.floor(d / 365)}y ago`;
 }
 
-async function openArticle(item: NewsItem) {
+const openArticleInApp = async (item: NewsItem) => {
   try {
     await WebBrowser.openBrowserAsync(item.link, {
       toolbarColor: "#111111",
@@ -102,12 +82,12 @@ async function openArticle(item: NewsItem) {
       showTitle: true,
       enableBarCollapsing: false,
     });
-  } catch {
+  } catch (err) {
     Alert.alert("Error", "Could not open the article.");
+    console.error(err);
   }
-}
+};
 
-// ── NewsCard ───────────────────────────────────────────────────────────────────
 const NewsCard = React.memo(
   ({
     item,
@@ -162,119 +142,97 @@ const NewsCard = React.memo(
   ),
 );
 
-// ── Main Screen ────────────────────────────────────────────────────────────────
 export default function NewsScreen() {
   const [articles, setArticles] = useState<NewsItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(false);
   const [isOffline, setIsOffline] = useState(false);
-  // Track when we last fetched from server to avoid hammering
-  const lastFetchRef = useRef(0);
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // ── Initialise ───────────────────────────────────────────────────────────────
   useEffect(() => {
     const init = async () => {
       await initializeSecureCache();
-      await boot();
+      boot();
     };
     init();
+
+    return () => {
+      if (refreshTimer.current) clearTimeout(refreshTimer.current);
+    };
   }, []);
 
-  // ── Network listener ──────────────────────────────────────────────────────────
   useEffect(() => {
     const unsub = NetInfo.addEventListener((state) => {
       const connected = !!state.isConnected;
       setIsOffline(!connected);
-      // Auto-fetch when coming back online
       if (connected && error) {
-        fetchFromServer(false);
+        fetchFromBackend(false);
       }
     });
     return () => unsub();
   }, [error]);
 
-  // ── Boot: L1 → L2 → network ──────────────────────────────────────────────────
-  const boot = async () => {
-    // L1: in-memory (instant)
-    const mem = memRead();
-    if (mem && mem.length > 0) {
-      setArticles(mem);
-      setLoading(false);
-      // Background refresh if stale
-      if (Date.now() - lastFetchRef.current > CLIENT_L1_TTL_MS) {
-        fetchFromServer(false);
-      }
-      return;
-    }
-
-    // L2: disk cache (fast, survives restarts)
-    const disk = await diskRead();
-    if (disk && disk.length > 0) {
-      memWrite(disk); // hydrate L1
-      setArticles(disk);
-      setLoading(false);
-      // Background refresh — don't block UI
-      fetchFromServer(false);
-      return;
-    }
-
-    // Cold start: no cache — must hit network
-    setLoading(true);
-    await fetchFromServer(false);
+  const scheduleRefresh = () => {
+    if (refreshTimer.current) clearTimeout(refreshTimer.current);
+    refreshTimer.current = setTimeout(() => fetchFromBackend(false), CACHE_TTL);
   };
 
-  // ── Fetch from server ─────────────────────────────────────────────────────────
-  const fetchFromServer = useCallback(
-    async (manual: boolean) => {
-      if (isOffline) {
-        if (manual) setError(true);
-        return;
-      }
+  const boot = async () => {
+    const cached = await readNewsCache();
 
-      if (manual) {
-        setRefreshing(true);
-      }
-
-      setError(false);
-
-      try {
-        const res = await fetch(`${API_URL}/api/news`, {
-          // 10s timeout via AbortController
-          signal: AbortSignal.timeout(10000),
-        });
-
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-        const data: NewsItem[] = await res.json();
-
-        if (data.length > 0) {
-          lastFetchRef.current = Date.now();
-          // Write to both cache layers
-          memWrite(data);
-          diskWrite(data); // non-blocking
-          setArticles(data);
-          setError(false);
-        } else if (manual) {
-          setError(true);
-        }
-      } catch (e: any) {
-        console.warn("[News] Fetch failed:", e.message);
-        if (manual) setError(true);
-      } finally {
+    if (cached?.length) {
+      setArticles(cached);
+      setLoading(false);
+      if (isOffline) return;
+      scheduleRefresh();
+    } else {
+      setLoading(true);
+      if (!isOffline) {
+        await fetchFromBackend(false);
+      } else {
         setLoading(false);
-        setRefreshing(false);
+        setError(true);
       }
-    },
-    [isOffline],
-  );
+    }
+  };
 
-  // ── Pull-to-refresh ───────────────────────────────────────────────────────────
-  const onRefresh = useCallback(() => {
-    if (!isOffline) fetchFromServer(true);
-  }, [isOffline, fetchFromServer]);
+  const fetchFromBackend = async (manual = true) => {
+    if (isOffline) {
+      if (manual) setError(true);
+      return;
+    }
 
-  // ── Render ────────────────────────────────────────────────────────────────────
+    if (manual) setRefreshing(true);
+    else if (!articles.length) setLoading(true);
+
+    setError(false);
+
+    try {
+      // ✅ FIX 2: Add ?refresh=true for manual pulls to bypass backend cache
+      const refreshParam = manual ? "?refresh=true" : "";
+      const res = await fetch(`${API_URL}/api/news${refreshParam}`);
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const data: NewsItem[] = await res.json();
+
+      if (data.length > 0) {
+        await writeNewsCache(data);
+        setArticles(data);
+        scheduleRefresh();
+      } else {
+        if (manual) setError(true);
+      }
+    } catch (e) {
+      console.warn("[News] Fetch failed:", e);
+      if (manual) setError(true);
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  };
+
   if (loading) {
     return (
       <View style={s.centre}>
@@ -286,7 +244,6 @@ export default function NewsScreen() {
 
   return (
     <View style={s.root}>
-      {/* Status bar spacer */}
       <View
         style={{
           height:
@@ -305,7 +262,7 @@ export default function NewsScreen() {
         </View>
       )}
 
-      {error && articles.length === 0 ? (
+      {(error || isOffline) && articles.length === 0 ? (
         <View style={s.centre}>
           <Ionicons
             name={isOffline ? "wifi-off-outline" : "alert-circle-outline"}
@@ -318,7 +275,7 @@ export default function NewsScreen() {
           {!isOffline && (
             <TouchableOpacity
               style={s.retryBtn}
-              onPress={() => fetchFromServer(true)}
+              onPress={() => fetchFromBackend(true)}
             >
               <Text style={s.retryText}>Retry</Text>
             </TouchableOpacity>
@@ -331,7 +288,7 @@ export default function NewsScreen() {
           refreshControl={
             <RefreshControl
               refreshing={refreshing}
-              onRefresh={onRefresh}
+              onRefresh={() => !isOffline && fetchFromBackend(true)}
               tintColor="#1DB954"
               colors={["#1DB954"]}
             />
@@ -343,24 +300,22 @@ export default function NewsScreen() {
             </View>
           ) : (
             articles.map((item) => (
-              <NewsCard key={item.id} item={item} onPress={openArticle} />
+              <NewsCard key={item.id} item={item} onPress={openArticleInApp} />
             ))
           )}
         </ScrollView>
       )}
 
-      {/* Offline banner when showing cached data */}
       {isOffline && articles.length > 0 && (
         <View style={s.offlineBanner}>
           <Ionicons name="wifi-off-outline" size={16} color="#fff" />
-          <Text style={s.offlineText}>Offline — Showing cached news</Text>
+          <Text style={s.offlineText}>Offline • Showing cached news</Text>
         </View>
       )}
     </View>
   );
 }
 
-// ── Styles ─────────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#000" },
   centre: {

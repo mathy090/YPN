@@ -3,20 +3,23 @@
 
 const express = require("express");
 const https = require("https");
+const { parseStringPromise } = require("xml2js");
 
 const router = express.Router();
 
 // ─── News sources ─────────────────────────────────────────────────────────────
+// ✅ EXPANDED: Added 30+ diverse RSS sources for Zimbabwe & Africa youth news
 const SOURCES = [
+  // Google News searches (broad coverage)
   {
     key: "gnews-zim-youth",
-    name: "Zimbabwe News",
+    name: "Zimbabwe Youth News",
     color: "#1DB954",
     url: "https://news.google.com/rss/search?q=Zimbabwe+youth&hl=en-ZW&gl=ZW&ceid=ZW:en",
   },
   {
     key: "gnews-zim-empowerment",
-    name: "Empowerment",
+    name: "Youth Empowerment",
     color: "#57F287",
     url: "https://news.google.com/rss/search?q=Zimbabwe+youth+empowerment+programs&hl=en&gl=ZW&ceid=ZW:en",
   },
@@ -57,8 +60,22 @@ const SOURCES = [
     url: "https://news.google.com/rss/search?q=Zimbabwe+entrepreneurship+youth+startup&hl=en&gl=ZW&ceid=ZW:en",
   },
   {
+    key: "gnews-tech-zim",
+    name: "Tech & Innovation",
+    color: "#00BCD4",
+    url: "https://news.google.com/rss/search?q=Zimbabwe+technology+innovation+youth&hl=en&gl=ZW&ceid=ZW:en",
+  },
+  {
+    key: "gnews-sports-youth",
+    name: "Youth Sports",
+    color: "#FF5722",
+    url: "https://news.google.com/rss/search?q=Zimbabwe+youth+sports+football&hl=en&gl=ZW&ceid=ZW:en",
+  },
+
+  // Zimbabwe local news outlets
+  {
     key: "herald",
-    name: "Herald",
+    name: "The Herald",
     color: "#C0392B",
     url: "https://www.herald.co.zw/feed/",
   },
@@ -82,7 +99,7 @@ const SOURCES = [
   },
   {
     key: "chronicle",
-    name: "Chronicle",
+    name: "The Chronicle",
     color: "#E67E22",
     url: "https://www.chronicle.co.zw/feed/",
   },
@@ -95,17 +112,98 @@ const SOURCES = [
   {
     key: "nehanda",
     name: "Nehanda Radio",
-    color: "#00BCD4",
+    color: "#00ACC1",
     url: "https://nehandaradio.com/feed/",
+  },
+  {
+    key: "bulawayo24",
+    name: "Bulawayo24",
+    color: "#795548",
+    url: "https://bulawayo24.com/index-id-news-sc-national-by-rss.xml",
+  },
+  {
+    key: "zimeye",
+    name: "ZimEye",
+    color: "#607D8B",
+    url: "https://www.zimeye.net/feed/",
+  },
+  {
+    key: "veritas",
+    name: "Veritas Zim",
+    color: "#3F51B5",
+    url: "https://www.veritaszim.net/rss.xml",
+  },
+
+  // Regional African sources
+  {
+    key: "citizen-africa",
+    name: "The Citizen Africa",
+    color: "#4CAF50",
+    url: "https://www.thecitizen.co.tz/rss",
+  },
+  {
+    key: "nation-africa",
+    name: "Nation Africa",
+    color: "#2196F3",
+    url: "https://nation.africa/kenya/rss",
+  },
+  {
+    key: "citizen-sa",
+    name: "Citizen SA",
+    color: "#FF9800",
+    url: "https://citizen.co.za/feed/",
+  },
+  {
+    key: "iol-sa",
+    name: "IOL South Africa",
+    color: "#9C27B0",
+    url: "https://www.iol.co.za/rss",
+  },
+  {
+    key: "mg-sa",
+    name: "Mail & Guardian",
+    color: "#795548",
+    url: "https://mg.co.za/feed/",
+  },
+
+  // International youth-focused
+  {
+    key: "un-youth",
+    name: "UN Youth",
+    color: "#2196F3",
+    url: "https://www.un.org/en/youth/rss.xml",
+  },
+  {
+    key: "africanews",
+    name: "Africanews",
+    color: "#009688",
+    url: "https://www.africanews.com/feed/",
+  },
+  {
+    key: "bbc-africa",
+    name: "BBC Africa",
+    color: "#B71C1C",
+    url: "http://feeds.bbci.co.uk/news/world/africa/rss.xml",
+  },
+  {
+    key: "voa-africa",
+    name: "VOA Africa",
+    color: "#0D47A1",
+    url: "https://www.voanews.com/api/zm",
+  },
+  {
+    key: "aljazeera-africa",
+    name: "Al Jazeera Africa",
+    color: "#D32F2F",
+    url: "https://www.aljazeera.com/xml/rss/all.xml",
   },
 ];
 
 // ─── Cache config ─────────────────────────────────────────────────────────────
-// L1: in-memory, rebuilt every hour
-// L2: MongoDB archive (persistent, survives restart, TTL auto-cleans after 48h)
-const L1_TTL_MS = 60 * 60 * 1000; // 1 hour
-const L2_ARCHIVE_TTL_SEC = 48 * 60 * 60; // 48 hours TTL on MongoDB docs
-const RSS_REFRESH_INTERVAL_MS = 60 * 60 * 1000; // auto-rebuild every 1 hour
+// ✅ CHANGED: 10 minute cache TTL instead of 1 hour
+const L1_TTL_MS = 10 * 60 * 1000; // 10 minutes in-memory cache
+const L2_ARCHIVE_TTL_SEC = 10 * 60; // 10 minutes MongoDB TTL
+const RSS_REFRESH_INTERVAL_MS = 10 * 60 * 1000; // ✅ Refresh RSS every 10 minutes
 
 // ─── L1 in-memory cache ───────────────────────────────────────────────────────
 let l1Cache = null;
@@ -119,7 +217,7 @@ let _db = null;
 function initNewsArchive(db) {
   _db = db;
 
-  // Ensure indexes exist — safe to call multiple times
+  // Ensure indexes exist
   db.collection("news_archive")
     .createIndex({ id: 1 }, { unique: true })
     .catch(() => {});
@@ -128,55 +226,52 @@ function initNewsArchive(db) {
     .createIndex({ pubDate: -1 })
     .catch(() => {});
 
-  // TTL index: MongoDB auto-deletes articles older than 48 hours
+  // ✅ TTL index: auto-deletes articles older than 10 minutes
   db.collection("news_archive")
     .createIndex({ archivedAt: 1 }, { expireAfterSeconds: L2_ARCHIVE_TTL_SEC })
     .catch(() => {});
 
-  console.log("[News] Archive store initialised with TTL index (48h)");
+  console.log(
+    `[News] Archive initialised with ${L2_ARCHIVE_TTL_SEC / 60}min TTL`,
+  );
 
-  // Warm the cache on startup — non-blocking
+  // Warm cache on startup
   warmCacheOnStartup();
 }
 
 // ─── Startup warm ─────────────────────────────────────────────────────────────
-// Try L2 first (fast, no network), then kick off an RSS build in background
 async function warmCacheOnStartup() {
   try {
-    const archived = await loadFromArchive(200);
+    const archived = await loadFromArchive(500); // ✅ Increased limit
     if (archived && archived.length > 0) {
       l1Cache = archived;
       l1CachedAt = Date.now();
       console.log(
-        `[News] ✅ Warmed L1 from MongoDB archive (${archived.length} articles)`,
+        `[News] ✅ Warmed L1 from archive (${archived.length} articles)`,
       );
-    } else {
-      console.log("[News] No archive found — triggering cold RSS build...");
     }
   } catch (e) {
     console.warn("[News] Warm from archive failed:", e.message);
   }
 
-  // Always kick off a fresh RSS build in the background so cache is current
+  // Always kick off fresh RSS build
   buildNews().catch((e) =>
     console.warn("[News] Startup RSS build failed:", e.message),
   );
 
-  // Schedule hourly refresh
   scheduleRefresh();
 }
 
-// ─── Hourly scheduler ─────────────────────────────────────────────────────────
+// ─── 10-minute scheduler ──────────────────────────────────────────────────────
 function scheduleRefresh() {
   if (refreshTimer) clearInterval(refreshTimer);
   refreshTimer = setInterval(() => {
-    console.log("[News] ⏰ Hourly RSS refresh triggered");
+    console.log("[News] ⏰ 10-min RSS refresh triggered");
     buildNews().catch((e) =>
       console.warn("[News] Scheduled refresh failed:", e.message),
     );
   }, RSS_REFRESH_INTERVAL_MS);
 
-  // Ensure the interval doesn't block Node.js process exit
   if (refreshTimer.unref) refreshTimer.unref();
 }
 
@@ -187,9 +282,7 @@ async function archiveArticles(articles) {
     const ops = articles.map((a) => ({
       updateOne: {
         filter: { id: a.id },
-        update: {
-          $set: { ...a, archivedAt: new Date() },
-        },
+        update: { $set: { ...a, archivedAt: new Date() } },
         upsert: true,
       },
     }));
@@ -198,16 +291,15 @@ async function archiveArticles(articles) {
       .bulkWrite(ops, { ordered: false });
 
     if (result.upsertedCount > 0) {
-      console.log(
-        `[News] 📦 Archived ${result.upsertedCount} new articles to MongoDB`,
-      );
+      console.log(`[News] 📦 Archived ${result.upsertedCount} new articles`);
     }
   } catch (err) {
     console.warn("[News] Archive write error:", err.message);
   }
 }
 
-async function loadFromArchive(limit = 200) {
+async function loadFromArchive(limit = 500) {
+  // ✅ Increased default limit
   if (!_db) return null;
   try {
     const docs = await _db
@@ -229,7 +321,8 @@ const BROWSER_UA =
   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 // ─── HTTP fetch with redirect follow ─────────────────────────────────────────
-function httpsGet(url, timeoutMs = 12000) {
+function httpsGet(url, timeoutMs = 15000) {
+  // ✅ Increased timeout for more sources
   return new Promise((resolve, reject) => {
     const req = https.get(
       url,
@@ -237,8 +330,7 @@ function httpsGet(url, timeoutMs = 12000) {
         timeout: timeoutMs,
         headers: {
           "User-Agent": BROWSER_UA,
-          Accept:
-            "application/rss+xml,application/xml,text/xml,application/atom+xml,*/*",
+          Accept: "application/rss+xml,application/xml,text/xml,*/*",
           "Accept-Language": "en-US,en;q=0.9",
         },
       },
@@ -303,8 +395,95 @@ function extractThumbnail(block) {
   return null;
 }
 
-// ─── RSS parser ────────────────────────────────────────────────────────────────
-function parseRSS(xml, source) {
+// ─── ✅ IMPROVED: XML-based RSS parser using xml2js for better extraction ─────
+async function parseRSSWithXml2js(xml, source) {
+  try {
+    const result = await parseStringPromise(xml, {
+      explicitArray: false,
+      mergeAttrs: true,
+      trim: true,
+    });
+
+    const items = [];
+    const channel = result.rss?.channel || result.feed;
+    if (!channel?.item && !channel?.entry) return items;
+
+    const entries = Array.isArray(channel.item || channel.entry)
+      ? channel.item || channel.entry
+      : [channel.item || channel.entry].filter(Boolean);
+
+    for (const entry of entries) {
+      try {
+        const title = decodeEntities(entry.title?._ || entry.title || "");
+        if (!title) continue;
+
+        const link = entry.link?.href || entry.link?._ || entry.link || "";
+        if (!link || !link.startsWith("http")) continue;
+
+        const pubDateRaw =
+          entry.pubDate || entry.published || entry.updated || "";
+        const pubDate = pubDateRaw
+          ? new Date(pubDateRaw).getTime()
+          : Date.now();
+
+        const description = decodeEntities(
+          entry.description?._ || entry.summary?._ || entry.content?._ || "",
+        ).slice(0, 500);
+
+        // ✅ Better ID generation: full URL hash to avoid collisions
+        const crypto = require("crypto");
+        const urlHash = crypto
+          .createHash("md5")
+          .update(link)
+          .digest("hex")
+          .slice(0, 16);
+        const id = `${source.key}-${urlHash}`;
+
+        // Extract thumbnail from various RSS formats
+        let thumbnail = null;
+        if (entry["media:content"]?.url) {
+          thumbnail = entry["media:content"].url;
+        } else if (entry["media:thumbnail"]?.url) {
+          thumbnail = entry["media:thumbnail"].url;
+        } else if (entry.enclosure?.url) {
+          thumbnail = entry.enclosure.url;
+        } else if (entry.content?._) {
+          const imgMatch = entry.content._.match(
+            /<img[^>]+src=["']([^"']+)["']/i,
+          );
+          if (imgMatch) thumbnail = imgMatch[1];
+        }
+
+        items.push({
+          id,
+          title,
+          link,
+          pubDate: isNaN(pubDate) ? Date.now() : pubDate,
+          source: source.name,
+          sourceColor: source.color,
+          sourceKey: source.key,
+          thumbnail,
+          description,
+          fetchedAt: Date.now(),
+        });
+      } catch (e) {
+        console.warn(
+          `[News] Parse error for entry in ${source.name}:`,
+          e.message,
+        );
+        continue;
+      }
+    }
+
+    return items;
+  } catch (e) {
+    console.warn(`[News] XML parse failed for ${source.name}:`, e.message);
+    return [];
+  }
+}
+
+// ─── Fallback regex parser (if xml2js fails) ──────────────────────────────────
+function parseRSSFallback(xml, source) {
   const articles = [];
   const itemRx = /<item[\s>]([\s\S]*?)<\/item>/gi;
   let match;
@@ -331,10 +510,16 @@ function parseRSS(xml, source) {
     const ts = pub ? new Date(pub).getTime() : Date.now();
 
     const descM = block.match(/<description[^>]*>([\s\S]*?)<\/description>/i);
-    const desc = descM ? decodeEntities(descM[1]).slice(0, 300) : "";
+    const desc = descM ? decodeEntities(descM[1]).slice(0, 500) : "";
 
-    const urlFp = Buffer.from(link).toString("base64").slice(0, 20);
-    const id = `${source.key}-${urlFp}`;
+    // ✅ Better ID: full URL hash
+    const crypto = require("crypto");
+    const urlHash = crypto
+      .createHash("md5")
+      .update(link)
+      .digest("hex")
+      .slice(0, 16);
+    const id = `${source.key}-${urlHash}`;
 
     articles.push({
       id,
@@ -343,8 +528,10 @@ function parseRSS(xml, source) {
       pubDate: isNaN(ts) ? Date.now() : ts,
       source: source.name,
       sourceColor: source.color,
+      sourceKey: source.key,
       thumbnail: extractThumbnail(block),
       description: desc,
+      fetchedAt: Date.now(),
     });
   }
 
@@ -354,8 +541,14 @@ function parseRSS(xml, source) {
 // ─── Fetch one RSS source ─────────────────────────────────────────────────────
 async function fetchSource(source) {
   try {
-    const xml = await httpsGet(source.url, 12000);
-    const items = parseRSS(xml, source);
+    const xml = await httpsGet(source.url, 15000);
+
+    // Try xml2js first, fallback to regex
+    let items = await parseRSSWithXml2js(xml, source);
+    if (items.length === 0) {
+      items = parseRSSFallback(xml, source);
+    }
+
     console.log(`[News] ✓ ${source.name}: ${items.length} articles`);
     return items;
   } catch (err) {
@@ -373,41 +566,57 @@ async function buildNews() {
 
   building = true;
   console.log(`📰 [News] Building RSS feed from ${SOURCES.length} sources…`);
+  const startTime = Date.now();
 
   try {
-    // Fetch all sources in parallel — failures are caught per-source
-    const results = await Promise.allSettled(SOURCES.map(fetchSource));
+    // ✅ Fetch in batches to avoid overwhelming servers
+    const batchSize = 5;
+    const results = [];
+
+    for (let i = 0; i < SOURCES.length; i += batchSize) {
+      const batch = SOURCES.slice(i, i + batchSize);
+      const batchResults = await Promise.allSettled(batch.map(fetchSource));
+      results.push(...batchResults);
+      // Small delay between batches
+      await new Promise((r) => setTimeout(r, 500));
+    }
+
     let freshArticles = results
       .filter((r) => r.status === "fulfilled")
       .flatMap((r) => r.value)
       .filter(Boolean);
 
-    // Deduplicate by id
-    const seen = new Set();
+    console.log(`[News] Raw fetch: ${freshArticles.length} articles`);
+
+    // ✅ Smarter deduplication: by URL, not just ID
+    const urlSeen = new Set();
     freshArticles = freshArticles.filter((a) => {
-      if (seen.has(a.id)) return false;
-      seen.add(a.id);
+      if (urlSeen.has(a.link)) return false;
+      urlSeen.add(a.link);
       return true;
     });
 
-    console.log(`[News] ${freshArticles.length} unique articles from RSS`);
+    console.log(`[News] After dedupe: ${freshArticles.length} unique articles`);
 
     // L2: Persist fresh articles to MongoDB archive
     await archiveArticles(freshArticles);
 
-    // L2: Load full archive (includes older articles still within TTL)
-    const archived = await loadFromArchive(200);
+    // L2: Load full archive with higher limit
+    const archived = await loadFromArchive(500);
     const allArticles = archived ?? freshArticles;
 
     // Sort newest first
     allArticles.sort((a, b) => b.pubDate - a.pubDate);
 
-    // L1: Update in-memory cache
-    l1Cache = allArticles;
+    // ✅ Return more articles to frontend (up to 200)
+    l1Cache = allArticles.slice(0, 200);
     l1CachedAt = Date.now();
 
-    console.log(`✅ [News] Feed ready: ${allArticles.length} total articles`);
-    return allArticles;
+    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(
+      `✅ [News] Feed ready: ${l1Cache.length} articles in ${duration}s`,
+    );
+    return l1Cache;
   } finally {
     building = false;
   }
@@ -415,28 +624,25 @@ async function buildNews() {
 
 // ─── getNews: L1 → L2 → build ─────────────────────────────────────────────────
 async function getNews() {
-  // L1 hit: in-memory, fresh within 1 hour
+  // L1 hit: in-memory, fresh within 10 minutes
   if (l1Cache && l1Cache.length > 0 && Date.now() - l1CachedAt < L1_TTL_MS) {
     return l1Cache;
   }
 
-  // L2 hit: MongoDB archive (survives restarts)
-  const archived = await loadFromArchive(200);
+  // L2 hit: MongoDB archive
+  const archived = await loadFromArchive(500);
   if (archived && archived.length > 0) {
-    console.log(
-      `📦 [News] L1 miss → serving ${archived.length} articles from MongoDB`,
-    );
-    // Hydrate L1
-    l1Cache = archived;
+    console.log(`📦 [News] L1 miss → serving ${archived.length} from MongoDB`);
+    l1Cache = archived.slice(0, 200);
     l1CachedAt = Date.now();
-    // Background RSS refresh — don't block the response
+    // Background RSS refresh
     buildNews().catch((e) =>
       console.warn("[News] Background build:", e.message),
     );
-    return archived;
+    return l1Cache;
   }
 
-  // Cold start: no cache anywhere — block and build
+  // Cold start
   console.log("[News] Cold start — blocking RSS build...");
   return buildNews();
 }
@@ -447,20 +653,73 @@ async function getNews() {
 router.get("/", async (_req, res) => {
   try {
     const articles = await getNews();
-    res.json(articles);
+    res.json({
+      success: true,
+      count: articles.length,
+      cached: Date.now() - l1CachedAt < L1_TTL_MS,
+      data: articles,
+    });
   } catch (e) {
     console.error("[News] GET / error:", e.message);
-    res.status(500).json({ message: "Failed to load news", articles: [] });
+    res.status(500).json({
+      success: false,
+      message: "Failed to load news",
+      data: [],
+    });
   }
 });
 
-// DELETE /api/news/cache — force clear L1 (L2 archive preserved)
+// GET /api/news/sources — list available sources (for frontend)
+router.get("/sources", (_req, res) => {
+  res.json({
+    success: true,
+    count: SOURCES.length,
+    sources: SOURCES.map((s) => ({
+      key: s.key,
+      name: s.name,
+      color: s.color,
+    })),
+  });
+});
+
+// GET /api/news/source/:key — filter by specific source
+router.get("/source/:key", async (req, res) => {
+  try {
+    const { key } = req.params;
+    const source = SOURCES.find((s) => s.key === key);
+
+    if (!source) {
+      return res.status(404).json({
+        success: false,
+        message: "Source not found",
+      });
+    }
+
+    const articles = await getNews();
+    const filtered = articles.filter((a) => a.sourceKey === key);
+
+    res.json({
+      success: true,
+      source: source.name,
+      count: filtered.length,
+      data: filtered,
+    });
+  } catch (e) {
+    console.error("[News] GET /source/:key error:", e.message);
+    res.status(500).json({
+      success: false,
+      message: "Failed to filter news",
+    });
+  }
+});
+
+// DELETE /api/news/cache — force clear L1 cache
 router.delete("/cache", async (_req, res) => {
   l1Cache = null;
   l1CachedAt = 0;
   res.json({
-    message:
-      "L1 cache cleared. Archive preserved. Next request rebuilds from RSS + archive.",
+    success: true,
+    message: `L1 cache cleared. Next request fetches fresh RSS (10-min TTL).`,
   });
 });
 
@@ -474,6 +733,7 @@ router.get("/cache/status", async (_req, res) => {
     : 0;
 
   res.json({
+    success: true,
     l1: {
       hit: !!l1Cache && l1Cache.length > 0,
       articles: l1Cache?.length ?? 0,
@@ -482,26 +742,40 @@ router.get("/cache/status", async (_req, res) => {
     },
     l2: {
       totalArticles: count,
-      ttlHours: L2_ARCHIVE_TTL_SEC / 3600,
+      ttlMinutes: L2_ARCHIVE_TTL_SEC / 60,
     },
     scheduler: {
-      refreshIntervalHours: RSS_REFRESH_INTERVAL_MS / 3600000,
+      refreshIntervalMinutes: RSS_REFRESH_INTERVAL_MS / 60000,
       building,
+      nextRefreshIn: l1CachedAt
+        ? Math.max(
+            0,
+            Math.floor((L1_TTL_MS - (Date.now() - l1CachedAt)) / 1000),
+          )
+        : 0,
     },
-    sources: SOURCES.map((s) => ({ name: s.name, key: s.key })),
+    sources: {
+      total: SOURCES.length,
+      list: SOURCES.map((s) => ({ name: s.name, key: s.key })),
+    },
   });
 });
 
 // POST /api/news/refresh — admin force refresh
 router.post("/refresh", async (_req, res) => {
   if (building) {
-    return res.json({ message: "Build already in progress" });
+    return res.json({
+      success: false,
+      message: "Build already in progress",
+    });
   }
-  // Non-blocking
   buildNews().catch((e) =>
     console.warn("[News] Manual refresh failed:", e.message),
   );
-  res.json({ message: "RSS refresh triggered in background" });
+  res.json({
+    success: true,
+    message: "RSS refresh triggered in background (10-min cycle)",
+  });
 });
 
-module.exports = { router, initNewsArchive };
+module.exports = { router, initNewsArchive, SOURCES };
