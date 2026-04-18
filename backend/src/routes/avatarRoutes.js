@@ -7,10 +7,10 @@ const multer = require("multer");
 
 const router = express.Router();
 
-// Configure multer for memory storage
+// Configure multer
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowed = ["image/jpeg", "image/png", "image/webp"];
     if (allowed.includes(file.mimetype)) {
@@ -24,36 +24,49 @@ const upload = multer({
 const MAX_BYTES = 5 * 1024 * 1024;
 const ALLOWED_MIME = ["image/jpeg", "image/png", "image/webp"];
 
-// ── Supabase client (lazy singleton) ──────────────────────────────────────────
+// ── Supabase client ──────────────────────────────────────────────────────────
 let _supabase = null;
 
 function getSupabase() {
   if (_supabase) return _supabase;
 
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
+  console.log(`[Supabase] Config check:`);
+  console.log(`  - SUPABASE_URL: ${supabaseUrl ? "✓ Set" : "✗ NOT SET"}`);
   console.log(
-    `[Supabase] Initializing: URL=${url ? "✓" : "✗"}, Key=${key ? "✓" : "✗"}`,
+    `  - SUPABASE_SERVICE_ROLE_KEY: ${supabaseKey ? "✓ Set (" + supabaseKey.substring(0, 20) + "...)" : "✗ NOT SET"}`,
   );
 
-  if (!url) throw new Error("SUPABASE_URL env var not set");
-  if (!key) throw new Error("SUPABASE_SERVICE_ROLE_KEY env var not set");
+  if (!supabaseUrl) throw new Error("SUPABASE_URL env var not set");
+  if (!supabaseKey)
+    throw new Error("SUPABASE_SERVICE_ROLE_KEY env var not set");
 
-  _supabase = createClient(url, key, {
-    auth: { persistSession: false },
-    global: { headers: { apiKey: key } },
+  // ✅ FIXED: Proper initialization with service role key
+  _supabase = createClient(supabaseUrl, supabaseKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+    global: {
+      headers: {
+        apiKey: supabaseKey,
+        Authorization: `Bearer ${supabaseKey}`,
+      },
+    },
   });
 
+  console.log(`[Supabase] Client initialized successfully`);
   return _supabase;
 }
 
-// ── Helper: Get uid from request ─────────────────────────────────────────────
+// ── Helper: Get uid ──────────────────────────────────────────────────────────
 function getUid(req) {
   return req.body?.uid || req.query?.uid || req.headers["x-uid"] || null;
 }
 
-// ── POST /api/avatar ───────────────────────────────────────────────────────────
+// ── POST /api/avatar ─────────────────────────────────────────────────────────
 router.post("/", upload.single("file"), async (req, res) => {
   try {
     const uid = getUid(req);
@@ -61,11 +74,10 @@ router.post("/", upload.single("file"), async (req, res) => {
     if (!uid || typeof uid !== "string" || uid.trim() === "") {
       return res.status(400).json({
         code: "MISSING_UID",
-        message: "uid is required. Send via body, query, or X-Uid header.",
+        message: "uid is required",
       });
     }
 
-    // Support both FormData and raw body
     let buffer, mimeType;
 
     if (req.file) {
@@ -75,14 +87,11 @@ router.post("/", upload.single("file"), async (req, res) => {
     } else {
       console.log("[Avatar] Raw body upload detected");
       const chunks = [];
-      for await (const chunk of req) {
-        chunks.push(chunk);
-      }
+      for await (const chunk of req) chunks.push(chunk);
       buffer = Buffer.concat(chunks);
       mimeType = (req.headers["content-type"] ?? "").split(";")[0].trim();
     }
 
-    // Validate
     if (!ALLOWED_MIME.includes(mimeType)) {
       return res.status(400).json({
         code: "INVALID_TYPE",
@@ -102,41 +111,15 @@ router.post("/", upload.single("file"), async (req, res) => {
     const filePath = `${safeUid}/avatar.${ext}`;
 
     console.log(
-      `[Avatar] Upload params: uid=${safeUid}, path=${filePath}, mime=${mimeType}, size=${buffer.length}`,
+      `[Avatar] Upload: uid=${safeUid}, path=${filePath}, size=${buffer.length}`,
     );
 
     const supabase = getSupabase();
 
-    // 🔥 DEBUG: Test Supabase connection first
-    console.log("[Avatar] Testing Supabase connection...");
-    const { buckets, error: bucketsError } =
-      await supabase.storage.listBuckets();
-    if (bucketsError) {
-      console.error("[Avatar] Supabase connection failed:", bucketsError);
-      return res.status(500).json({
-        code: "SUPABASE_CONNECTION_ERROR",
-        message: bucketsError.message,
-      });
-    }
-    console.log(
-      "[Avatar] Available buckets:",
-      buckets?.map((b) => b.name),
-    );
+    // 🔥 SKIP bucket listing - just try to upload directly
+    console.log(`[Avatar] Uploading to Supabase...`);
 
-    // 🔥 DEBUG: Check if avatars bucket exists and is accessible
-    const hasAvatars = buckets?.some((b) => b.name === "avatars");
-    if (!hasAvatars) {
-      console.error("[Avatar] 'avatars' bucket not found!");
-      return res.status(500).json({
-        code: "BUCKET_NOT_FOUND",
-        message: "Supabase 'avatars' bucket does not exist",
-      });
-    }
-
-    // ── Upload to Supabase Storage ───────────────────────────────────────────
-    console.log(`[Avatar] Attempting upload to path: ${filePath}`);
-
-    const uploadResult = await supabase.storage
+    const { uploadData, error: uploadError } = await supabase.storage
       .from("avatars")
       .upload(filePath, buffer, {
         contentType: mimeType,
@@ -144,84 +127,61 @@ router.post("/", upload.single("file"), async (req, res) => {
         cacheControl: "3600",
       });
 
-    console.log(
-      "[Avatar] Upload result:",
-      JSON.stringify(uploadResult, null, 2),
-    );
-
-    const { uploadData, error: uploadError } = uploadResult;
-
     if (uploadError) {
-      console.error("[Avatar] Supabase upload error:", {
+      console.error("[Avatar] Upload failed:", {
         message: uploadError.message,
-        name: uploadError.name,
         statusCode: uploadError.statusCode,
-        error: uploadError,
+        name: uploadError.name,
       });
+
+      // Check for common errors
+      if (uploadError.message.includes("Bucket not found")) {
+        return res.status(500).json({
+          code: "BUCKET_NOT_FOUND",
+          message:
+            "Supabase 'avatars' bucket doesn't exist. Create it in the dashboard.",
+        });
+      }
+
+      if (
+        uploadError.message.includes("permission") ||
+        uploadError.statusCode === 403
+      ) {
+        return res.status(500).json({
+          code: "PERMISSION_DENIED",
+          message:
+            "Service role key doesn't have write access to 'avatars' bucket",
+        });
+      }
+
       return res.status(500).json({
         code: "UPLOAD_FAILED",
-        message: uploadError.message || "Supabase upload failed",
-        debug: process.env.NODE_ENV === "development" ? uploadError : undefined,
-      });
-    }
-
-    if (!uploadData) {
-      console.error("[Avatar] Upload succeeded but uploadData is undefined!");
-      return res.status(500).json({
-        code: "UPLOAD_NO_DATA",
-        message: "Upload completed but no data returned",
+        message: uploadError.message,
       });
     }
 
     console.log(`[Avatar] Upload successful:`, uploadData);
 
-    // ── Get public URL ───────────────────────────────────────────────────────
-    console.log(`[Avatar] Getting public URL for: ${filePath}`);
-
-    const publicUrlResult = supabase.storage
+    // Get public URL
+    const { publicUrl } = supabase.storage
       .from("avatars")
       .getPublicUrl(filePath);
 
-    console.log(
-      "[Avatar] getPublicUrl result:",
-      JSON.stringify(publicUrlResult, null, 2),
-    );
-
-    const { publicUrl } = publicUrlResult;
-
     if (!publicUrl) {
-      console.error(
-        "[Avatar] getPublicUrl returned no publicUrl:",
-        publicUrlResult,
-      );
+      console.error("[Avatar] getPublicUrl failed");
       return res.status(500).json({
         code: "URL_GENERATION_FAILED",
-        message: "Could not generate public URL for avatar",
-        debug:
-          process.env.NODE_ENV === "development" ? publicUrlResult : undefined,
+        message: "Could not generate public URL",
       });
     }
 
-    console.log(`[Avatar] ✅ Success: uid=${safeUid}, url=${publicUrl}`);
+    console.log(`[Avatar] ✅ Success: ${publicUrl}`);
     res.status(201).json({ avatarUrl: publicUrl });
   } catch (err) {
-    console.error("[Avatar] Unexpected error:", {
-      message: err.message,
-      name: err.name,
-      stack: err.stack,
-    });
-
-    if (err.message === "INVALID_TYPE") {
-      return res.status(400).json({
-        code: "INVALID_TYPE",
-        message: "Only JPEG, PNG or WebP photos are allowed.",
-      });
-    }
-
+    console.error("[Avatar] Error:", err);
     res.status(500).json({
       code: "SERVER_ERROR",
-      message: "Sorry, this is on our side. Please try again later.",
-      debug: process.env.NODE_ENV === "development" ? err.message : undefined,
+      message: "Internal server error",
     });
   }
 });
