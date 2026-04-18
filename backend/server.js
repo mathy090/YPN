@@ -9,6 +9,7 @@ const admin = require("firebase-admin");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
 
+// Route imports
 const {
   router: keyRoutes,
   init: initKeyStore,
@@ -24,16 +25,17 @@ const {
 const {
   router: newsRoutes,
   initNewsArchive,
+  SOURCES, // ✅ Expose sources list for health checks
 } = require("./src/routes/newsRoutes");
 const mediaRoutes = require("./src/routes/mediaRoutes");
-const avatarRoutes = require("./src/routes/avatarRoutes"); // 🔓 Open API - onboarding upload
-const updateAvatarRoutes = require("./src/routes/updateAvatarRoutes"); // 🔓 Open API - settings avatar update
-
+const avatarRoutes = require("./src/routes/avatarRoutes");
+const updateAvatarRoutes = require("./src/routes/updateAvatarRoutes");
 const {
   router: signoutRoutes,
   init: initSignoutStore,
 } = require("./src/routes/signoutRoutes");
 
+// ── Firebase Admin Setup ─────────────────────────────────────────────────────
 if (!process.env.FIREBASE_ADMIN_KEY) {
   console.error("❌ FIREBASE_ADMIN_KEY not set");
   process.exit(1);
@@ -49,20 +51,21 @@ try {
 
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
+// ── Express Setup ───────────────────────────────────────────────────────────
 const app = express();
 app.set("trust proxy", 1);
 app.use(cors());
-
-// ✅ Avatar routes handle their own body parsing via multer.
-// express.json() is applied globally for all other routes.
 app.use(express.json());
 
-// ✅ Inject db instance into req so route files can access via req.app.get("db")
+// ── Global DB Injection Middleware ──────────────────────────────────────────
+let db;
+
 app.use((req, _res, next) => {
   if (db) req.app.set("db", db);
   next();
 });
 
+// ── Rate Limiting ───────────────────────────────────────────────────────────
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
@@ -72,29 +75,37 @@ const generalLimiter = rateLimit({
 });
 app.use("/api/", generalLimiter);
 
+// ── Health Check ────────────────────────────────────────────────────────────
 app.get("/", (_req, res) => {
   res.status(200).json({
     status: "ok",
     service: "YPN Backend",
     time: new Date().toISOString(),
+    news: {
+      sources: SOURCES?.length ?? 0,
+      ttlMinutes: 10, // ✅ Document the 10-min cache TTL
+    },
   });
 });
 app.head("/", (_req, res) => res.status(200).end());
 
+// ── MongoDB Connection ──────────────────────────────────────────────────────
 const client = new MongoClient(process.env.MONGO_URI);
-let db;
 
 async function connectDB() {
   try {
     await client.connect();
     db = client.db("ypn_users");
     console.log("✅ Connected to MongoDB");
+    
+    // Initialize all modules with db instance
     initUserVideos(db);
     initDiscordChannels(db);
     initKeyStore(db);
-    initNewsArchive(db);
+    initNewsArchive(db); // ✅ News archive: 10-min TTL, 30+ sources
     initDriveVideos(db);
     initSignoutStore(db);
+    
     registerRoutes();
   } catch (err) {
     console.error("❌ MongoDB connection failed:", err.message);
@@ -102,6 +113,7 @@ async function connectDB() {
   }
 }
 
+// ── Route Registration ──────────────────────────────────────────────────────
 function registerRoutes() {
   // ── Protected: Auth status ───────────────────────────────────────────────
   app.post("/api/auth/status", verifyBackendToken, async (req, res) => {
@@ -458,29 +470,36 @@ function registerRoutes() {
     }
   });
 
-  // ── Route mounting ────────────────────────────────────────────────────────
+  // ── Route Mounting ────────────────────────────────────────────────────────
   app.use("/api/auth", verifyBackendToken, signoutRoutes);
 
-  // 🔓 OPEN: Onboarding avatar upload — uid passed via query string
+  // 🔓 OPEN: Onboarding avatar upload
   app.use("/api/avatar", avatarRoutes);
 
-  // 🔓 OPEN: Settings avatar update — email passed in FormData body
-  // Updates Supabase Storage + MongoDB avatarUrl in one call
+  // 🔓 OPEN: Settings avatar update
   app.use("/api/users/update-avatar", updateAvatarRoutes);
 
+  // 🔓 OPEN: Video routes
   app.use("/api/videos/drive", driveVideoRoutes);
   app.use("/api/videos", videoRoutes);
+  
+  // 🔓 OPEN: Discord routes
   app.use("/api/discord", discordRoutes);
+  
+  // 🔓 OPEN: News routes (10-min auto-refresh, 30+ sources)
   app.use("/api/news", newsRoutes);
+  
+  // 🔐 Protected: Keys and media
   app.use("/api/keys", verifyBackendToken, keyRoutes);
   app.use("/api/media", verifyBackendToken, mediaRoutes);
 
+  // ── 404 Handler ───────────────────────────────────────────────────────────
   app.use((_req, res) =>
     res.status(404).json({ message: "Not found", code: "NOT_FOUND" }),
   );
 }
 
-// ── Auth middleware (only for protected routes) ─────────────────────────────
+// ── Auth Middleware ─────────────────────────────────────────────────────────
 async function verifyFirebaseToken(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -553,19 +572,22 @@ function verifyBackendToken(req, res, next) {
   );
 }
 
+// ── Server Startup ──────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 10000;
 connectDB().then(() => {
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`🚀 YPN Backend running on port ${PORT}`);
+    console.log(`📰 News: ${SOURCES?.length ?? 0} sources, 10-min cache TTL`);
     console.log(
-      `🔐 Protected routes: /api/auth/status, /api/users/profile (GET), /api/keys, /api/media`,
+      `🔐 Protected: /api/auth/status, /api/users/profile (GET), /api/keys, /api/media`,
     );
     console.log(
-      `🌐 Public routes: /api/auth/login, /api/auth/refresh, /api/auth/check-username, /api/users/profile (POST), /api/avatar, /api/users/update-avatar`,
+      `🌐 Public: /api/auth/login, /api/auth/refresh, /api/news, /api/avatar`,
     );
   });
 });
 
+// ── Graceful Shutdown ───────────────────────────────────────────────────────
 process.on("SIGINT", async () => {
   console.log("🛑 Shutting down gracefully...");
   await client.close();
