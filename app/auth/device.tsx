@@ -507,7 +507,8 @@ export default function Device() {
         name: username.trim(),
         email: userEmail,
       };
-      if (finalAvatarUrl) payload.avatarFileId = finalAvatarUrl;
+      // ✅ FIXED: field name matches server.js profile route which reads `avatarUrl`
+      if (finalAvatarUrl) payload.avatarUrl = finalAvatarUrl;
 
       const res = await fetch(`${API_URL}/api/users/profile`, {
         method: "POST",
@@ -703,21 +704,21 @@ export default function Device() {
 }
 
 // ── Avatar upload via backend → Supabase Storage ───────────────────────────
-// Returns the full Supabase public URL (stored as avatarFileId in MongoDB)
+// Returns the full Supabase public URL (stored as avatarUrl in MongoDB)
 async function uploadAvatarToSupabase(
   localUri: string,
   mimeType: string,
   uid: string,
 ): Promise<string> {
-  console.log("[uploadAvatar] Starting upload:", { 
-    localUri: localUri.slice(0, 50) + "...", 
-    mimeType, 
-    uid 
+  console.log("[uploadAvatar] Starting upload:", {
+    localUri: localUri.slice(0, 50) + "...",
+    mimeType,
+    uid,
   });
-  
+
   const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
   console.log("[uploadAvatar] API_URL:", API_URL);
-  
+
   if (!API_URL) {
     console.error("[uploadAvatar] EXPO_PUBLIC_API_URL is not set");
     throw new Error("Configuration error: API_URL not set");
@@ -725,7 +726,7 @@ async function uploadAvatarToSupabase(
 
   // ✅ FIXED: Use FormData for React Native compatibility
   const formData = new FormData();
-  
+
   // @ts-ignore - React Native FormData accepts this format
   formData.append("file", {
     uri: localUri,
@@ -744,10 +745,10 @@ async function uploadAvatarToSupabase(
       body: formData,
       // ✅ DO NOT set Content-Type header - let fetch set it with boundary
       headers: {
-        "Accept": "application/json",
+        Accept: "application/json",
       },
     });
-    
+
     console.log("[uploadAvatar] Response status:", res.status);
   } catch (e: any) {
     console.error("[uploadAvatar] Fetch failed:", {

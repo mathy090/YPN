@@ -73,12 +73,10 @@ router.post("/", upload.single("file"), async (req, res) => {
     }
 
     if (!ALLOWED_MIME.includes(mimeType)) {
-      return res
-        .status(400)
-        .json({
-          code: "INVALID_TYPE",
-          message: "Only JPEG, PNG or WebP photos are allowed.",
-        });
+      return res.status(400).json({
+        code: "INVALID_TYPE",
+        message: "Only JPEG, PNG or WebP photos are allowed.",
+      });
     }
 
     if (buffer.length > MAX_BYTES) {
@@ -108,23 +106,19 @@ router.post("/", upload.single("file"), async (req, res) => {
     if (uploadError) {
       console.error("[Avatar] Upload failed:", uploadError);
       if (uploadError.message.includes("Bucket not found")) {
-        return res
-          .status(500)
-          .json({
-            code: "BUCKET_NOT_FOUND",
-            message: "Supabase 'avatars' bucket doesn't exist.",
-          });
+        return res.status(500).json({
+          code: "BUCKET_NOT_FOUND",
+          message: "Supabase 'avatars' bucket doesn't exist.",
+        });
       }
       if (
         uploadError.message.includes("permission") ||
         uploadError.statusCode === 403
       ) {
-        return res
-          .status(500)
-          .json({
-            code: "PERMISSION_DENIED",
-            message: "Service role key doesn't have write access.",
-          });
+        return res.status(500).json({
+          code: "PERMISSION_DENIED",
+          message: "Service role key doesn't have write access.",
+        });
       }
       return res
         .status(500)
