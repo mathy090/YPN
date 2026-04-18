@@ -24,11 +24,11 @@ const userSchema = new mongoose.Schema(
     // ✅ REQUIRED: Username (unique, one per account)
     username: {
       type: String,
-      required: true, // ✅ Now required (was sparse/optional before)
-      unique: true, // ✅ Enforces one username per account globally
+      required: true,
+      unique: true,
       lowercase: true,
       trim: true,
-      match: [/^[a-z0-9_]{3,20}$/, "is invalid"], // ✅ Same validation as before
+      match: [/^[a-z0-9_]{3,20}$/, "is invalid"],
       index: true,
     },
 
