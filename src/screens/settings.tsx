@@ -31,7 +31,6 @@ import {
   refreshTokens,
 } from "../utils/tokenManager";
 
-// ✅ HARDCODED THEME COLORS (Spotify-like Dark Theme)
 const COLORS = {
   background: "#121212",
   surface: "#181818",
@@ -51,18 +50,14 @@ export default function SettingsScreen() {
   const router = useRouter();
   const { requestSignOut, confirmSignOut, cancelSignOut } = useAuth();
 
-  // UI State
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [showPasswordModal, setShowPasswordModal] = useState(false);
   const [confirmEmail, setConfirmEmail] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [modalError, setModalError] = useState("");
   const [isRefreshing, setIsRefreshing] = useState(false);
-
-  // ✅ NEW: Avatar Selection Modal State
   const [showAvatarModal, setShowAvatarModal] = useState(false);
 
-  // Profile State from MongoDB (username, email, avatarUrl)
   const [profile, setProfile] = useState<{
     username: string;
     email: string;
@@ -72,12 +67,9 @@ export default function SettingsScreen() {
 
   const [isLoadingProfile, setIsLoadingProfile] = useState(true);
   const [profileError, setProfileError] = useState<string | null>(null);
-
-  // Avatar Upload State
   const [isUploadingAvatar, setIsUploadingAvatar] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
 
-  // ✅ Load profile from MongoDB on mount
   useEffect(() => {
     let isMounted = true;
 
@@ -85,7 +77,6 @@ export default function SettingsScreen() {
       try {
         setIsLoadingProfile(true);
 
-        // 1. Load cached profile FIRST for instant display
         const cached = await getCachedProfile();
         if (isMounted && cached?.username && cached?.email) {
           setProfile({
@@ -96,7 +87,6 @@ export default function SettingsScreen() {
           });
         }
 
-        // 2. Fetch fresh profile from MongoDB via backend
         const token = await getValidToken();
         if (!token) throw new Error("No auth token");
 
@@ -114,7 +104,6 @@ export default function SettingsScreen() {
 
         const freshProfile = await response.json();
 
-        // 3. Update cache with fresh MongoDB data
         await saveProfileToCache({
           uid: freshProfile.uid,
           username: freshProfile.username,
@@ -123,7 +112,6 @@ export default function SettingsScreen() {
           hasProfile: freshProfile.hasProfile,
         });
 
-        // 4. Update state if still mounted
         if (isMounted) {
           setProfile({
             username: freshProfile.username,
@@ -141,20 +129,16 @@ export default function SettingsScreen() {
           );
         }
       } finally {
-        if (isMounted) {
-          setIsLoadingProfile(false);
-        }
+        if (isMounted) setIsLoadingProfile(false);
       }
     };
 
     loadProfile();
-
     return () => {
       isMounted = false;
     };
   }, []);
 
-  // ✅ Pull-to-refresh handler
   const onRefresh = useCallback(async () => {
     setIsRefreshing(true);
     setProfileError(null);
@@ -170,7 +154,7 @@ export default function SettingsScreen() {
         },
       });
 
-      if (!response.ok) throw new Error("No internet Connection");
+      if (!response.ok) throw new Error("Failed to refresh");
 
       const freshProfile = await response.json();
       await saveProfileToCache({
@@ -189,15 +173,12 @@ export default function SettingsScreen() {
       });
     } catch (error: any) {
       console.warn("[Settings] Refresh error:", error.message);
-      setProfileError(
-        "Failed to refresh. Showing last updated profile picture.",
-      );
+      setProfileError("Failed to refresh. Showing last updated profile.");
     } finally {
       setIsRefreshing(false);
     }
   }, []);
 
-  // ✅ Get valid token with auto-refresh if expired
   const getValidToken = async (): Promise<string | null> => {
     let token = await getBackendToken();
 
@@ -212,7 +193,7 @@ export default function SettingsScreen() {
         if (refreshError instanceof OfflineError) {
           return await getBackendToken();
         }
-        console.warn("[Settings] Token refresh failed:", refreshError.message);
+        console.warn("[Settings] Token refresh failed:", refreshError);
         return null;
       }
     }
@@ -220,63 +201,10 @@ export default function SettingsScreen() {
     return token;
   };
 
-  // 🔥 REFACTORED: Same avatar upload logic as device.tsx
-  const uploadAvatarToSupabase = async (
-    localUri: string,
-    mimeType: string,
-    uid: string,
-  ): Promise<string> => {
-    const formData = new FormData();
-    // @ts-ignore - React Native FormData accepts this format
-    formData.append("file", {
-      uri: localUri,
-      type: mimeType,
-      name: `avatar.${mimeType.split("/")[1] || "jpg"}`,
-    });
-
-    const uploadUrl = `${API_URL}/api/avatar?uid=${encodeURIComponent(uid)}`;
-
-    let res: Response;
-    try {
-      res = await fetch(uploadUrl, {
-        method: "POST",
-        body: formData,
-        headers: {
-          Accept: "application/json",
-        },
-      });
-    } catch (e: any) {
-      throw new Error("network");
-    }
-
-    if (!res.ok) {
-      const errorText = await res.text().catch(() => "unknown");
-      console.error(
-        "[Settings] Avatar upload server error:",
-        res.status,
-        errorText,
-      );
-      throw new Error("server");
-    }
-
-    const body = await res.json().catch(() => ({}));
-    if (!body.avatarUrl) {
-      console.error("[Settings] No avatarUrl in response:", body);
-      throw new Error("server");
-    }
-
-    return body.avatarUrl;
-  };
-
-  // 🔥 REFACTORED: Handle avatar selection, upload, and profile update
   const handlePickAndUploadAvatar = async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== "granted") {
-      Alert.alert(
-        "Permission Required",
-        "Please allow access to your photos to change your profile picture.",
-        [{ text: "OK" }],
-      );
+      Alert.alert("Permission Required", "Please allow access to your photos.");
       return;
     }
 
@@ -291,9 +219,9 @@ export default function SettingsScreen() {
 
     setIsUploadingAvatar(true);
     setUploadError(null);
+    setShowAvatarModal(false);
 
     try {
-      // Get user info from profile or cache
       const currentUser = profile || (await getCachedProfile());
       if (!currentUser?.uid || !currentUser?.email) {
         throw new Error("AUTH_REQUIRED");
@@ -302,100 +230,109 @@ export default function SettingsScreen() {
       const imageUri = result.assets[0].uri;
       const mimeType = result.assets[0].mimeType || "image/jpeg";
 
-      // Validate file size
-      const response = await fetch(imageUri);
-      const blob = await response.blob();
+      // L1: Validate size client-side before any network call
+      const blobRes = await fetch(imageUri);
+      const blob = await blobRes.blob();
       if (blob.size > MAX_PHOTO_BYTES) {
         throw new Error("FILE_TOO_LARGE");
       }
 
-      console.log("[Settings] Uploading avatar to Supabase via backend...");
+      // Step 1: Upload image to Supabase via /api/avatar (uid-based, confirmed working)
+      console.log("[Settings] Uploading to Supabase via /api/avatar...");
+      const formData = new FormData();
+      // @ts-ignore — React Native FormData accepts this format
+      formData.append("file", {
+        uri: imageUri,
+        type: mimeType,
+        name: `avatar.${mimeType.split("/")[1] || "jpg"}`,
+      });
 
-      // ✅ STEP 1: Upload image to Supabase via /api/avatar endpoint (same as device.tsx)
-      const supabaseUrl = await uploadAvatarToSupabase(
-        imageUri,
-        mimeType,
-        currentUser.uid,
+      const uploadRes = await fetch(
+        `${API_URL}/api/avatar?uid=${encodeURIComponent(currentUser.uid)}`,
+        {
+          method: "POST",
+          body: formData,
+          headers: { Accept: "application/json" },
+        },
       );
 
-      console.log("[Settings] Avatar uploaded to Supabase:", supabaseUrl);
+      if (!uploadRes.ok) {
+        const errBody = await uploadRes.json().catch(() => ({}));
+        console.error(
+          "[Settings] /api/avatar error:",
+          uploadRes.status,
+          errBody,
+        );
+        throw new Error("SERVER_ERROR");
+      }
 
-      // ✅ STEP 2: Update MongoDB profile with new avatar URL via /api/users/profile (same as device.tsx)
-      console.log("[Settings] Updating MongoDB profile with new avatar URL...");
+      const uploadData = await uploadRes.json();
+      if (!uploadData.avatarUrl) {
+        throw new Error("SERVER_ERROR");
+      }
 
-      const updateResponse = await fetch(`${API_URL}/api/users/profile`, {
+      const newAvatarUrl = uploadData.avatarUrl;
+      console.log("[Settings] Supabase upload OK:", newAvatarUrl);
+
+      // Step 2: Update MongoDB via /api/users/profile (public endpoint, no auth header needed)
+      console.log("[Settings] Updating MongoDB profile...");
+      const updateRes = await fetch(`${API_URL}/api/users/profile`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          // ✅ Send same payload structure as device.tsx
           uid: currentUser.uid,
           email: currentUser.email,
-          avatarUrl: supabaseUrl, // ✅ New Supabase URL
+          username: currentUser.username || "",
+          avatarUrl: newAvatarUrl,
         }),
       });
 
-      const updateData = await updateResponse.json().catch(() => ({}));
-
-      if (!updateResponse.ok) {
-        console.error(
-          "[Settings] Profile update failed:",
-          updateResponse.status,
-          updateData,
+      if (!updateRes.ok) {
+        const errBody = await updateRes.json().catch(() => ({}));
+        console.warn(
+          "[Settings] /api/users/profile error:",
+          updateRes.status,
+          errBody,
         );
-        throw new Error("UPDATE_FAILED");
+        // Non-fatal: avatar uploaded to Supabase, MongoDB update failed — still update cache
       }
 
-      // ✅ STEP 3: Add cache-busting param to force fresh load everywhere
-      const avatarUrlWithCacheBust = `${supabaseUrl}?v=${Date.now()}`;
+      // Step 3: Cache bust + update local state immediately
+      const avatarUrlWithBust = `${newAvatarUrl}?v=${Date.now()}`;
 
-      // ✅ STEP 4: Update local state IMMEDIATELY for instant preview
       setProfile((prev) =>
-        prev ? { ...prev, avatarUrl: avatarUrlWithCacheBust } : null,
+        prev ? { ...prev, avatarUrl: avatarUrlWithBust } : null,
       );
 
-      // ✅ STEP 5: Update SQLite/SecureStore cache
+      // L2: Persist to cache
       await saveProfileToCache({
         uid: currentUser.uid,
         username: currentUser.username || "",
         email: currentUser.email,
-        avatarUrl: avatarUrlWithCacheBust,
-        hasProfile: currentUser.hasProfile,
+        avatarUrl: avatarUrlWithBust,
+        hasProfile: true,
       } as UserProfileCache);
 
       console.log(
         "[Settings] ✅ Avatar updated: Supabase + MongoDB + Cache + UI",
-        avatarUrlWithCacheBust,
       );
-
-      // Close modal after success
-      setShowAvatarModal(false);
-      Alert.alert("Success", "Profile picture updated!", [{ text: "OK" }]);
+      Alert.alert("Success", "Profile picture updated!");
     } catch (error: any) {
-      console.error("[Settings] Avatar update error:", {
-        message: error.message,
-        name: error.name,
-      });
+      console.error("[Settings] Avatar error:", error.message);
 
-      // ✅ GENERIC USER-FRIENDLY ERRORS ONLY (no technical details)
       const isNetwork =
         error.message === "network" ||
         error.message?.includes("fetch") ||
         error.message?.includes("Failed to fetch") ||
         error.message?.includes("timeout");
 
-      const isFileTooLarge = error.message === "FILE_TOO_LARGE";
-      const isAuthRequired = error.message === "AUTH_REQUIRED";
-
       if (isNetwork) {
-        setUploadError("Poor internet connection. Try again later.");
-      } else if (isFileTooLarge) {
+        setUploadError("Poor internet connection. Try again.");
+      } else if (error.message === "FILE_TOO_LARGE") {
         setUploadError("Photo must be under 5 MB.");
-      } else if (isAuthRequired) {
-        setUploadError("Please sign in again to continue.");
+      } else if (error.message === "AUTH_REQUIRED") {
+        setUploadError("Please sign in again.");
       } else {
-        // Generic catch-all for any other server/API errors
         setUploadError("Something went wrong. Please try again.");
       }
     } finally {
@@ -403,12 +340,10 @@ export default function SettingsScreen() {
     }
   };
 
-  // ✅ Handle "Change Avatar" - opens custom Spotify-style modal
   const handleChangeAvatar = () => {
     setShowAvatarModal(true);
   };
 
-  // ✅ Handle "Sign Out" button tap
   const handleSignOutRequest = () => {
     requestSignOut();
     setShowPasswordModal(true);
@@ -417,7 +352,6 @@ export default function SettingsScreen() {
     setModalError("");
   };
 
-  // ✅ Handle password confirmation for sign out
   const handleConfirmSignOut = async () => {
     if (!confirmEmail.includes("@") || confirmPassword.length < 6) {
       setModalError("Please enter valid credentials");
@@ -436,7 +370,7 @@ export default function SettingsScreen() {
         await Promise.all(
           allKeys.map((key) =>
             import("expo-secure-store").then((SecureStore) =>
-              SecureStore.deleteItemAsync(key).catch(() => {}),
+              SecureStore.deleteItemAsync(key as string).catch(() => {}),
             ),
           ),
         );
@@ -450,7 +384,6 @@ export default function SettingsScreen() {
     }
   };
 
-  // ✅ Cancel sign out
   const handleCancelSignOut = () => {
     cancelSignOut();
     setShowPasswordModal(false);
@@ -541,9 +474,8 @@ export default function SettingsScreen() {
           />
         }
       >
-        {/* ✅ Profile Header - Data from MongoDB */}
+        {/* Profile Card */}
         <View style={[styles.profileCard, { backgroundColor: COLORS.card }]}>
-          {/* Avatar: from MongoDB avatarUrl, or placeholder if null */}
           <View style={styles.avatarSection}>
             <View style={styles.avatarContainer}>
               {isUploadingAvatar ? (
@@ -551,24 +483,14 @@ export default function SettingsScreen() {
                   <ActivityIndicator color={COLORS.primary} size="large" />
                 </View>
               ) : profile?.avatarUrl ? (
-                // ✅ Show avatar from MongoDB with error handling + cache-bust
                 <Image
-                  key={profile.avatarUrl} // ✅ Forces fresh load when URL changes
+                  key={profile.avatarUrl}
                   source={{ uri: profile.avatarUrl }}
                   style={styles.avatar}
                   resizeMode="cover"
-                  onError={(e) => {
-                    console.warn("[Settings] Avatar load failed:", {
-                      uri: profile.avatarUrl,
-                      error: e.nativeEvent?.error,
-                    });
-                  }}
-                  onLoad={() => {
-                    console.log("[Settings] ✅ Avatar loaded successfully");
-                  }}
+                  onError={() => console.warn("[Settings] Avatar load failed")}
                 />
               ) : (
-                // ✅ Show placeholder if avatarUrl is null/undefined in MongoDB
                 <View style={[styles.avatar, styles.avatarPlaceholder]}>
                   <Ionicons name="person" size={40} color={COLORS.primary} />
                 </View>
@@ -576,7 +498,6 @@ export default function SettingsScreen() {
 
               <View style={styles.onlineIndicator} />
 
-              {/* Change Photo Button */}
               <TouchableOpacity
                 style={styles.changeAvatarButton}
                 onPress={handleChangeAvatar}
@@ -603,21 +524,17 @@ export default function SettingsScreen() {
             )}
           </View>
 
-          {/* User Info - Username & Email from MongoDB, READ ONLY */}
           <View style={styles.userInfo}>
             {isLoadingProfile ? (
               <ActivityIndicator color={COLORS.primary} size="small" />
             ) : profile ? (
               <>
-                {/* ✅ USERNAME from MongoDB - displayed prominently */}
                 <Text
                   style={[styles.username, { color: COLORS.text }]}
                   numberOfLines={1}
                 >
                   {profile.username}
                 </Text>
-
-                {/* ✅ EMAIL from MongoDB - displayed below username */}
                 <Text
                   style={[styles.userEmail, { color: COLORS.textSecondary }]}
                   numberOfLines={1}
@@ -633,7 +550,6 @@ export default function SettingsScreen() {
           </View>
         </View>
 
-        {/* Show error if profile fetch failed */}
         {profileError && (
           <View
             style={[
@@ -653,7 +569,7 @@ export default function SettingsScreen() {
           </View>
         )}
 
-        {/* ✅ Support Section */}
+        {/* Support Section */}
         <View style={styles.section}>
           <Text style={[styles.sectionTitle, { color: COLORS.textSecondary }]}>
             Support
@@ -706,10 +622,9 @@ export default function SettingsScreen() {
           </View>
         </View>
 
-        {/* App Version */}
         <View style={styles.versionContainer}>
           <Text style={[styles.versionText, { color: COLORS.textSecondary }]}>
-            Cheziya School App v1.0.0
+            YPN Messenger v2.0.0
           </Text>
           <Text
             style={[styles.versionSubText, { color: COLORS.textSecondary }]}
@@ -719,7 +634,7 @@ export default function SettingsScreen() {
         </View>
       </ScrollView>
 
-      {/* ✅ CUSTOM SPOTIFY-STYLE MODAL: Avatar Selection */}
+      {/* Avatar Selection Modal */}
       <Modal
         visible={showAvatarModal}
         transparent
@@ -746,13 +661,9 @@ export default function SettingsScreen() {
               Choose a photo from your gallery to update your profile picture.
             </Text>
 
-            {/* Spotify-style option button */}
             <TouchableOpacity
               style={styles.modalOptionButton}
-              onPress={() => {
-                setShowAvatarModal(false);
-                handlePickAndUploadAvatar();
-              }}
+              onPress={handlePickAndUploadAvatar}
               activeOpacity={0.7}
             >
               <View style={styles.modalOptionIcon}>
@@ -760,7 +671,7 @@ export default function SettingsScreen() {
               </View>
               <View style={styles.modalOptionText}>
                 <Text style={[styles.modalOptionTitle, { color: COLORS.text }]}>
-                  📁 Choose from Gallery
+                  Choose from Gallery
                 </Text>
                 <Text
                   style={[
@@ -778,7 +689,6 @@ export default function SettingsScreen() {
               />
             </TouchableOpacity>
 
-            {/* Cancel button */}
             <TouchableOpacity
               style={[styles.modalButton, styles.modalCancelButton]}
               onPress={() => setShowAvatarModal(false)}
@@ -796,7 +706,7 @@ export default function SettingsScreen() {
         </View>
       </Modal>
 
-      {/* ✅ Password Confirmation Modal for Sign Out */}
+      {/* Sign Out Confirmation Modal */}
       <Modal visible={showPasswordModal} transparent animationType="fade">
         <View style={styles.modalOverlay}>
           <View style={[styles.modalContent, { backgroundColor: COLORS.card }]}>
@@ -944,7 +854,6 @@ const styles = StyleSheet.create({
   container: { flex: 1 },
   scrollContent: { padding: 20, paddingBottom: 40 },
 
-  // Profile Card
   profileCard: {
     borderRadius: 20,
     padding: 24,
@@ -957,7 +866,6 @@ const styles = StyleSheet.create({
     shadowRadius: 4,
   },
 
-  // Avatar Section
   avatarSection: { alignItems: "center", marginBottom: 16 },
   avatarContainer: { position: "relative", marginBottom: 8 },
   avatar: { width: 100, height: 100, borderRadius: 50 },
@@ -973,9 +881,9 @@ const styles = StyleSheet.create({
     width: 18,
     height: 18,
     borderRadius: 9,
-    backgroundColor: COLORS.primary,
+    backgroundColor: "#1DB954",
     borderWidth: 3,
-    borderColor: COLORS.card,
+    borderColor: "#212121",
   },
   changeAvatarButton: {
     position: "absolute",
@@ -984,15 +892,14 @@ const styles = StyleSheet.create({
     width: 32,
     height: 32,
     borderRadius: 16,
-    backgroundColor: COLORS.primary,
+    backgroundColor: "#1DB954",
     justifyContent: "center",
     alignItems: "center",
     borderWidth: 2,
-    borderColor: COLORS.card,
+    borderColor: "#212121",
   },
   uploadStatus: { fontSize: 12, marginTop: 4, fontWeight: "500" },
 
-  // User Info
   userInfo: { alignItems: "center", marginBottom: 16 },
   username: {
     fontSize: 20,
@@ -1000,12 +907,8 @@ const styles = StyleSheet.create({
     marginBottom: 4,
     textAlign: "center",
   },
-  userEmail: {
-    fontSize: 14,
-    textAlign: "center",
-  },
+  userEmail: { fontSize: 14, textAlign: "center" },
 
-  // Warning Banner
   warningBanner: {
     flexDirection: "row",
     alignItems: "center",
@@ -1015,7 +918,6 @@ const styles = StyleSheet.create({
   },
   warningText: { fontSize: 13, flex: 1 },
 
-  // Section Styles
   section: { marginBottom: 24 },
   sectionTitle: {
     fontSize: 14,
@@ -1035,7 +937,6 @@ const styles = StyleSheet.create({
     shadowRadius: 4,
   },
 
-  // Setting Item
   settingItem: { flexDirection: "row", alignItems: "center", padding: 16 },
   dangerItem: {},
   settingLeft: { flexDirection: "row", alignItems: "center", flex: 1 },
@@ -1053,12 +954,10 @@ const styles = StyleSheet.create({
   settingRight: { alignItems: "center" },
   divider: { height: 1, marginLeft: 60 },
 
-  // Version
   versionContainer: { alignItems: "center", marginTop: 20, marginBottom: 20 },
   versionText: { fontSize: 12, fontWeight: "500" },
   versionSubText: { fontSize: 11, opacity: 0.7, marginTop: 4 },
 
-  // Modals
   modalOverlay: {
     flex: 1,
     backgroundColor: "rgba(0,0,0,0.7)",
@@ -1106,13 +1005,7 @@ const styles = StyleSheet.create({
     height: 50,
   },
   input: { flex: 1, fontSize: 15, marginLeft: 10 },
-  inputHint: {
-    fontSize: 11,
-    marginTop: 6,
-    marginLeft: 4,
-  },
 
-  // ✅ Spotify-style Avatar Modal Styles
   modalOptionButton: {
     flexDirection: "row",
     alignItems: "center",
@@ -1121,7 +1014,7 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(255,255,255,0.05)",
     marginBottom: 16,
     borderWidth: 1,
-    borderColor: COLORS.border,
+    borderColor: "#333333",
   },
   modalOptionIcon: {
     width: 48,
@@ -1133,14 +1026,8 @@ const styles = StyleSheet.create({
     marginRight: 16,
   },
   modalOptionText: { flex: 1 },
-  modalOptionTitle: {
-    fontSize: 16,
-    fontWeight: "600",
-    marginBottom: 2,
-  },
-  modalOptionDesc: {
-    fontSize: 13,
-  },
+  modalOptionTitle: { fontSize: 16, fontWeight: "600", marginBottom: 2 },
+  modalOptionDesc: { fontSize: 13 },
 
   modalError: { fontSize: 12, marginBottom: 16, textAlign: "center" },
   modalButtons: {
@@ -1156,7 +1043,8 @@ const styles = StyleSheet.create({
     marginHorizontal: 4,
   },
   modalCancelButton: { backgroundColor: "rgba(255,255,255,0.1)" },
-  confirmButton: { backgroundColor: COLORS.primary },
-  confirmButtonDisabled: { backgroundColor: COLORS.border, opacity: 0.6 },
+  cancelButton: { backgroundColor: "rgba(255,255,255,0.1)" },
+  confirmButton: { backgroundColor: "#1DB954" },
+  confirmButtonDisabled: { backgroundColor: "#333333", opacity: 0.6 },
   modalButtonText: { fontWeight: "600", fontSize: 14 },
 });

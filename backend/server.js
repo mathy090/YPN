@@ -26,8 +26,8 @@ const {
   initNewsArchive,
 } = require("./src/routes/newsRoutes");
 const mediaRoutes = require("./src/routes/mediaRoutes");
-const avatarRoutes = require("./src/routes/avatarRoutes"); // 🔓 Open API
-const updateAvatarRoutes = require("./src/routes/updateAvatarRoutes"); // ✅ NEW ROUTE
+const avatarRoutes = require("./src/routes/avatarRoutes"); // 🔓 Open API - onboarding upload
+const updateAvatarRoutes = require("./src/routes/updateAvatarRoutes"); // 🔓 Open API - settings avatar update
 
 const {
   router: signoutRoutes,
@@ -53,15 +53,13 @@ const app = express();
 app.set("trust proxy", 1);
 app.use(cors());
 
-// ✅ REMOVED: express.raw() middleware for /api/avatar
-// The avatar route now handles both raw body and FormData via multer
+// ✅ Avatar routes handle their own body parsing via multer.
+// express.json() is applied globally for all other routes.
 app.use(express.json());
 
-// ✅ MIDDLEWARE: Inject DB instance into request object for routes to use
-app.use((req, res, next) => {
-  if (db) {
-    req.app.set("db", db);
-  }
+// ✅ Inject db instance into req so route files can access via req.app.get("db")
+app.use((req, _res, next) => {
+  if (db) req.app.set("db", db);
   next();
 });
 
@@ -91,11 +89,6 @@ async function connectDB() {
     await client.connect();
     db = client.db("ypn_users");
     console.log("✅ Connected to MongoDB");
-
-    // Verify connection by pinging
-    await db.command({ ping: 1 });
-    console.log("✅ MongoDB Ping Successful");
-
     initUserVideos(db);
     initDiscordChannels(db);
     initKeyStore(db);
@@ -295,9 +288,6 @@ function registerRoutes() {
 
   // ── Public: Profile creation (onboarding) ─────────────────────────────────
   app.post("/api/users/profile", async (req, res) => {
-    console.log("\n🟢 [PROFILE SAVE] Received Request");
-    console.log("   Body:", JSON.stringify(req.body, null, 2));
-
     try {
       const {
         uid,
@@ -306,155 +296,95 @@ function registerRoutes() {
         avatarUrl,
         name,
       } = req.body ?? {};
-
-      // 1. Strict Validation
       if (!uid || !email) {
-        console.warn("   ❌ Validation Failed: Missing UID or Email");
         return res.status(400).json({
           code: "MISSING_FIELDS",
           message: "uid and email are required",
         });
       }
-
       const cleanUsername = (rawUsername ?? "").toString().trim().toLowerCase();
-
       if (!cleanUsername || !/^[a-z0-9_]{3,20}$/.test(cleanUsername)) {
-        console.warn(
-          "   ❌ Validation Failed: Invalid Username Format:",
-          cleanUsername,
-        );
         return res.status(400).json({
           code: "INVALID_USERNAME",
           message:
             "Username: 3–20 chars, lowercase letters/numbers/underscores only",
         });
       }
-
-      console.log("   ℹ️ Validated Data:", { uid, email, cleanUsername });
-
-      // 2. Check if user already exists
-      console.log("   🔍 Checking for existing user with UID:", uid);
-      const existingUser = await db.collection("users").findOne({ uid });
-
-      // CASE A: User already has a username
-      if (existingUser && existingUser.username) {
-        console.log("   ℹ️ User already has username:", existingUser.username);
-
-        if (cleanUsername !== existingUser.username.toLowerCase()) {
-          console.warn("   ⚠️ Username mismatch attempt");
-          return res.status(409).json({
-            code: "USERNAME_LOCKED",
-            message: "Username cannot be changed after initial setup",
+      const updatePayload = { email, updatedAt: new Date() };
+      if (avatarUrl !== undefined && avatarUrl !== null) {
+        updatePayload.avatarUrl = avatarUrl.toString().trim();
+      }
+      if (name) {
+        updatePayload.name = name.toString().trim();
+      }
+      const currentUser = await db.collection("users").findOne({ uid });
+      if (!currentUser?.username) {
+        const result = await db.collection("users").findOneAndUpdate(
+          {
+            uid,
+            $or: [{ username: { $exists: false } }, { username: null }],
+          },
+          { $set: { ...updatePayload, username: cleanUsername } },
+          {
+            returnDocument: "after",
+            projection: { username: 1, email: 1, avatarUrl: 1, uid: 1 },
+          },
+        );
+        if (!result?.value) {
+          const conflict = await db
+            .collection("users")
+            .findOne(
+              { username: cleanUsername, uid: { $ne: uid } },
+              { projection: { uid: 1 } },
+            );
+          if (conflict) {
+            return res.status(409).json({
+              code: "USERNAME_TAKEN",
+              message: "Username already taken by another account",
+            });
+          }
+          return res.status(500).json({
+            code: "UPDATE_FAILED",
+            message: "Could not create profile",
           });
         }
-
-        // User exists, username matches, just update other fields if needed
-        const updatePayload = { email, updatedAt: new Date() };
-        if (avatarUrl) updatePayload.avatarUrl = avatarUrl.trim();
-        if (name) updatePayload.name = name.trim();
-
-        console.log("   💾 Updating existing user fields...");
-        await db
-          .collection("users")
-          .updateOne({ uid }, { $set: updatePayload });
-
-        console.log("   ✅ Success: Existing user updated");
-        return res.json({
+        return res.status(201).json({
           success: true,
           user: {
-            uid,
-            username: existingUser.username,
-            email,
-            avatarUrl: updatePayload.avatarUrl || existingUser.avatarUrl,
+            uid: result.value.uid,
+            username: result.value.username,
+            email: result.value.email,
+            avatarUrl: result.value.avatarUrl,
           },
         });
       }
-
-      // CASE B: User does not exist OR exists but has NO username
-      console.log("   ℹ️ User needs profile creation/update");
-
-      // First, check if the desired username is taken by SOMEONE ELSE
-      console.log("   🔍 Checking for username conflict:", cleanUsername);
-      const usernameConflict = await db.collection("users").findOne({
-        username: cleanUsername,
-        uid: { $ne: uid },
-      });
-
-      if (usernameConflict) {
-        console.warn("   ❌ Conflict: Username taken by another user");
+      if (rawUsername && rawUsername.toLowerCase() !== currentUser.username) {
         return res.status(409).json({
-          code: "USERNAME_TAKEN",
-          message: "Username already taken by another account",
+          code: "USERNAME_LOCKED",
+          message: "Username cannot be changed after initial setup",
         });
       }
-
-      console.log("   ℹ️ No conflicts. Proceeding to save...");
-
-      // If no conflict, proceed to save
-      const updatePayload = {
-        email,
-        username: cleanUsername,
-        updatedAt: new Date(),
-      };
-
-      if (avatarUrl) updatePayload.avatarUrl = avatarUrl.trim();
-      if (name) updatePayload.name = name.trim();
-
-      console.log("   💾 Saving to MongoDB...", updatePayload);
-
-      // Use upsert: true to create if not exists, update if exists
-      const result = await db.collection("users").updateOne(
-        { uid },
-        {
-          $set: updatePayload,
-          $setOnInsert: { createdAt: new Date() },
-        },
-        { upsert: true },
-      );
-
-      console.log("   ℹ️ MongoDB Update Result:", {
-        matchedCount: result.matchedCount,
-        modifiedCount: result.modifiedCount,
-        upsertedId: result.upsertedId,
-      });
-
-      // Fetch the final user object to return
-      console.log("   🔍 Fetching final user document...");
-      const finalUser = await db
-        .collection("users")
-        .findOne(
-          { uid },
-          { projection: { username: 1, email: 1, avatarUrl: 1, uid: 1 } },
-        );
-
-      if (!finalUser) {
-        console.error("   ❌ Critical: Failed to retrieve user after save");
-        throw new Error("Failed to retrieve user after save");
-      }
-
-      console.log("   ✅ Success: Profile saved/updated in MongoDB");
-      console.log("   📄 Final User:", JSON.stringify(finalUser, null, 2));
-
-      return res.status(existingUser ? 200 : 201).json({
+      await db.collection("users").updateOne({ uid }, { $set: updatePayload });
+      res.json({
         success: true,
-        user: finalUser,
+        user: {
+          uid,
+          username: currentUser.username,
+          email,
+          avatarUrl: updatePayload.avatarUrl || currentUser.avatarUrl,
+        },
       });
     } catch (err) {
-      console.error("\n🔴 [PROFILE SAVE] CRITICAL ERROR:", err);
-
-      // Handle Duplicate Key Error (MongoDB Native Code 11000)
+      console.error("[POST /api/users/profile] Error:", err);
       if (err.code === 11000) {
-        console.warn("   ❌ Duplicate Key Error (Race Condition)");
         return res.status(409).json({
           code: "USERNAME_TAKEN",
           message: "Username already exists in database",
         });
       }
-
-      res.status(500).json({
-        code: "SERVER_ERROR",
-        message: "Internal server error: " + err.message,
-      });
+      res
+        .status(500)
+        .json({ code: "SERVER_ERROR", message: "Internal server error" });
     }
   });
 
@@ -531,11 +461,11 @@ function registerRoutes() {
   // ── Route mounting ────────────────────────────────────────────────────────
   app.use("/api/auth", verifyBackendToken, signoutRoutes);
 
-  // 🔓 OPEN AVATAR ROUTE: No auth middleware - completely public
-  // Multer in avatarRoutes.js handles both FormData and raw body
+  // 🔓 OPEN: Onboarding avatar upload — uid passed via query string
   app.use("/api/avatar", avatarRoutes);
 
-  // ✅ NEW DEDICATED ROUTE: Public, email-based avatar update
+  // 🔓 OPEN: Settings avatar update — email passed in FormData body
+  // Updates Supabase Storage + MongoDB avatarUrl in one call
   app.use("/api/users/update-avatar", updateAvatarRoutes);
 
   app.use("/api/videos/drive", driveVideoRoutes);

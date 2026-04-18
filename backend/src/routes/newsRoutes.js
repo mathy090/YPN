@@ -4,7 +4,7 @@
 const express = require("express");
 const https = require("https");
 
-const router = express.Router(); // ← MUST be first
+const router = express.Router();
 
 // ─── News sources ─────────────────────────────────────────────────────────────
 const SOURCES = [
@@ -100,41 +100,107 @@ const SOURCES = [
   },
 ];
 
+// ─── Cache config ─────────────────────────────────────────────────────────────
+// L1: in-memory, rebuilt every hour
+// L2: MongoDB archive (persistent, survives restart, TTL auto-cleans after 48h)
+const L1_TTL_MS = 60 * 60 * 1000; // 1 hour
+const L2_ARCHIVE_TTL_SEC = 48 * 60 * 60; // 48 hours TTL on MongoDB docs
+const RSS_REFRESH_INTERVAL_MS = 60 * 60 * 1000; // auto-rebuild every 1 hour
+
 // ─── L1 in-memory cache ───────────────────────────────────────────────────────
 let l1Cache = null;
 let l1CachedAt = 0;
-const L1_TTL = 20 * 60 * 1000;
 let building = false;
+let refreshTimer = null;
 
-// ─── MongoDB accumulation ─────────────────────────────────────────────────────
+// ─── MongoDB (L2) ─────────────────────────────────────────────────────────────
 let _db = null;
 
 function initNewsArchive(db) {
   _db = db;
+
+  // Ensure indexes exist — safe to call multiple times
   db.collection("news_archive")
     .createIndex({ id: 1 }, { unique: true })
     .catch(() => {});
+
   db.collection("news_archive")
     .createIndex({ pubDate: -1 })
     .catch(() => {});
-  console.log("[News] Archive store initialised");
+
+  // TTL index: MongoDB auto-deletes articles older than 48 hours
+  db.collection("news_archive")
+    .createIndex({ archivedAt: 1 }, { expireAfterSeconds: L2_ARCHIVE_TTL_SEC })
+    .catch(() => {});
+
+  console.log("[News] Archive store initialised with TTL index (48h)");
+
+  // Warm the cache on startup — non-blocking
+  warmCacheOnStartup();
 }
 
+// ─── Startup warm ─────────────────────────────────────────────────────────────
+// Try L2 first (fast, no network), then kick off an RSS build in background
+async function warmCacheOnStartup() {
+  try {
+    const archived = await loadFromArchive(200);
+    if (archived && archived.length > 0) {
+      l1Cache = archived;
+      l1CachedAt = Date.now();
+      console.log(
+        `[News] ✅ Warmed L1 from MongoDB archive (${archived.length} articles)`,
+      );
+    } else {
+      console.log("[News] No archive found — triggering cold RSS build...");
+    }
+  } catch (e) {
+    console.warn("[News] Warm from archive failed:", e.message);
+  }
+
+  // Always kick off a fresh RSS build in the background so cache is current
+  buildNews().catch((e) =>
+    console.warn("[News] Startup RSS build failed:", e.message),
+  );
+
+  // Schedule hourly refresh
+  scheduleRefresh();
+}
+
+// ─── Hourly scheduler ─────────────────────────────────────────────────────────
+function scheduleRefresh() {
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(() => {
+    console.log("[News] ⏰ Hourly RSS refresh triggered");
+    buildNews().catch((e) =>
+      console.warn("[News] Scheduled refresh failed:", e.message),
+    );
+  }, RSS_REFRESH_INTERVAL_MS);
+
+  // Ensure the interval doesn't block Node.js process exit
+  if (refreshTimer.unref) refreshTimer.unref();
+}
+
+// ─── MongoDB L2 helpers ────────────────────────────────────────────────────────
 async function archiveArticles(articles) {
   if (!_db || !articles.length) return;
   try {
     const ops = articles.map((a) => ({
       updateOne: {
         filter: { id: a.id },
-        update: { $setOnInsert: { ...a, archivedAt: new Date() } },
+        update: {
+          $set: { ...a, archivedAt: new Date() },
+        },
         upsert: true,
       },
     }));
     const result = await _db
       .collection("news_archive")
       .bulkWrite(ops, { ordered: false });
+
     if (result.upsertedCount > 0) {
-      console.log(`[News] Archived ${result.upsertedCount} new articles`);
+      console.log(
+        `[News] 📦 Archived ${result.upsertedCount} new articles to MongoDB`,
+      );
     }
   } catch (err) {
     console.warn("[News] Archive write error:", err.message);
@@ -151,7 +217,8 @@ async function loadFromArchive(limit = 200) {
       .limit(limit)
       .toArray();
     return docs.length > 0 ? docs : null;
-  } catch {
+  } catch (e) {
+    console.warn("[News] Archive read error:", e.message);
     return null;
   }
 }
@@ -161,6 +228,7 @@ const BROWSER_UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
+// ─── HTTP fetch with redirect follow ─────────────────────────────────────────
 function httpsGet(url, timeoutMs = 12000) {
   return new Promise((resolve, reject) => {
     const req = https.get(
@@ -202,6 +270,7 @@ function httpsGet(url, timeoutMs = 12000) {
   });
 }
 
+// ─── RSS entity decoder ────────────────────────────────────────────────────────
 function decodeEntities(str) {
   if (!str) return "";
   return str
@@ -219,6 +288,7 @@ function decodeEntities(str) {
     .trim();
 }
 
+// ─── Thumbnail extractor ───────────────────────────────────────────────────────
 function extractThumbnail(block) {
   let m = block.match(/media:content[^>]*url=["']([^"']+)["']/i);
   if (m) return m[1];
@@ -233,6 +303,7 @@ function extractThumbnail(block) {
   return null;
 }
 
+// ─── RSS parser ────────────────────────────────────────────────────────────────
 function parseRSS(xml, source) {
   const articles = [];
   const itemRx = /<item[\s>]([\s\S]*?)<\/item>/gi;
@@ -280,6 +351,7 @@ function parseRSS(xml, source) {
   return articles;
 }
 
+// ─── Fetch one RSS source ─────────────────────────────────────────────────────
 async function fetchSource(source) {
   try {
     const xml = await httpsGet(source.url, 12000);
@@ -292,22 +364,25 @@ async function fetchSource(source) {
   }
 }
 
+// ─── Build: fetch all RSS → dedupe → archive → update L1 ─────────────────────
 async function buildNews() {
   if (building) {
-    await new Promise((r) => setTimeout(r, 2000));
+    console.log("[News] Build already in progress, skipping");
     return l1Cache ?? [];
   }
 
   building = true;
-  console.log(`📰 Building news feed from ${SOURCES.length} sources…`);
+  console.log(`📰 [News] Building RSS feed from ${SOURCES.length} sources…`);
 
   try {
+    // Fetch all sources in parallel — failures are caught per-source
     const results = await Promise.allSettled(SOURCES.map(fetchSource));
     let freshArticles = results
       .filter((r) => r.status === "fulfilled")
       .flatMap((r) => r.value)
       .filter(Boolean);
 
+    // Deduplicate by id
     const seen = new Set();
     freshArticles = freshArticles.filter((a) => {
       if (seen.has(a.id)) return false;
@@ -317,44 +392,58 @@ async function buildNews() {
 
     console.log(`[News] ${freshArticles.length} unique articles from RSS`);
 
+    // L2: Persist fresh articles to MongoDB archive
     await archiveArticles(freshArticles);
 
+    // L2: Load full archive (includes older articles still within TTL)
     const archived = await loadFromArchive(200);
     const allArticles = archived ?? freshArticles;
 
+    // Sort newest first
     allArticles.sort((a, b) => b.pubDate - a.pubDate);
 
-    console.log(`✅ News ready: ${allArticles.length} total articles`);
-
+    // L1: Update in-memory cache
     l1Cache = allArticles;
     l1CachedAt = Date.now();
 
+    console.log(`✅ [News] Feed ready: ${allArticles.length} total articles`);
     return allArticles;
   } finally {
     building = false;
   }
 }
 
+// ─── getNews: L1 → L2 → build ─────────────────────────────────────────────────
 async function getNews() {
-  if (l1Cache && l1Cache.length > 0 && Date.now() - l1CachedAt < L1_TTL) {
+  // L1 hit: in-memory, fresh within 1 hour
+  if (l1Cache && l1Cache.length > 0 && Date.now() - l1CachedAt < L1_TTL_MS) {
     return l1Cache;
   }
 
+  // L2 hit: MongoDB archive (survives restarts)
   const archived = await loadFromArchive(200);
   if (archived && archived.length > 0) {
-    console.log(`📦 News from archive (${archived.length} articles)`);
+    console.log(
+      `📦 [News] L1 miss → serving ${archived.length} articles from MongoDB`,
+    );
+    // Hydrate L1
     l1Cache = archived;
     l1CachedAt = Date.now();
+    // Background RSS refresh — don't block the response
     buildNews().catch((e) =>
       console.warn("[News] Background build:", e.message),
     );
     return archived;
   }
 
+  // Cold start: no cache anywhere — block and build
+  console.log("[News] Cold start — blocking RSS build...");
   return buildNews();
 }
 
-// ─── Routes (router defined at top, so this is always safe) ──────────────────
+// ─── Routes ───────────────────────────────────────────────────────────────────
+
+// GET /api/news — main feed
 router.get("/", async (_req, res) => {
   try {
     const articles = await getNews();
@@ -365,6 +454,7 @@ router.get("/", async (_req, res) => {
   }
 });
 
+// DELETE /api/news/cache — force clear L1 (L2 archive preserved)
 router.delete("/cache", async (_req, res) => {
   l1Cache = null;
   l1CachedAt = 0;
@@ -374,6 +464,7 @@ router.delete("/cache", async (_req, res) => {
   });
 });
 
+// GET /api/news/cache/status — debug info
 router.get("/cache/status", async (_req, res) => {
   const count = _db
     ? await _db
@@ -384,15 +475,33 @@ router.get("/cache/status", async (_req, res) => {
 
   res.json({
     l1: {
-      hit: !!l1Cache,
+      hit: !!l1Cache && l1Cache.length > 0,
       articles: l1Cache?.length ?? 0,
       ageSeconds: l1Cache ? Math.floor((Date.now() - l1CachedAt) / 1000) : null,
+      ttlSeconds: Math.floor(L1_TTL_MS / 1000),
     },
-    archive: {
+    l2: {
       totalArticles: count,
+      ttlHours: L2_ARCHIVE_TTL_SEC / 3600,
+    },
+    scheduler: {
+      refreshIntervalHours: RSS_REFRESH_INTERVAL_MS / 3600000,
+      building,
     },
     sources: SOURCES.map((s) => ({ name: s.name, key: s.key })),
   });
+});
+
+// POST /api/news/refresh — admin force refresh
+router.post("/refresh", async (_req, res) => {
+  if (building) {
+    return res.json({ message: "Build already in progress" });
+  }
+  // Non-blocking
+  buildNews().catch((e) =>
+    console.warn("[News] Manual refresh failed:", e.message),
+  );
+  res.json({ message: "RSS refresh triggered in background" });
 });
 
 module.exports = { router, initNewsArchive };
