@@ -82,6 +82,11 @@ async function connectDB() {
     await client.connect();
     db = client.db("ypn_users");
     console.log("✅ Connected to MongoDB");
+
+    // Verify connection by pinging
+    await db.command({ ping: 1 });
+    console.log("✅ MongoDB Ping Successful");
+
     initUserVideos(db);
     initDiscordChannels(db);
     initKeyStore(db);
@@ -281,6 +286,9 @@ function registerRoutes() {
 
   // ── Public: Profile creation (onboarding) ─────────────────────────────────
   app.post("/api/users/profile", async (req, res) => {
+    console.log("\n🟢 [PROFILE SAVE] Received Request");
+    console.log("   Body:", JSON.stringify(req.body, null, 2));
+
     try {
       const {
         uid,
@@ -292,7 +300,7 @@ function registerRoutes() {
 
       // 1. Strict Validation
       if (!uid || !email) {
-        console.warn("[Profile] Missing UID or Email:", { uid, email });
+        console.warn("   ❌ Validation Failed: Missing UID or Email");
         return res.status(400).json({
           code: "MISSING_FIELDS",
           message: "uid and email are required",
@@ -301,9 +309,11 @@ function registerRoutes() {
 
       const cleanUsername = (rawUsername ?? "").toString().trim().toLowerCase();
 
-      // Regex check: 3-20 chars, lowercase letters, numbers, underscores only
       if (!cleanUsername || !/^[a-z0-9_]{3,20}$/.test(cleanUsername)) {
-        console.warn("[Profile] Invalid Username Format:", cleanUsername);
+        console.warn(
+          "   ❌ Validation Failed: Invalid Username Format:",
+          cleanUsername,
+        );
         return res.status(400).json({
           code: "INVALID_USERNAME",
           message:
@@ -311,116 +321,121 @@ function registerRoutes() {
         });
       }
 
-      // 2. Prepare Data
-      // Note: email is included here in $set, so we MUST NOT include it in $setOnInsert
+      console.log("   ℹ️ Validated Data:", { uid, email, cleanUsername });
+
+      // 2. Check if user already exists
+      console.log("   🔍 Checking for existing user with UID:", uid);
+      const existingUser = await db.collection("users").findOne({ uid });
+
+      // CASE A: User already has a username
+      if (existingUser && existingUser.username) {
+        console.log("   ℹ️ User already has username:", existingUser.username);
+
+        if (cleanUsername !== existingUser.username.toLowerCase()) {
+          console.warn("   ⚠️ Username mismatch attempt");
+          return res.status(409).json({
+            code: "USERNAME_LOCKED",
+            message: "Username cannot be changed after initial setup",
+          });
+        }
+
+        // User exists, username matches, just update other fields if needed
+        const updatePayload = { email, updatedAt: new Date() };
+        if (avatarUrl) updatePayload.avatarUrl = avatarUrl.trim();
+        if (name) updatePayload.name = name.trim();
+
+        console.log("   💾 Updating existing user fields...");
+        await db
+          .collection("users")
+          .updateOne({ uid }, { $set: updatePayload });
+
+        console.log("   ✅ Success: Existing user updated");
+        return res.json({
+          success: true,
+          user: {
+            uid,
+            username: existingUser.username,
+            email,
+            avatarUrl: updatePayload.avatarUrl || existingUser.avatarUrl,
+          },
+        });
+      }
+
+      // CASE B: User does not exist OR exists but has NO username
+      console.log("   ℹ️ User needs profile creation/update");
+
+      // First, check if the desired username is taken by SOMEONE ELSE
+      console.log("   🔍 Checking for username conflict:", cleanUsername);
+      const usernameConflict = await db.collection("users").findOne({
+        username: cleanUsername,
+        uid: { $ne: uid },
+      });
+
+      if (usernameConflict) {
+        console.warn("   ❌ Conflict: Username taken by another user");
+        return res.status(409).json({
+          code: "USERNAME_TAKEN",
+          message: "Username already taken by another account",
+        });
+      }
+
+      console.log("   ℹ️ No conflicts. Proceeding to save...");
+
+      // If no conflict, proceed to save
       const updatePayload = {
         email,
+        username: cleanUsername,
         updatedAt: new Date(),
       };
 
       if (avatarUrl) updatePayload.avatarUrl = avatarUrl.trim();
       if (name) updatePayload.name = name.trim();
 
-      // 3. Check Current State
-      const currentUser = await db.collection("users").findOne({ uid });
+      console.log("   💾 Saving to MongoDB...", updatePayload);
 
-      // CASE A: User does not exist OR exists but has NO username yet
-      if (!currentUser || !currentUser.username) {
-        // Attempt to create/update with the new username
-        const result = await db.collection("users").findOneAndUpdate(
-          {
-            uid,
-            // Ensure we only target users who DON'T have a username yet to avoid overwriting
-            $or: [{ username: { $exists: false } }, { username: null }],
-          },
-          {
-            $set: {
-              ...updatePayload,
-              username: cleanUsername,
-              createdAt: new Date(), // Set creation date if new
-            },
-            // ✅ FIXED: Removed 'email' from here to avoid conflict with $set
-            $setOnInsert: { uid },
-          },
-          {
-            returnDocument: "after",
-            projection: { username: 1, email: 1, avatarUrl: 1, uid: 1 },
-          },
+      // Use upsert: true to create if not exists, update if exists
+      const result = await db.collection("users").updateOne(
+        { uid },
+        {
+          $set: updatePayload,
+          $setOnInsert: { createdAt: new Date() },
+        },
+        { upsert: true },
+      );
+
+      console.log("   ℹ️ MongoDB Update Result:", {
+        matchedCount: result.matchedCount,
+        modifiedCount: result.modifiedCount,
+        upsertedId: result.upsertedId,
+      });
+
+      // Fetch the final user object to return
+      console.log("   🔍 Fetching final user document...");
+      const finalUser = await db
+        .collection("users")
+        .findOne(
+          { uid },
+          { projection: { username: 1, email: 1, avatarUrl: 1, uid: 1 } },
         );
 
-        // If result is null, it means either:
-        // 1. The user already has a username (race condition)
-        // 2. The username was taken by someone else in the split second between check and update
-        if (!result?.value) {
-          // Check if THIS user already has a username (meaning they clicked submit twice quickly)
-          const reCheck = await db.collection("users").findOne({ uid });
-          if (reCheck && reCheck.username) {
-            return res.status(409).json({
-              code: "USERNAME_LOCKED",
-              message: "Profile already created.",
-            });
-          }
-
-          // Check if SOMEONE ELSE took the username
-          const conflict = await db
-            .collection("users")
-            .findOne(
-              { username: cleanUsername, uid: { $ne: uid } },
-              { projection: { uid: 1 } },
-            );
-
-          if (conflict) {
-            return res.status(409).json({
-              code: "USERNAME_TAKEN",
-              message: "Username already taken by another account",
-            });
-          }
-
-          // Fallback error
-          return res.status(500).json({
-            code: "UPDATE_FAILED",
-            message: "Could not create profile. Please try again.",
-          });
-        }
-
-        // Success: New profile created
-        return res.status(201).json({
-          success: true,
-          user: {
-            uid: result.value.uid,
-            username: result.value.username,
-            email: result.value.email,
-            avatarUrl: result.value.avatarUrl,
-          },
-        });
+      if (!finalUser) {
+        console.error("   ❌ Critical: Failed to retrieve user after save");
+        throw new Error("Failed to retrieve user after save");
       }
 
-      // CASE B: User already has a username
-      // Prevent changing username after setup
-      if (rawUsername && rawUsername.toLowerCase() !== currentUser.username) {
-        return res.status(409).json({
-          code: "USERNAME_LOCKED",
-          message: "Username cannot be changed after initial setup",
-        });
-      }
+      console.log("   ✅ Success: Profile saved/updated in MongoDB");
+      console.log("   📄 Final User:", JSON.stringify(finalUser, null, 2));
 
-      // Allow updating email/avatar/name for existing users
-      await db.collection("users").updateOne({ uid }, { $set: updatePayload });
-
-      res.json({
+      return res.status(existingUser ? 200 : 201).json({
         success: true,
-        user: {
-          uid,
-          username: currentUser.username,
-          email,
-          avatarUrl: updatePayload.avatarUrl || currentUser.avatarUrl,
-        },
+        user: finalUser,
       });
     } catch (err) {
-      console.error("[POST /api/users/profile] CRITICAL ERROR:", err);
+      console.error("\n🔴 [PROFILE SAVE] CRITICAL ERROR:", err);
 
       // Handle Duplicate Key Error (MongoDB Native Code 11000)
       if (err.code === 11000) {
+        console.warn("   ❌ Duplicate Key Error (Race Condition)");
         return res.status(409).json({
           code: "USERNAME_TAKEN",
           message: "Username already exists in database",
@@ -429,7 +444,7 @@ function registerRoutes() {
 
       res.status(500).json({
         code: "SERVER_ERROR",
-        message: "Internal server error",
+        message: "Internal server error: " + err.message,
       });
     }
   });
