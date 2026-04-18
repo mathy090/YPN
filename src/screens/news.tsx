@@ -1,315 +1,322 @@
 // src/screens/news.tsx
 import { Ionicons } from "@expo/vector-icons";
 import NetInfo from "@react-native-community/netinfo";
-import * as WebBrowser from "expo-web-browser";
-import React, { useEffect, useRef, useState } from "react";
+import { useRouter } from "expo-router";
+import React, { memo, useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
-  Alert,
+  Dimensions,
+  FlatList,
   Image,
   Platform,
+  Pressable,
   RefreshControl,
-  StatusBar as RNStatusBar,
-  ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from "react-native";
 
-import {
-  getSecureCache,
-  initializeSecureCache,
-  setSecureCache,
-} from "../utils/cache";
+const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
+const { width: W } = Dimensions.get("window");
 
-WebBrowser.maybeCompleteAuthSession();
-
-// ── Config ─────────────────────────────────────────────────────────────────────
-const API_URL = process.env.EXPO_PUBLIC_API_URL;
-const NEWS_CACHE_KEY = "news_manifest";
-// ✅ FIX 1: Match backend L1 TTL (10 minutes)
-const CACHE_TTL = 10 * 60 * 1000;
-
-type NewsItem = {
+// ── Types ─────────────────────────────────────────────────────────────────────
+type NewsArticle = {
   id: string;
   title: string;
   link: string;
   pubDate: number;
   source: string;
   sourceColor: string;
+  sourceKey: string;
   thumbnail: string | null;
   description: string;
+  fetchedAt?: number;
 };
 
-// ── Cache Helpers ──────────────────────────────────────────────────────────────
-async function readNewsCache(): Promise<NewsItem[] | null> {
-  try {
-    const data = await getSecureCache(NEWS_CACHE_KEY);
-    return Array.isArray(data) ? data : null;
-  } catch {
-    return null;
-  }
-}
+// ✅ FIX: Added 'data:' property name below
+type NewsResponse = {
+  success: boolean;
+  count: number;
+  cached: boolean;
+  data: NewsArticle[];
+};
 
-async function writeNewsCache(items: NewsItem[]) {
-  try {
-    await setSecureCache(NEWS_CACHE_KEY, items, CACHE_TTL);
-  } catch (e) {
-    console.warn("[News] Failed to write cache:", e);
-  }
-}
+type Source = { key: string; name: string; color: string };
+type RouteParams = {
+  id: string;
+  url: string;
+  title?: string;
+  source?: string;
+  sourceColor?: string;
+};
 
-function relativeTime(ts: number): string {
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const fmtDate = (ts: number): string => {
   const diff = Date.now() - ts;
-  const m = Math.floor(diff / 60000);
-  if (m < 1) return "just now";
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  const d = Math.floor(h / 24);
-  if (d < 7) return `${d}d ago`;
-  const w = Math.floor(d / 7);
-  if (w < 52) return `${w}w ago`;
-  return `${Math.floor(d / 365)}y ago`;
-}
-
-const openArticleInApp = async (item: NewsItem) => {
-  try {
-    await WebBrowser.openBrowserAsync(item.link, {
-      toolbarColor: "#111111",
-      controlsColor: "#1DB954",
-      showTitle: true,
-      enableBarCollapsing: false,
-    });
-  } catch (err) {
-    Alert.alert("Error", "Could not open the article.");
-    console.error(err);
-  }
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "Just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(diff / 3600000);
+  if (hours < 24) return `${hours}h ago`;
+  return new Date(ts).toLocaleDateString("en-ZW", {
+    month: "short",
+    day: "numeric",
+  });
 };
 
-const NewsCard = React.memo(
-  ({
-    item,
-    onPress,
-  }: {
-    item: NewsItem;
-    onPress: (item: NewsItem) => void;
-  }) => (
+const truncate = (str: string, len: number) =>
+  str && str.length > len ? str.slice(0, len - 1) + "…" : str || "";
+
+// ── API ───────────────────────────────────────────────────────────────────────
+async function fetchNews(
+  selectedSource: string | null,
+): Promise<NewsArticle[]> {
+  const url = selectedSource
+    ? `${API_URL}/api/news/source/${selectedSource}`
+    : `${API_URL}/api/news`;
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = (await res.json()) as NewsResponse | NewsArticle[];
+
+  if ("data" in json && Array.isArray(json.data)) return json.data;
+  if (Array.isArray(json)) return json;
+  return [];
+}
+
+async function fetchSources(): Promise<Source[]> {
+  const res = await fetch(`${API_URL}/api/news/sources`);
+  if (!res.ok) return [];
+  const json = await res.json();
+  return json.success && Array.isArray(json.sources) ? json.sources : [];
+}
+
+// ── Components ────────────────────────────────────────────────────────────────
+const NewsCard = memo(({ item }: { item: NewsArticle }) => {
+  const router = useRouter();
+  return (
     <TouchableOpacity
       style={s.card}
-      onPress={() => onPress(item)}
-      activeOpacity={0.82}
+      onPress={() =>
+        router.push({
+          pathname: "/article/[id]",
+          params: {
+            id: item.id,
+            url: encodeURIComponent(item.link),
+            title: encodeURIComponent(item.title),
+            source: encodeURIComponent(item.source),
+            sourceColor: encodeURIComponent(item.sourceColor),
+          } as RouteParams,
+        })
+      }
+      activeOpacity={0.7}
     >
-      {item.thumbnail ? (
-        <Image
-          source={{ uri: item.thumbnail }}
-          style={s.thumb}
-          resizeMode="cover"
-        />
-      ) : (
-        <View style={[s.thumb, s.thumbPlaceholder]}>
-          <Ionicons name="newspaper-outline" size={24} color="#333" />
+      <View style={s.sourceRow}>
+        <View style={[s.sourceBadge, { backgroundColor: item.sourceColor }]}>
+          <Text style={s.sourceText}>{item.source}</Text>
         </View>
-      )}
-      <View style={s.cardBody}>
-        <View style={s.meta}>
-          <View style={[s.badge, { backgroundColor: item.sourceColor + "1A" }]}>
-            <View style={[s.badgeDot, { backgroundColor: item.sourceColor }]} />
-            <Text
-              style={[s.badgeText, { color: item.sourceColor }]}
-              numberOfLines={1}
-            >
-              {item.source}
-            </Text>
+        <Text style={s.dateText}>{fmtDate(item.pubDate)}</Text>
+      </View>
+      <View style={s.contentRow}>
+        {item.thumbnail ? (
+          <Image
+            source={{ uri: item.thumbnail }}
+            style={s.thumbnail}
+            resizeMode="cover"
+          />
+        ) : (
+          <View style={[s.thumbnail, s.thumbnailPlaceholder]}>
+            <Ionicons name="newspaper-outline" size={32} color="#666" />
           </View>
-          <Text style={s.time}>{relativeTime(item.pubDate)}</Text>
-        </View>
-        <Text style={s.title} numberOfLines={3}>
-          {item.title}
-        </Text>
-        {item.description ? (
-          <Text style={s.desc} numberOfLines={2}>
-            {item.description}
+        )}
+        <View style={s.textWrap}>
+          <Text style={s.title} numberOfLines={2}>
+            {item.title}
           </Text>
-        ) : null}
-        <View style={s.readRow}>
-          <Text style={s.readMore}>Read more</Text>
-          <Ionicons name="arrow-forward" size={12} color="#1DB954" />
+          {item.description ? (
+            <Text style={s.desc} numberOfLines={3}>
+              {truncate(item.description, 150)}
+            </Text>
+          ) : null}
+          <Text style={s.readMore}>Tap to read full article</Text>
         </View>
       </View>
     </TouchableOpacity>
+  );
+});
+
+const SourceChip = memo(
+  ({
+    source,
+    selected,
+    onPress,
+  }: {
+    source: Source;
+    selected: boolean;
+    onPress: () => void;
+  }) => (
+    <Pressable
+      style={[
+        s.chip,
+        selected && {
+          backgroundColor: source.color + "20",
+          borderColor: source.color,
+        },
+      ]}
+      onPress={onPress}
+    >
+      <View style={[s.chipDot, { backgroundColor: source.color }]} />
+      <Text style={[s.chipText, selected && { color: source.color }]}>
+        {source.name}
+      </Text>
+    </Pressable>
   ),
 );
 
+// ── Main Screen ───────────────────────────────────────────────────────────────
 export default function NewsScreen() {
-  const [articles, setArticles] = useState<NewsItem[]>([]);
+  const [articles, setArticles] = useState<NewsArticle[]>([]);
+  const [sources, setSources] = useState<Source[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState(false);
-  const [isOffline, setIsOffline] = useState(false);
-  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [poorConnection, setPoorConnection] = useState(false);
+  const [selectedSource, setSelectedSource] = useState<string | null>(null);
+  const [cacheInfo, setCacheInfo] = useState<{
+    cached: boolean;
+    count: number;
+  } | null>(null);
 
   useEffect(() => {
-    const init = async () => {
-      await initializeSecureCache();
-      boot();
-    };
-    init();
-
-    return () => {
-      if (refreshTimer.current) clearTimeout(refreshTimer.current);
-    };
+    const sub = NetInfo.addEventListener((state) => {
+      setPoorConnection(
+        (state.type === "cellular" &&
+          ["2g", "3g"].includes(state.details?.cellularGeneration || "")) ||
+          !state.isConnected,
+      );
+    });
+    return () => sub();
   }, []);
 
   useEffect(() => {
-    const unsub = NetInfo.addEventListener((state) => {
-      const connected = !!state.isConnected;
-      setIsOffline(!connected);
-      if (connected && error) {
-        fetchFromBackend(false);
-      }
-    });
-    return () => unsub();
-  }, [error]);
+    fetchSources().then(setSources).catch(console.warn);
+  }, []);
 
-  const scheduleRefresh = () => {
-    if (refreshTimer.current) clearTimeout(refreshTimer.current);
-    refreshTimer.current = setTimeout(() => fetchFromBackend(false), CACHE_TTL);
-  };
-
-  const boot = async () => {
-    const cached = await readNewsCache();
-
-    if (cached?.length) {
-      setArticles(cached);
-      setLoading(false);
-      if (isOffline) return;
-      scheduleRefresh();
-    } else {
-      setLoading(true);
-      if (!isOffline) {
-        await fetchFromBackend(false);
-      } else {
-        setLoading(false);
-        setError(true);
-      }
-    }
-  };
-
-  const fetchFromBackend = async (manual = true) => {
-    if (isOffline) {
-      if (manual) setError(true);
-      return;
-    }
-
-    if (manual) setRefreshing(true);
-    else if (!articles.length) setLoading(true);
-
-    setError(false);
-
-    try {
-      // ✅ FIX 2: Add ?refresh=true for manual pulls to bypass backend cache
-      const refreshParam = manual ? "?refresh=true" : "";
-      const res = await fetch(`${API_URL}/api/news${refreshParam}`);
-
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-      const data: NewsItem[] = await res.json();
-
-      if (data.length > 0) {
-        await writeNewsCache(data);
+  const loadNews = useCallback(
+    async (isRefresh = false) => {
+      if (isRefresh) setRefreshing(true);
+      else setLoading(true);
+      setError(null);
+      try {
+        const data = await fetchNews(selectedSource);
         setArticles(data);
-        scheduleRefresh();
-      } else {
-        if (manual) setError(true);
+        setCacheInfo({ cached: false, count: data.length });
+      } catch (e: any) {
+        setError(poorConnection ? "Poor connection" : "Failed to load");
+        if (!isRefresh) setArticles([]);
+      } finally {
+        setLoading(false);
+        setRefreshing(false);
       }
-    } catch (e) {
-      console.warn("[News] Fetch failed:", e);
-      if (manual) setError(true);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-  };
+    },
+    [selectedSource, poorConnection],
+  );
 
-  if (loading) {
+  useEffect(() => {
+    loadNews();
+  }, [loadNews]);
+
+  if (loading && articles.length === 0) {
     return (
-      <View style={s.centre}>
+      <View style={s.center}>
         <ActivityIndicator size="large" color="#1DB954" />
         <Text style={s.loadingText}>Loading news…</Text>
       </View>
     );
   }
 
+  if (error && articles.length === 0) {
+    return (
+      <View style={s.center}>
+        <Ionicons name="wifi-outline" size={48} color="#666" />
+        <Text style={s.errorText}>{error}</Text>
+        <Pressable style={s.retryBtn} onPress={() => loadNews()}>
+          <Text style={s.retryText}>Retry</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
   return (
     <View style={s.root}>
-      <View
-        style={{
-          height:
-            Platform.OS === "android"
-              ? (RNStatusBar.currentHeight || 24) + 48
-              : 48,
-        }}
+      <View style={s.header}>
+        <View style={s.headerLeft}>
+          <Text style={s.headerTitle}>News</Text>
+          {cacheInfo && (
+            <View style={s.cacheBadge}>
+              <Text style={s.cacheText}>{cacheInfo.count} articles</Text>
+            </View>
+          )}
+        </View>
+        <Pressable onPress={() => loadNews(true)} hitSlop={10}>
+          <Ionicons name="refresh-outline" size={20} color="#1DB954" />
+        </Pressable>
+      </View>
+
+      {sources.length > 0 && (
+        <View style={s.filterWrap}>
+          <FlatList
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={s.filterList}
+            data={sources}
+            keyExtractor={(s) => s.key}
+            renderItem={({ item }) => (
+              <SourceChip
+                source={item}
+                selected={selectedSource === item.key}
+                onPress={() =>
+                  setSelectedSource((prev) =>
+                    prev === item.key ? null : item.key,
+                  )
+                }
+              />
+            )}
+          />
+        </View>
+      )}
+
+      <FlatList
+        data={articles}
+        keyExtractor={(item) => item.id}
+        renderItem={({ item }) => <NewsCard item={item} />}
+        contentContainerStyle={s.list}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={() => loadNews(true)}
+            tintColor="#1DB954"
+            colors={["#1DB954"]}
+          />
+        }
+        ListEmptyComponent={
+          !loading && (
+            <View style={s.empty}>
+              <Text style={s.emptyText}>No articles found</Text>
+            </View>
+          )
+        }
+        removeClippedSubviews={Platform.OS === "android"}
+        windowSize={10}
+        maxToRenderPerBatch={5}
+        updateCellsBatchingPeriod={100}
       />
 
-      {articles.length > 0 && (
-        <View style={s.countRow}>
-          <Text style={s.countText}>
-            {articles.length} article{articles.length !== 1 ? "s" : ""}{" "}
-            available
-          </Text>
-        </View>
-      )}
-
-      {(error || isOffline) && articles.length === 0 ? (
-        <View style={s.centre}>
-          <Ionicons
-            name={isOffline ? "wifi-off-outline" : "alert-circle-outline"}
-            size={48}
-            color="#333"
-          />
-          <Text style={s.errorText}>
-            {isOffline ? "No internet connection" : "Could not load news"}
-          </Text>
-          {!isOffline && (
-            <TouchableOpacity
-              style={s.retryBtn}
-              onPress={() => fetchFromBackend(true)}
-            >
-              <Text style={s.retryText}>Retry</Text>
-            </TouchableOpacity>
-          )}
-        </View>
-      ) : (
-        <ScrollView
-          contentContainerStyle={s.list}
-          showsVerticalScrollIndicator={false}
-          refreshControl={
-            <RefreshControl
-              refreshing={refreshing}
-              onRefresh={() => !isOffline && fetchFromBackend(true)}
-              tintColor="#1DB954"
-              colors={["#1DB954"]}
-            />
-          }
-        >
-          {articles.length === 0 ? (
-            <View style={s.centre}>
-              <Text style={s.errorText}>No articles available</Text>
-            </View>
-          ) : (
-            articles.map((item) => (
-              <NewsCard key={item.id} item={item} onPress={openArticleInApp} />
-            ))
-          )}
-        </ScrollView>
-      )}
-
-      {isOffline && articles.length > 0 && (
-        <View style={s.offlineBanner}>
-          <Ionicons name="wifi-off-outline" size={16} color="#fff" />
-          <Text style={s.offlineText}>Offline • Showing cached news</Text>
+      {poorConnection && (
+        <View style={s.banner}>
+          <Ionicons name="warning-outline" size={16} color="#FF9800" />
+          <Text style={s.bannerText}>Poor connection</Text>
         </View>
       )}
     </View>
@@ -318,81 +325,106 @@ export default function NewsScreen() {
 
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#000" },
-  centre: {
+  center: {
     flex: 1,
     justifyContent: "center",
     alignItems: "center",
-    gap: 12,
-    padding: 24,
+    backgroundColor: "#000",
+    gap: 16,
   },
-  loadingText: { color: "#555", fontSize: 14, marginTop: 8 },
-  errorText: { color: "#555", fontSize: 16, textAlign: "center" },
+  loadingText: { color: "#888", fontSize: 14 },
+  errorText: { color: "#FF453A", fontSize: 16, fontWeight: "600" },
   retryBtn: {
-    marginTop: 8,
+    backgroundColor: "#1DB954",
     paddingHorizontal: 24,
     paddingVertical: 10,
-    backgroundColor: "#1DB954",
     borderRadius: 20,
   },
   retryText: { color: "#000", fontWeight: "700", fontSize: 14 },
-  countRow: { paddingHorizontal: 16, paddingBottom: 6 },
-  countText: { color: "#3A3A3A", fontSize: 11 },
-  list: { paddingHorizontal: 12, paddingBottom: 40 },
-  card: {
+  header: {
     flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    backgroundColor: "#0a0a0a",
+    borderBottomWidth: 1,
+    borderBottomColor: "#222",
+  },
+  headerLeft: { flexDirection: "row", alignItems: "center", gap: 10 },
+  headerTitle: { color: "#fff", fontSize: 20, fontWeight: "700" },
+  cacheBadge: {
+    backgroundColor: "#1a1a1a",
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+  },
+  cacheText: { color: "#1DB954", fontSize: 11, fontWeight: "600" },
+  filterWrap: {
+    backgroundColor: "#0a0a0a",
+    borderBottomWidth: 1,
+    borderBottomColor: "#222",
+  },
+  filterList: { paddingHorizontal: 12, paddingVertical: 8 },
+  chip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 16,
+    backgroundColor: "#1a1a1a",
+    borderWidth: 1,
+    borderColor: "transparent",
+    marginRight: 8,
+  },
+  chipDot: { width: 8, height: 8, borderRadius: 4 },
+  chipText: { color: "#aaa", fontSize: 12, fontWeight: "500" },
+  list: { padding: 12 },
+  card: {
     backgroundColor: "#111",
     borderRadius: 12,
-    marginBottom: 10,
-    overflow: "hidden",
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#1E1E1E",
+    padding: 12,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: "#222",
   },
-  thumb: { width: 96, height: 106 },
-  thumbPlaceholder: {
-    backgroundColor: "#161616",
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  cardBody: { flex: 1, padding: 10, justifyContent: "space-between" },
-  meta: {
+  sourceRow: {
     flexDirection: "row",
-    alignItems: "center",
     justifyContent: "space-between",
-    marginBottom: 5,
-  },
-  badge: {
-    flexDirection: "row",
     alignItems: "center",
-    gap: 4,
-    paddingHorizontal: 7,
-    paddingVertical: 3,
+    marginBottom: 10,
+  },
+  sourceBadge: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 8 },
+  sourceText: { color: "#000", fontSize: 11, fontWeight: "700" },
+  dateText: { color: "#666", fontSize: 11 },
+  contentRow: { flexDirection: "row", gap: 12 },
+  thumbnail: {
+    width: 80,
+    height: 80,
     borderRadius: 8,
-    maxWidth: 120,
+    backgroundColor: "#222",
   },
-  badgeDot: { width: 5, height: 5, borderRadius: 3, flexShrink: 0 },
-  badgeText: { fontSize: 10, fontWeight: "700", flexShrink: 1 },
-  time: { color: "#3A3A3A", fontSize: 10 },
-  title: {
-    color: "#E8E8E8",
-    fontSize: 13,
-    fontWeight: "600",
-    lineHeight: 18,
-    flex: 1,
-  },
-  desc: { color: "#555", fontSize: 11, lineHeight: 16, marginTop: 4 },
-  readRow: { flexDirection: "row", alignItems: "center", gap: 3, marginTop: 6 },
-  readMore: { color: "#1DB954", fontSize: 11, fontWeight: "600" },
-  offlineBanner: {
+  thumbnailPlaceholder: { justifyContent: "center", alignItems: "center" },
+  textWrap: { flex: 1, gap: 6 },
+  title: { color: "#fff", fontSize: 14, fontWeight: "700", lineHeight: 20 },
+  desc: { color: "#aaa", fontSize: 12, lineHeight: 18 },
+  readMore: { color: "#1DB954", fontSize: 12, fontWeight: "600", marginTop: 4 },
+  empty: { alignItems: "center", padding: 40 },
+  emptyText: { color: "#666", fontSize: 14 },
+  banner: {
     position: "absolute",
     bottom: 0,
     left: 0,
     right: 0,
-    backgroundColor: "#333",
     flexDirection: "row",
     alignItems: "center",
+    gap: 6,
+    backgroundColor: "rgba(255,152,0,0.15)",
     paddingHorizontal: 16,
-    paddingVertical: 8,
-    gap: 8,
+    paddingVertical: 10,
+    borderTopWidth: 1,
+    borderTopColor: "rgba(255,152,0,0.3)",
   },
-  offlineText: { color: "#fff", fontSize: 12, fontWeight: "500" },
+  bannerText: { color: "#FF9800", fontSize: 12, flex: 1 },
 });
