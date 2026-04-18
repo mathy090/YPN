@@ -1,9 +1,12 @@
 // app/auth/device.tsx
+// Photo is stored locally on pick.
+// Upload + profile save both happen only when user presses "Get Started".
 import { Ionicons } from "@expo/vector-icons";
 import * as ImagePicker from "expo-image-picker";
 import { LinearGradient } from "expo-linear-gradient";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
+import { getAuth } from "firebase/auth";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -19,19 +22,16 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-
-import {
-  checkUsernameAvailability,
-  pickAndUploadAvatar,
-  type AvatarResult,
-} from "../../src/utils/profileUpload";
-import { isNetworkError } from "../../src/utils/tokenManager";
+import { authHeaders } from "../../src/utils/tokenManager";
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
 const TOAST_DURATION = 4000;
+const MAX_PHOTO_BYTES = 5 * 1024 * 1024;
 
+// ── Username availability cache (session-only) ─────────────────────────────
 const usernameCache = new Map<string, boolean>();
 
+// ── Types ──────────────────────────────────────────────────────────────────
 type UsernameStatus =
   | "idle"
   | "typing"
@@ -40,11 +40,16 @@ type UsernameStatus =
   | "taken"
   | "invalid"
   | "error";
+
+// "none"   → no photo selected
+// "picked" → photo chosen locally, will upload on submit
 type PhotoState = "none" | "picked";
+
 type StepStatus = "idle" | "loading" | "done" | "error";
 type ToastType = "network" | "server" | null;
 type Step = { key: string; label: string; status: StepStatus };
 
+// ── Toast ──────────────────────────────────────────────────────────────────
 function Toast({
   type,
   message,
@@ -72,20 +77,11 @@ function Toast({
     ]).start();
   }, [visible]);
 
-  const config = {
-    network: {
-      bg: "#1a1000",
-      border: "#FFA500",
-      color: "#FFA500",
-      icon: "wifi-off-outline",
-    },
-    server: {
-      bg: "#1a0000",
-      border: "#E91429",
-      color: "#E91429",
-      icon: "alert-circle-outline",
-    },
-  }[type || "server"];
+  const isNetwork = type === "network";
+  const bg = isNetwork ? "#1a1000" : "#1a0000";
+  const border = isNetwork ? "#FFA500" : "#E91429";
+  const color = isNetwork ? "#FFA500" : "#E91429";
+  const icon = isNetwork ? "wifi-off-outline" : "alert-circle-outline";
 
   return (
     <Animated.View
@@ -93,15 +89,15 @@ function Toast({
       style={[
         ts.wrap,
         {
-          backgroundColor: config.bg,
-          borderColor: config.border,
+          backgroundColor: bg,
+          borderColor: border,
           opacity,
           transform: [{ translateY }],
         },
       ]}
     >
-      <Ionicons name={config.icon as any} size={18} color={config.color} />
-      <Text style={[ts.text, { color: config.color }]}>{message}</Text>
+      <Ionicons name={icon as any} size={18} color={color} />
+      <Text style={[ts.text, { color }]}>{message}</Text>
     </Animated.View>
   );
 }
@@ -129,6 +125,7 @@ const ts = StyleSheet.create({
   text: { flex: 1, fontSize: 14, fontWeight: "500", lineHeight: 20 },
 });
 
+// ── Progress overlay ───────────────────────────────────────────────────────
 function ProgressScreen({ steps }: { steps: Step[] }) {
   const allDone = steps.every((s) => s.status === "done");
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -196,12 +193,14 @@ function ProgressScreen({ steps }: { steps: Step[] }) {
           </Animated.View>
         )}
       </View>
+
       <Text style={ps.title}>
         {allDone ? "You're all set!" : "Setting up your account"}
       </Text>
       {allDone && (
         <Text style={ps.subtitle}>Redirecting to the community…</Text>
       )}
+
       <View style={ps.stepsWrap}>
         {steps.map((step) => (
           <View key={step.key} style={ps.stepRow}>
@@ -310,6 +309,7 @@ const ps = StyleSheet.create({
   stepIdle: { color: "rgba(255,255,255,0.25)" },
 });
 
+// ── Main screen ────────────────────────────────────────────────────────────
 export default function Device() {
   const router = useRouter();
   const params = useLocalSearchParams();
@@ -317,14 +317,18 @@ export default function Device() {
   const [username, setUsername] = useState("");
   const [usernameStatus, setUsernameStatus] = useState<UsernameStatus>("idle");
   const [usernameMsg, setUsernameMsg] = useState("");
+
+  // Photo: stored locally only until submit
   const [photoState, setPhotoState] = useState<PhotoState>("none");
   const [avatarLocalUri, setAvatarLocalUri] = useState<string | null>(null);
   const [avatarMime, setAvatarMime] = useState<string>("image/jpeg");
+
   const [showProgress, setShowProgress] = useState(false);
   const [steps, setSteps] = useState<Step[]>([
     { key: "photo", label: "Uploading photo...", status: "idle" },
     { key: "save", label: "Saving account...", status: "idle" },
   ]);
+
   const [toast, setToast] = useState<{ type: ToastType; message: string }>({
     type: null,
     message: "",
@@ -334,7 +338,9 @@ export default function Device() {
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const canSubmit = usernameStatus === "available" && !showProgress;
+  // Username available + not mid-submit
+  const usernameReady = usernameStatus === "available";
+  const canSubmit = usernameReady && !showProgress;
 
   useEffect(() => {
     return () => {
@@ -343,6 +349,7 @@ export default function Device() {
     };
   }, []);
 
+  // ── Toast helper ─────────────────────────────────────────────────────────
   const showToast = useCallback((type: ToastType, message: string) => {
     if (toastTimer.current) clearTimeout(toastTimer.current);
     setToast({ type, message });
@@ -353,6 +360,7 @@ export default function Device() {
     );
   }, []);
 
+  // ── Step helper ───────────────────────────────────────────────────────────
   const setStep = useCallback(
     (key: string, status: StepStatus, label?: string) => {
       setSteps((prev) =>
@@ -364,158 +372,160 @@ export default function Device() {
     [],
   );
 
+  // ── Pick photo — local preview only, no upload ────────────────────────────
   const handlePickAvatar = useCallback(async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== "granted") {
       showToast("server", "Please allow photo access.");
       return;
     }
+
     const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      mediaTypes: ImagePicker.MediaType.Images,
       allowsEditing: true,
       aspect: [1, 1],
       quality: 0.85,
     });
+
     if (result.canceled || !result.assets?.[0]) return;
+
     const asset = result.assets[0];
-    if (asset.fileSize && asset.fileSize > 5 * 1024 * 1024) {
+
+    if (asset.fileSize && asset.fileSize > MAX_PHOTO_BYTES) {
       showToast("server", "Photo must be under 5 MB.");
       return;
     }
+
+    // Store locally — upload happens in handleSubmit
     setAvatarLocalUri(asset.uri);
     setAvatarMime(asset.mimeType ?? guessMime(asset.uri));
     setPhotoState("picked");
   }, [showToast]);
 
-  const onUsernameChange = useCallback(
-    async (raw: string) => {
-      const cleaned = raw.toLowerCase().replace(/[^a-z0-9_]/g, "");
-      setUsername(cleaned);
-      if (debounceRef.current) clearTimeout(debounceRef.current);
-      if (cleaned.length === 0) {
-        setUsernameStatus("idle");
-        setUsernameMsg("");
-        return;
-      }
-      if (cleaned.length < 3) {
-        setUsernameStatus("typing");
-        setUsernameMsg("At least 3 characters required.");
-        return;
-      }
-      if (cleaned.length > 20) {
-        setUsernameStatus("invalid");
-        setUsernameMsg("Maximum 20 characters.");
-        return;
-      }
-      if (usernameCache.has(cleaned)) {
-        const available = usernameCache.get(cleaned)!;
-        setUsernameStatus(available ? "available" : "taken");
-        setUsernameMsg(
-          available ? "Username is available" : "Username already taken.",
-        );
-        return;
-      }
-      setUsernameStatus("checking");
-      setUsernameMsg("Checking availability…");
-      debounceRef.current = setTimeout(async () => {
-        try {
-          const result = await checkUsernameAvailability(cleaned);
-          if (!result.ok) {
-            if (result.code === "NETWORK_ERROR") {
-              setUsernameStatus("error");
-              setUsernameMsg("Poor internet connection. Try again later.");
-              showToast(
-                "network",
-                "Poor internet connection. Try again later.",
-              );
-            } else {
-              setUsernameStatus("error");
-              setUsernameMsg(result.message || "Check failed.");
-            }
-            return;
-          }
-          usernameCache.set(cleaned, result.available);
-          setUsernameStatus(result.available ? "available" : "taken");
-          setUsernameMsg(result.message);
-        } catch (error: any) {
-          console.error("[Device] Username check error:", error);
-          if (isNetworkError(error)) {
-            setUsernameStatus("error");
-            setUsernameMsg("Poor internet connection. Try again later.");
-            showToast("network", "Poor internet connection. Try again later.");
-          } else {
-            setUsernameStatus("error");
-            setUsernameMsg("No connection. Try again.");
-          }
-        }
-      }, 600);
-    },
-    [showToast],
-  );
+  // ── Username availability check ───────────────────────────────────────────
+  const onUsernameChange = useCallback((raw: string) => {
+    const cleaned = raw.toLowerCase().replace(/[^a-z0-9_]/g, "");
+    setUsername(cleaned);
 
-  const handleSubmit = useCallback(async () => {
-    if (!canSubmit) return;
-    const userEmail = params.userEmail as string;
-    const userUid = params.userUid as string;
+    if (debounceRef.current) clearTimeout(debounceRef.current);
 
-    if (!userEmail || !userUid) {
-      showToast("server", "Missing user info. Please restart.");
+    if (cleaned.length === 0) {
+      setUsernameStatus("idle");
+      setUsernameMsg("");
+      return;
+    }
+    if (cleaned.length < 3) {
+      setUsernameStatus("typing");
+      setUsernameMsg("At least 3 characters required.");
+      return;
+    }
+    if (cleaned.length > 20) {
+      setUsernameStatus("invalid");
+      setUsernameMsg("Maximum 20 characters.");
       return;
     }
 
+    // Cache hit
+    if (usernameCache.has(cleaned)) {
+      const available = usernameCache.get(cleaned)!;
+      setUsernameStatus(available ? "available" : "taken");
+      setUsernameMsg(
+        available ? "Username is available" : "Username already taken.",
+      );
+      return;
+    }
+
+    setUsernameStatus("checking");
+    setUsernameMsg("Checking availability…");
+
+    debounceRef.current = setTimeout(async () => {
+      try {
+        const res = await fetch(
+          `${API_URL}/api/auth/check-username?username=${encodeURIComponent(cleaned)}`,
+        );
+        const data = await res.json().catch(() => ({}));
+
+        if (!res.ok) {
+          setUsernameStatus(
+            data.code === "INVALID_FORMAT" ? "invalid" : "error",
+          );
+          setUsernameMsg(data.message ?? "Could not check username.");
+          return;
+        }
+
+        usernameCache.set(cleaned, data.available);
+        setUsernameStatus(data.available ? "available" : "taken");
+        setUsernameMsg(
+          data.available ? "Username is available" : "Username already taken.",
+        );
+      } catch {
+        setUsernameStatus("error");
+        setUsernameMsg("No connection. Try again.");
+      }
+    }, 600);
+  }, []);
+
+  // ── Submit: upload photo then save profile ────────────────────────────────
+  const handleSubmit = useCallback(async () => {
+    if (!canSubmit) return;
+
+    const authUser = getAuth().currentUser;
+    const userEmail = authUser?.email || (params.userEmail as string);
+
+    if (!userEmail) {
+      showToast("server", "Session expired. Please sign in again.");
+      return;
+    }
+
+    // Reset steps for this attempt
     setSteps([
       { key: "photo", label: "Uploading photo...", status: "idle" },
       { key: "save", label: "Saving account...", status: "idle" },
     ]);
     setShowProgress(true);
 
+    // ── Step 1: Upload photo (only now, on submit) ──────────────────────────
     let finalAvatarUrl: string | null = null;
+
     if (photoState === "none") {
       setStep("photo", "done", "Skipped");
     } else {
       setStep("photo", "loading", "Uploading photo...");
       try {
-        const result: AvatarResult = await pickAndUploadAvatar();
-        if (!result.ok) {
-          if (result.error.code === "NETWORK_ERROR") {
-            showToast("network", "Poor internet connection. Try again later.");
-          } else if (result.error.code === "PERMISSION_DENIED") {
-            showToast("server", result.error.message);
-          } else if (result.error.code === "FILE_TOO_LARGE") {
-            showToast("server", result.error.message);
-          } else if (result.error.code === "INVALID_TYPE") {
-            showToast("server", result.error.message);
-          } else {
-            showToast("server", result.error.message || "Upload failed.");
-          }
-          setStep("photo", "error", "Failed");
-          setShowProgress(false);
-          return;
-        }
-        finalAvatarUrl = result.avatarUrl;
+        finalAvatarUrl = await uploadAvatarToSupabase(
+          avatarLocalUri!,
+          avatarMime,
+        );
         setStep("photo", "done", "Uploaded ✓");
       } catch (err: any) {
-        console.error("[Device] Avatar upload exception:", err);
-        setStep("photo", "error", "Failed");
+        setStep("photo", "error", "Upload failed");
         setShowProgress(false);
-        showToast("server", "Photo upload failed. Try again.");
+        if (err?.message === "network") {
+          showToast("network", "No internet — photo upload failed.");
+        } else if (err?.message === "size") {
+          showToast("server", "Photo must be under 5 MB.");
+        } else {
+          showToast("server", "Photo upload failed. Try again.");
+        }
         return;
       }
     }
 
+    // ── Step 2: Save profile (backend atomic lock) ──────────────────────────
     setStep("save", "loading");
     try {
+      const headers = await authHeaders();
       const payload: Record<string, string> = {
-        uid: userUid,
         username: username.trim().toLowerCase(),
         name: username.trim(),
         email: userEmail,
       };
-      if (finalAvatarUrl) payload.avatarUrl = finalAvatarUrl;
+      // Store the full Supabase public URL as avatarFileId
+      if (finalAvatarUrl) payload.avatarFileId = finalAvatarUrl;
 
       const res = await fetch(`${API_URL}/api/users/profile`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...headers, "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
       const body = await res.json().catch(() => ({}));
@@ -523,13 +533,14 @@ export default function Device() {
       if (!res.ok) {
         setStep("save", "error", "Failed");
         setShowProgress(false);
+
         if (body.code === "USERNAME_TAKEN") {
           setUsernameStatus("taken");
           setUsernameMsg("Just got taken. Please choose another.");
           showToast("server", "Username taken. Try another.");
         } else if (body.code === "USERNAME_LOCKED") {
           showToast("server", "Account already set up. Redirecting…");
-          setTimeout(() => router.replace("../(tabs)/discord"), 1800);
+          setTimeout(() => router.replace("/tabs/discord"), 1800);
         } else if (res.status >= 500) {
           showToast("server", "Server error. Please try again.");
         } else {
@@ -537,19 +548,16 @@ export default function Device() {
         }
         return;
       }
+
       setStep("save", "done", "Saved ✓");
-    } catch (error: any) {
+    } catch {
       setStep("save", "error", "Failed");
       setShowProgress(false);
-
-      if (isNetworkError(error)) {
-        showToast("network", "Poor internet connection. Try again later.");
-      } else {
-        showToast("network", "Poor internet connection. Try again later.");
-      }
+      showToast("network", "No internet. Check connection and retry.");
       return;
     }
-    setTimeout(() => router.replace("../(tabs)/discord"), 2000);
+
+    setTimeout(() => router.replace("/tabs/discord"), 2000);
   }, [
     canSubmit,
     username,
@@ -562,6 +570,7 @@ export default function Device() {
     params,
   ]);
 
+  // ── Derived UI values ─────────────────────────────────────────────────────
   const uColor: Record<UsernameStatus, string> = {
     idle: "#555",
     typing: "#555",
@@ -571,6 +580,7 @@ export default function Device() {
     invalid: "#E91429",
     error: "#FFA500",
   };
+
   const uIcon: Record<UsernameStatus, string> = {
     idle: "at-outline",
     typing: "at-outline",
@@ -580,6 +590,7 @@ export default function Device() {
     invalid: "alert-circle-outline",
     error: "wifi-outline",
   };
+
   const uBorder: Record<UsernameStatus, string> = {
     idle: "rgba(255,255,255,0.08)",
     typing: "rgba(255,255,255,0.08)",
@@ -589,23 +600,14 @@ export default function Device() {
     invalid: "#E91429",
     error: "#FFA500",
   };
-  const disabledHint = !canSubmit
+
+  const disabledHint = !usernameReady
     ? usernameStatus === "checking"
       ? "Checking username…"
       : usernameStatus === "taken"
         ? "Choose another username."
         : "Enter a valid username first."
     : "";
-
-  function guessMime(uri: string): string {
-    const u = uri.toLowerCase();
-    if (u.endsWith(".png")) return "image/png";
-    if (u.endsWith(".jpg") || u.endsWith(".jpeg")) return "image/jpeg";
-    if (u.endsWith(".webp")) return "image/webp";
-    if (u.endsWith(".gif")) return "image/gif";
-    if (u.endsWith(".heic") || u.endsWith(".heif")) return "image/heic";
-    return "image/jpeg";
-  }
 
   return (
     <View style={s.root}>
@@ -616,6 +618,7 @@ export default function Device() {
       />
       <View style={[s.orb, s.orb1]} />
       <View style={[s.orb, s.orb2]} />
+
       <SafeAreaView style={s.safe}>
         <KeyboardAvoidingView
           style={{ flex: 1 }}
@@ -626,6 +629,7 @@ export default function Device() {
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator={false}
           >
+            {/* ── Avatar picker ─────────────────────────────────────────── */}
             <TouchableOpacity
               style={s.avatarWrap}
               onPress={handlePickAvatar}
@@ -646,13 +650,17 @@ export default function Device() {
                 />
               </View>
             </TouchableOpacity>
+
             <Text style={s.avatarHint}>
               {photoState === "picked"
                 ? "Tap to change · uploads on submit"
                 : "Add photo (optional)"}
             </Text>
+
             <Text style={s.title}>Choose your username</Text>
             <Text style={s.sub}>Enter a unique name to get started.</Text>
+
+            {/* ── Username input ────────────────────────────────────────── */}
             <View style={s.card}>
               <View style={s.cardEdge} />
               <Text style={s.label}>USERNAME</Text>
@@ -677,18 +685,19 @@ export default function Device() {
                   <ActivityIndicator size="small" color="#B3B3B3" />
                 )}
               </View>
-              {usernameMsg && (
+              {usernameMsg ? (
                 <Text
                   style={[s.usernameMsg, { color: uColor[usernameStatus] }]}
                 >
                   {usernameMsg}
                 </Text>
-              )}
+              ) : null}
               <Text style={s.usernameHint}>
                 Letters, numbers, underscores · 3–20 chars
               </Text>
             </View>
 
+            {/* ── Submit ───────────────────────────────────────────────── */}
             <TouchableOpacity
               onPress={handleSubmit}
               disabled={!canSubmit}
@@ -698,18 +707,83 @@ export default function Device() {
               <Text style={s.btnText}>Get Started →</Text>
             </TouchableOpacity>
 
-            {!canSubmit && disabledHint && (
+            {!canSubmit && disabledHint ? (
               <Text style={s.disabledHint}>{disabledHint}</Text>
-            )}
+            ) : null}
           </ScrollView>
         </KeyboardAvoidingView>
       </SafeAreaView>
+
+      {/* Progress overlay */}
       {showProgress && <ProgressScreen steps={steps} />}
+
+      {/* Toast */}
       <Toast type={toast.type} message={toast.message} visible={toastVisible} />
     </View>
   );
 }
 
+// ── Avatar upload via backend → Supabase Storage ───────────────────────────
+// Returns the full Supabase public URL (stored as avatarFileId in MongoDB)
+async function uploadAvatarToSupabase(
+  localUri: string,
+  mimeType: string,
+): Promise<string> {
+  const allowed = ["image/jpeg", "image/png", "image/webp"];
+  const safeMime = allowed.includes(mimeType) ? mimeType : "image/jpeg";
+
+  let blob: Blob;
+  try {
+    const r = await fetch(localUri);
+    blob = await r.blob();
+  } catch {
+    throw new Error("network");
+  }
+
+  if (blob.size > MAX_PHOTO_BYTES) throw new Error("size");
+
+  const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
+  let headers: Record<string, string>;
+  try {
+    const { authHeaders } = await import("../../src/utils/tokenManager");
+    headers = await authHeaders();
+  } catch {
+    throw new Error("network");
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/api/avatar`, {
+      method: "POST",
+      headers: {
+        ...headers,
+        "Content-Type": safeMime,
+        "Content-Length": String(blob.size),
+      },
+      body: blob,
+    });
+  } catch {
+    throw new Error("network");
+  }
+
+  if (!res.ok) throw new Error("server");
+
+  const body = await res.json().catch(() => ({}));
+
+  // Supabase returns avatarUrl directly as a full public CDN URL
+  if (!body.avatarUrl) throw new Error("server");
+
+  return body.avatarUrl;
+}
+
+function guessMime(uri: string): string {
+  const u = uri.toLowerCase();
+  if (u.includes(".png")) return "image/png";
+  if (u.includes(".webp")) return "image/webp";
+  return "image/jpeg";
+}
+
+// ── Styles ─────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#000" },
   safe: { flex: 1 },

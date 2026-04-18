@@ -5,18 +5,17 @@ import {
   useRootNavigationState,
   useRouter,
 } from "expo-router";
-import { useEffect, useState } from "react";
+import * as SecureStore from "expo-secure-store"; // ✅ Direct SecureStore import
+import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
 import { SessionExpiredProvider } from "../src/context/SessionExpiredContext";
 import { useSessionHeartbeat } from "../src/hooks/useSessionHeartbeat";
 import { useAuth } from "../src/store/authStore";
 import { getLastRoute } from "../src/utils/cacheAppState";
-import { getBackendToken, getUserData } from "../src/utils/tokenManager";
+import { getUserData } from "../src/utils/tokenManager";
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
-
-// 🔒 Module-level flag survives component remounts, Fast Refresh & nav transitions
-let BOOT_LOCKED = false;
+const REFRESH_TOKEN_KEY = "refreshToken"; // 🔑 MUST match your actual key
 
 export default function RootLayout() {
   const router = useRouter();
@@ -25,35 +24,63 @@ export default function RootLayout() {
   const { checkAuth, isAuthenticated, isChecking } = useAuth();
   const [showExpired, setShowExpired] = useState(false);
 
+  // ✅ Use ref + module flag for bulletproof single execution
+  const didBoot = useRef(false);
+  const BOOT_LOCKED = useRef(false);
+
   useSessionHeartbeat(isAuthenticated);
 
   useEffect(() => {
-    // 🛑 TRIPLE GUARD: Prevents loop 100% of the time
-    if (BOOT_LOCKED) return; // Already ran this session
-    if (pathname === "/welcome" || pathname === "welcome") return; // Already on target
-    if (!navState?.key) return; // Navigation container not ready
+    // 🛑 TRIPLE GUARD - prevents any redirect loops
+    if (BOOT_LOCKED.current || didBoot.current) return;
 
-    BOOT_LOCKED = true; // 🔒 Lock immediately (won't reset on remount)
+    // ✅ Only check pathname AFTER navigation is ready
+    if (!navState?.key) return;
+
+    // ✅ Normalize pathname check (Expo Router always uses leading slash)
+    if (pathname?.startsWith("/welcome")) return;
+
+    // 🔒 Lock immediately before any async work
+    didBoot.current = true;
+    BOOT_LOCKED.current = true;
 
     const boot = async () => {
       try {
-        const token = await getBackendToken();
+        // 🔐 DIRECT SECURESTORE CHECK (bypasses any caching in getBackendToken)
+        console.log(
+          "[RootLayout] Checking SecureStore for:",
+          REFRESH_TOKEN_KEY,
+        );
+        const refreshToken = await SecureStore.getItemAsync(REFRESH_TOKEN_KEY);
+        const hasValidToken = !!refreshToken && refreshToken.trim() !== "";
 
-        if (!token) {
-          console.log("[RootLayout] No valid token → redirect to /welcome");
-          setTimeout(() => router.replace({ pathname: "/welcome" }), 300);
+        if (!hasValidToken) {
+          console.log(
+            "[RootLayout] ❌ No refresh token → redirect to /welcome",
+          );
+          // ✅ Use replace with explicit pathname object for reliability
+          router.replace({ pathname: "/welcome" });
           return;
         }
 
+        console.log("[RootLayout] ✅ Token found, proceeding with auth...");
+
+        // ✅ Token exists → validate with backend
         const valid = await checkAuth();
         if (!valid) {
-          console.log("[RootLayout] Auth failed → redirect to /welcome");
-          setTimeout(() => router.replace({ pathname: "/welcome" }), 300);
+          console.log(
+            "[RootLayout] ❌ Auth validation failed → redirect to /welcome",
+          );
+          router.replace({ pathname: "/welcome" });
           return;
         }
 
+        // ✅ Auth passed → check profile completion
         const user = await getUserData();
         if (!user?.hasProfile) {
+          console.log(
+            "[RootLayout] ⚠️ Profile incomplete → redirect to /auth/device",
+          );
           router.replace({
             pathname: "/auth/device",
             params: { userEmail: user?.email || "" },
@@ -61,6 +88,8 @@ export default function RootLayout() {
           return;
         }
 
+        // ✅ All checks passed → restore session
+        console.log("[RootLayout] ✅ All checks passed, restoring session...");
         const lastRoute = await getLastRoute();
         const publicRoutes = [
           "/welcome",
@@ -76,22 +105,24 @@ export default function RootLayout() {
           router.replace("/(tabs)/discord");
         }
       } catch (error) {
-        console.error("[RootLayout] Boot error:", error);
-        setTimeout(() => router.replace({ pathname: "/welcome" }), 300);
+        console.error("[RootLayout] 💥 Boot error:", error);
+        // ✅ On any error, safely redirect to welcome
+        if (!pathname?.startsWith("/welcome")) {
+          router.replace({ pathname: "/welcome" });
+        }
       }
     };
 
     boot();
-  }, [navState?.key, pathname]);
+  }, [navState?.key]); // ✅ Only depend on navState - pathname changes handled inside
 
-  // ✅ FIX: Only show splash overlay if NOT already navigating to welcome
-  // This prevents the overlay from blocking the welcome screen after redirect
-  const showSplash =
-    isChecking && pathname !== "/welcome" && pathname !== "welcome";
+  // ✅ Show splash ONLY during initial auth check, never block navigation
+  const shouldShowSplash = isChecking && !pathname?.startsWith("/welcome");
 
   return (
     <>
-      {showSplash && (
+      {/* ✅ Splash overlay - pointerEvents=none ensures it doesn't block touches */}
+      {shouldShowSplash && (
         <View style={StyleSheet.absoluteFillObject} pointerEvents="none">
           <View style={styles.splash}>
             <ActivityIndicator size="large" color="#1DB954" />
@@ -107,7 +138,7 @@ export default function RootLayout() {
           router.replace("/auth/otp");
         }}
       >
-        {/* ✅ Stack ALWAYS renders - navigation happens even if splash is visible */}
+        {/* ✅ Stack ALWAYS renders - navigation works even during splash */}
         <Stack
           screenOptions={{
             headerShown: false,
