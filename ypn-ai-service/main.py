@@ -41,12 +41,17 @@ logger.info("[init] Cohere V2 client initialized")
 # Use latest supported model
 MODEL = "command-r-plus-08-2024"
 
-# ── Enhanced System Prompt with Name Handling ─────────────────────────────────
+# ── Enhanced System Prompt with Creator Info & Name Handling ──────────────────
 SYSTEM_PROMPT = (
     "You are YPN AI, a warm and helpful assistant for Team YPN — "
     "a youth empowerment network based in Zimbabwe. "
     "Be concise, helpful, and natural like ChatGPT. "
     "Avoid long explanations unless asked.\n\n"
+    "--- CREATOR INFO (Respond when asked 'who made you', 'creator', 'who created you') ---\n"
+    "I was created by Mathews Tafadzwa Runowanda, born 21 April 2006. "
+    "He created me as a side project while learning at Cheziga Gokwe High School in September 2024. "
+    "His vision is to help bring youths close together, form networks for sharing ideas, "
+    "and support mental well-being and counselling.\n\n"
     "--- NAME HANDLING RULES ---\n"
     "1. If the user greets you (e.g., 'hello', 'hi', 'hey') and you DON'T know their name yet, "
     "   respond warmly and ASK for their name. Example: 'Hello! 👋 I'm YPN AI. What's your name?'\n"
@@ -101,94 +106,100 @@ app.add_middleware(
 )
 
 
-# Request model
+# ── Request model with email for session isolation ────────────────────────────
 class ChatRequest(BaseModel):
     message: str
     session_id: str = "default"
+    email: str = ""  # 🔥 NEW: Unique user identifier for isolation
 
 
-# ── Redis Helpers ─────────────────────────────────────────────────────────────
-def _get_redis_key(session_id: str) -> str:
+# ── Redis Helpers (Email-Aware) ───────────────────────────────────────────────
+def _get_redis_key(session_id: str, email: str = "") -> str:
+    """Generate unique Redis key using email if provided."""
+    if email:
+        # Sanitize email for Redis key (replace @ and . with safe chars)
+        safe_email = email.lower().replace("@", "_at_").replace(".", "_dot_")
+        return f"session:{safe_email}"
     return f"session:{session_id}"
 
 
-def _get_name_redis_key(session_id: str) -> str:
+def _get_name_redis_key(session_id: str, email: str = "") -> str:
+    """Generate unique name storage key using email."""
+    if email:
+        safe_email = email.lower().replace("@", "_at_").replace(".", "_dot_")
+        return f"name:{safe_email}"
     return f"name:{session_id}"
 
 
-def _get_session_from_redis(session_id: str) -> list:
-    """Load session history from Redis."""
+def _get_session_from_redis(session_id: str, email: str = "") -> list:
+    """Load session history from Redis using email if provided."""
     if not redis:
         return sessions.get(session_id, [])
     try:
-        data = redis.get(_get_redis_key(session_id))
+        key = _get_redis_key(session_id, email)
+        data = redis.get(key)
         return json.loads(data) if data else []
     except Exception as e:
         logger.error(f"[redis] Error loading session: {e}")
         return sessions.get(session_id, [])
 
 
-def _save_session_to_redis(session_id: str, history: list):
-    """Save session history to Redis with 24h TTL."""
+def _save_session_to_redis(session_id: str, history: list, email: str = ""):
+    """Save session history to Redis with 24h TTL using email."""
     if not redis:
         sessions[session_id] = history
         return
     try:
-        key = _get_redis_key(session_id)
+        key = _get_redis_key(session_id, email)
         redis.set(key, json.dumps(history), ex=86400)  # 24 hours
     except Exception as e:
         logger.error(f"[redis] Error saving session: {e}")
         sessions[session_id] = history
 
 
-def _get_user_name(session_id: str) -> str:
-    """Get stored user name from Redis."""
+def _get_user_name(session_id: str, email: str = "") -> str:
+    """Get stored user name from Redis using email."""
     if not redis:
         return ""
     try:
-        name = redis.get(_get_name_redis_key(session_id))
+        key = _get_name_redis_key(session_id, email)
+        name = redis.get(key)
         return name if name else ""
     except Exception as e:
         logger.error(f"[redis] Error getting name: {e}")
         return ""
 
 
-def _save_user_name(session_id: str, name: str):
-    """Save user name to Redis with 7-day TTL."""
+def _save_user_name(session_id: str, name: str, email: str = ""):
+    """Save user name to Redis with 7-day TTL using email."""
     if not redis:
         return
     try:
-        redis.set(_get_name_redis_key(session_id), name, ex=604800)  # 7 days
-        logger.debug(f"[redis] Saved name '{name}' for session={session_id}")
+        key = _get_name_redis_key(session_id, email)
+        redis.set(key, name, ex=604800)  # 7 days
+        logger.debug(f"[redis] Saved name '{name}' for email={email or session_id}")
     except Exception as e:
         logger.error(f"[redis] Error saving name: {e}")
 
 
-# ── Supabase Helpers (Schema-Compatible) ──────────────────────────────────────
-def _log_message_to_supabase(session_id: str, role: str, content: str):
+# ── Supabase Helpers (Email-Aware, Schema-Compatible) ─────────────────────────
+def _log_message_to_supabase(session_id: str, role: str, content: str, email: str = ""):
     """
-    Persist message to Supabase using ONLY existing columns:
-    - user_id (TEXT)
-    - role (TEXT) 
-    - content (TEXT)
-    - created_at (auto-default, not inserted)
-    
-    Non-critical: failures are logged but don't break the chat.
+    Persist message to Supabase using email as user_id if provided.
+    Uses ONLY existing columns: user_id, role, content.
     """
     if not supabase:
         return
-    
     try:
+        # 🔥 Use email as user_id for isolation, fallback to session_id
+        user_id = email if email else session_id
         supabase.table("messages").insert({
-            "user_id": session_id,
+            "user_id": user_id,  # Email isolates messages per account
             "role": role,
             "content": content.strip()
-            # ✅ Only these 3 columns - matches your exact schema
-            # ❌ No 'metadata', no 'created_at' (auto-handled by DB)
         }).execute()
-        logger.debug(f"[supabase] Logged {role} message for session={session_id}")
+        logger.debug(f"[supabase] Logged {role} message for user={user_id}")
     except Exception as e:
-        # Log but don't crash — chat continues with Redis only
         logger.error(f"[supabase] Insert failed (non-critical): {e}")
 
 
@@ -200,9 +211,10 @@ def build_messages(history: list, message: str) -> list:
     return msgs
 
 
-# ── Helper: Cache key generator ───────────────────────────────────────────────
-def cache_key(session_id: str, message: str, history: list) -> str:
-    raw = session_id + message + json.dumps(history, sort_keys=True)
+# ── Helper: Cache key generator (Email-Aware) ─────────────────────────────────
+def cache_key(session_id: str, message: str, history: list, email: str = "") -> str:
+    """Generate cache key including email for isolation."""
+    raw = (email or session_id) + message + json.dumps(history, sort_keys=True)
     return hashlib.md5(raw.encode()).hexdigest()
 
 
@@ -214,14 +226,12 @@ def extract_name_from_message(message: str) -> str:
     """
     message_lower = message.lower()
     
-    # Pattern: "my name is [name]"
     if "my name is" in message_lower:
         parts = message_lower.split("my name is")
         if len(parts) > 1:
             name = parts[1].strip().split()[0].capitalize()
             return name.rstrip(".,!?")
     
-    # Pattern: "I am [name]" or "I'm [name]"
     if "i am " in message_lower or "i'm " in message_lower:
         marker = "i am " if "i am " in message_lower else "i'm "
         parts = message_lower.split(marker)
@@ -229,7 +239,6 @@ def extract_name_from_message(message: str) -> str:
             name = parts[1].strip().split()[0].capitalize()
             return name.rstrip(".,!?")
     
-    # Pattern: "call me [name]"
     if "call me " in message_lower:
         parts = message_lower.split("call me ")
         if len(parts) > 1:
@@ -267,34 +276,36 @@ async def health():
     }
 
 
-# Normal chat endpoint (JSON)
+# Normal chat endpoint (JSON) - Email-Aware
 @app.post("/chat")
 async def chat(req: ChatRequest):
     message = req.message.strip()
     session_id = req.session_id.strip() or "default"
+    email = req.email.strip().lower() if req.email else ""  # 🔥 Get email
 
     if not message:
         raise HTTPException(400, "Message cannot be empty")
 
-    # Get stored user name
-    user_name = _get_user_name(session_id)
+    # Get stored user name using email
+    user_name = _get_user_name(session_id, email)
     
     # Check if user is providing their name
     extracted_name = extract_name_from_message(message)
     if extracted_name:
-        _save_user_name(session_id, extracted_name)
+        _save_user_name(session_id, extracted_name, email)
         user_name = extracted_name
-        logger.info(f"[chat] Captured user name '{user_name}' for session={session_id}")
+        logger.info(f"[chat] Captured name '{user_name}' for email={email or session_id}")
 
-    # Load history from Redis (or memory fallback)
-    history = _get_session_from_redis(session_id)
+    # Load history from Redis using email
+    history = _get_session_from_redis(session_id, email)
     history = _trim_history(history)
 
-    key = cache_key(session_id, message, history)
+    # Cache key includes email for isolation
+    key = cache_key(session_id, message, history, email)
 
     # Return cached reply if available
     if key in cache:
-        logger.debug(f"[chat] Cache hit for session={session_id}")
+        logger.debug(f"[chat] Cache hit for email={email or session_id}")
         return {"reply": cache[key], "cached": True, "user_name": user_name}
 
     try:
@@ -312,14 +323,14 @@ async def chat(req: ChatRequest):
         history.append({"role": "assistant", "content": reply})
         history = history[-20:]
 
-        # Save to Redis (or memory fallback)
-        _save_session_to_redis(session_id, history)
+        # Save to Redis using email
+        _save_session_to_redis(session_id, history, email)
 
-        # Log to Supabase (non-critical, schema-compatible)
-        _log_message_to_supabase(session_id, "user", message)
-        _log_message_to_supabase(session_id, "assistant", reply)
+        # Log to Supabase using email as user_id
+        _log_message_to_supabase(session_id, "user", message, email)
+        _log_message_to_supabase(session_id, "assistant", reply, email)
 
-        # Cache result
+        # Cache result (email-isolated)
         cache[key] = reply
 
         return {"reply": reply, "cached": False, "user_name": user_name}
@@ -329,32 +340,31 @@ async def chat(req: ChatRequest):
         raise HTTPException(500, str(e))
 
 
-# Streaming chat endpoint (ChatGPT-like)
+# Streaming chat endpoint (Email-Aware)
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
     message = req.message.strip()
     session_id = req.session_id.strip() or "default"
+    email = req.email.strip().lower() if req.email else ""
 
     if not message:
         raise HTTPException(400, "Message cannot be empty")
 
-    # Get stored user name
-    user_name = _get_user_name(session_id)
+    # Get stored user name using email
+    user_name = _get_user_name(session_id, email)
     
     # Check if user is providing their name
     extracted_name = extract_name_from_message(message)
     if extracted_name:
-        _save_user_name(session_id, extracted_name)
+        _save_user_name(session_id, extracted_name, email)
         user_name = extracted_name
-        logger.info(f"[stream] Captured user name '{user_name}' for session={session_id}")
 
-    # Load history from Redis (or memory fallback)
-    history = _get_session_from_redis(session_id)
+    # Load history from Redis using email
+    history = _get_session_from_redis(session_id, email)
     history = _trim_history(history)
 
     async def generate():
         full_text = ""
-
         try:
             stream = co.chat_stream(
                 model=MODEL,
@@ -362,7 +372,6 @@ async def chat_stream(req: ChatRequest):
                 temperature=0.7,
                 max_tokens=200,
             )
-
             for event in stream:
                 if event.type == "content-delta":
                     chunk = event.delta.message.content.text
@@ -371,15 +380,15 @@ async def chat_stream(req: ChatRequest):
                         yield chunk
                         await asyncio.sleep(0.01)
 
-            # Save session after streaming ends
+            # Save session after streaming ends using email
             history.append({"role": "user", "content": message})
             history.append({"role": "assistant", "content": full_text})
             history = history[-20:]
-            _save_session_to_redis(session_id, history)
+            _save_session_to_redis(session_id, history, email)
 
-            # Log to Supabase (non-critical)
-            _log_message_to_supabase(session_id, "user", message)
-            _log_message_to_supabase(session_id, "assistant", full_text)
+            # Log to Supabase using email
+            _log_message_to_supabase(session_id, "user", message, email)
+            _log_message_to_supabase(session_id, "assistant", full_text, email)
 
         except Exception as e:
             logger.error(f"[stream] Error: {e}")
@@ -388,20 +397,20 @@ async def chat_stream(req: ChatRequest):
     return StreamingResponse(generate(), media_type="text/plain")
 
 
-# Clear session (including stored name)
+# Clear session (Email-Aware)
 @app.delete("/chat/{session_id}")
-async def clear_session(session_id: str):
+async def clear_session(session_id: str, email: str = ""):
+    email = email.strip().lower() if email else ""
     if redis:
         try:
-            redis.delete(_get_redis_key(session_id))
-            redis.delete(_get_name_redis_key(session_id))
+            redis.delete(_get_redis_key(session_id, email))
+            redis.delete(_get_name_redis_key(session_id, email))
         except Exception as e:
             logger.error(f"[redis] Error clearing session: {e}")
     else:
         sessions.pop(session_id, None)
-    
-    logger.info(f"[chat] Session cleared: {session_id}")
-    return {"cleared": session_id}
+    logger.info(f"[chat] Session cleared: {email or session_id}")
+    return {"cleared": email or session_id}
 
 
 # ------------------- Background Tasks -------------------

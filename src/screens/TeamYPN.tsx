@@ -14,8 +14,8 @@ import {
   Animated,
   FlatList,
   Image,
+  Keyboard,
   KeyboardAvoidingView,
-  Modal,
   Platform,
   Pressable,
   StatusBar,
@@ -28,6 +28,7 @@ import {
 
 import { resumeOrStartAIStream } from "../errorHandlerAIchat/streamHandler";
 import { Message } from "../types/chat";
+import { getUserEmail } from "../utils/auth"; // 🔥 NEW: Import email helper
 import { getSecureCache, setSecureCache } from "../utils/cache";
 import { useNetworkStatus } from "../utils/network";
 import {
@@ -38,9 +39,8 @@ import {
   clearTeamYPNUnreadBadge,
   incrementUnreadBadge,
 } from "../utils/teamYPNBadge";
-import VoiceCallScreen from "./VoiceCallScreen";
 
-// 🔥 Point to your Python FastAPI Backend (no auth, no heartbeat)
+// 🔥 Point to your Python FastAPI Backend
 const AI_API_URL = `${process.env.EXPO_PUBLIC_AI_URL}/chat`;
 const CACHE_KEY = "chat_team-ypn";
 const UNDO_MS = 3000;
@@ -148,13 +148,15 @@ export default function TeamYPNScreen() {
   const [loading, setLoading] = useState(true);
   const [aiTyping, setAiTyping] = useState(false);
 
-  // Voice modal visibility
-  const [voiceVisible, setVoiceVisible] = useState(false);
-
   const [pending, setPending] = useState<Message | null>(null);
   const undoProgress = useRef(new Animated.Value(1)).current;
   const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const undoAnimRef = useRef<Animated.CompositeAnimation | null>(null);
+
+  // 🔥 Message Queue System for handling rapid sends
+  const messageQueueRef = useRef<string[]>([]);
+  const isProcessingRef = useRef(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const { isConnected } = useNetworkStatus();
   const isChatOpenRef = useRef(true);
@@ -168,6 +170,19 @@ export default function TeamYPNScreen() {
       };
     }, []),
   );
+
+  // 🔥 Keyboard listener to scroll to bottom when keyboard hides
+  useEffect(() => {
+    const keyboardDidHideListener = Keyboard.addListener(
+      "keyboardDidHide",
+      () => {
+        setTimeout(() => {
+          listRef.current?.scrollToEnd({ animated: true });
+        }, 100);
+      },
+    );
+    return () => keyboardDidHideListener.remove();
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -216,20 +231,26 @@ export default function TeamYPNScreen() {
     setTimeout(() => listRef.current?.scrollToEnd({ animated }), 80);
   }, []);
 
-  // 🔥 Fetch AI Reply - Simplified (No Auth, No Heartbeat)
-  const fetchAIReply = async (text: string): Promise<string> => {
+  // 🔥 Fetch AI Reply - Include email for session isolation
+  const fetchAIReply = async (
+    text: string,
+    signal?: AbortSignal,
+  ): Promise<string> => {
     try {
-      const requestBody: { message: string; uid?: string } = {
+      // 🔥 Get user email from auth storage
+      const userEmail = await getUserEmail();
+      
+      const requestBody: { message: string; session_id?: string; email?: string } = {
         message: text,
-        // Optional: pass uid for session isolation
-        // uid: "your-user-id-here",
+        session_id: "team-ypn",
+        email: userEmail || undefined, // 🔥 Send email if available for isolation
       };
 
-      // Send message to AI backend (no auth headers, no heartbeat)
       const res = await fetch(AI_API_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(requestBody),
+        signal,
       });
 
       if (!res.ok) {
@@ -240,87 +261,96 @@ export default function TeamYPNScreen() {
       const data = await res.json();
       return (data.reply ?? data.message ?? "Sorry, no response.") as string;
     } catch (err: any) {
+      if (err.name === "AbortError") {
+        throw new Error("REQUEST_ABORTED");
+      }
       console.error("[TeamYPN] fetchAIReply error:", err);
       throw err;
     }
   };
 
+  // 🔥 Process a single message from the queue
+  const processNextMessage = useCallback(async () => {
+    if (isProcessingRef.current || messageQueueRef.current.length === 0) {
+      return;
+    }
+
+    isProcessingRef.current = true;
+    const text = messageQueueRef.current.shift()!;
+    abortControllerRef.current = new AbortController();
+
+    const userMsgId = Date.now().toString();
+    const userMsg: Message = {
+      id: userMsgId,
+      text,
+      sender: "user",
+      timestamp: new Date().toISOString(),
+      status: "sent",
+    };
+
+    setMessages((prev) => [...prev, userMsg]);
+    scrollToBottom();
+    setMessages((prev) =>
+      prev.map((m) => (m.id === userMsgId ? { ...m, status: "read" } : m)),
+    );
+
+    try {
+      const reply = await fetchAIReply(text, abortControllerRef.current.signal);
+
+      if (isChatOpenRef.current) {
+        setAiTyping(true);
+        scrollToBottom();
+        await new Promise<void>((r) => setTimeout(r, 400));
+        setAiTyping(false);
+      }
+
+      const aiMsgId = `ai_${Date.now()}`;
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: aiMsgId,
+          text: "",
+          sender: "ai",
+          timestamp: new Date().toISOString(),
+          status: "sent",
+        },
+      ]);
+      if (isChatOpenRef.current) scrollToBottom();
+
+      await resumeOrStartAIStream(aiMsgId, reply, setMessages, isChatOpenRef);
+
+      if (!isChatOpenRef.current) {
+        await incrementUnreadBadge();
+      }
+    } catch (err: any) {
+      // ✅ Silently handle abort - expected when user sends new message
+      if (err.message === "REQUEST_ABORTED") {
+        return;
+      }
+      console.warn("[TeamYPN] processNextMessage error:", err);
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === userMsgId ? { ...m, status: "failed" } : m,
+        ),
+      );
+    } finally {
+      isProcessingRef.current = false;
+      abortControllerRef.current = null;
+      if (messageQueueRef.current.length > 0) {
+        setTimeout(() => processNextMessage(), 300);
+      }
+    }
+  }, [scrollToBottom]);
+
   const sendMessage = useCallback(
-    async (text: string, retryId?: string) => {
-      if (!text.trim() || !isConnected || sending) return;
-      setSending(true);
-
-      const userMsgId = retryId ?? Date.now().toString();
-      const userMsg: Message = {
-        id: userMsgId,
-        text,
-        sender: "user",
-        timestamp: new Date().toISOString(),
-        status: "sent",
-      };
-
-      setMessages((prev) =>
-        retryId
-          ? prev.filter((m) => m.id !== retryId).concat(userMsg)
-          : [...prev, userMsg],
-      );
-      scrollToBottom();
-      setMessages((prev) =>
-        prev.map((m) => (m.id === userMsgId ? { ...m, status: "read" } : m)),
-      );
-
-      const replyPromise = fetchAIReply(text);
-
-      replyPromise
-        .then(async (reply) => {
-          if (isChatOpenRef.current) {
-            setAiTyping(true);
-            scrollToBottom();
-            await new Promise<void>((r) => setTimeout(r, 700));
-            setAiTyping(false);
-          }
-          const aiMsgId = `ai_${Date.now()}`;
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: aiMsgId,
-              text: "",
-              sender: "ai",
-              timestamp: new Date().toISOString(),
-              status: "sent",
-            },
-          ]);
-          if (isChatOpenRef.current) scrollToBottom();
-          resumeOrStartAIStream(
-            aiMsgId,
-            reply,
-            setMessages,
-            isChatOpenRef,
-          ).catch((err) => {
-            console.warn("[TeamYPN] stream:", err);
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === aiMsgId ? { ...m, text: reply, status: "read" } : m,
-              ),
-            );
-            clearPendingAIReply(aiMsgId).catch(() => {});
-          });
-          if (!isChatOpenRef.current) await incrementUnreadBadge();
-        })
-        .catch((err: any) => {
-          console.warn("[TeamYPN] fetch:", err);
-          setAiTyping(false);
-
-          // Mark message as failed for retry
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === userMsgId ? { ...m, status: "failed" } : m,
-            ),
-          );
-        })
-        .finally(() => setSending(false));
+    (text: string) => {
+      if (!text.trim() || !isConnected) return;
+      messageQueueRef.current.push(text.trim());
+      if (!isProcessingRef.current) {
+        processNextMessage();
+      }
     },
-    [isConnected, sending, scrollToBottom],
+    [isConnected, processNextMessage],
   );
 
   const handleSend = useCallback(() => {
@@ -328,7 +358,19 @@ export default function TeamYPNScreen() {
     if (!text) return;
     setInput("");
     sendMessage(text);
+    inputRef.current?.blur();
   }, [input, sendMessage]);
+
+  const handleRetry = useCallback(
+    (text: string, msgId: string) => {
+      setMessages((prev) => prev.filter((m) => m.id !== msgId));
+      messageQueueRef.current.unshift(text);
+      if (!isProcessingRef.current) {
+        processNextMessage();
+      }
+    },
+    [processNextMessage],
+  );
 
   const commitDelete = useCallback(
     (msg: Message) => {
@@ -439,7 +481,7 @@ export default function TeamYPNScreen() {
               )}
               {isUser && msg.status === "failed" && (
                 <TouchableOpacity
-                  onPress={() => sendMessage(msg.text, msg.id)}
+                  onPress={() => handleRetry(msg.text, msg.id)}
                   hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
                   style={s.retryRow}
                 >
@@ -452,10 +494,18 @@ export default function TeamYPNScreen() {
         </Pressable>
       );
     },
-    [commitDelete, sendMessage],
+    [commitDelete, handleRetry],
   );
 
   const keyExtractor = useCallback((item: GroupItem) => item.key, []);
+
+  useEffect(() => {
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
+  }, []);
 
   if (loading) {
     return (
@@ -484,26 +534,14 @@ export default function TeamYPNScreen() {
           >
             <Ionicons name="chevron-back" size={28} color="#25D366" />
           </Pressable>
-
           <Image
             source={require("../../assets/images/YPN.png")}
             style={s.avatar}
           />
-
           <View style={s.headerTextContainer}>
             <Text style={s.headerName}>Team YPN</Text>
             <Text style={s.headerSub}>{aiTyping ? "typing..." : "Online"}</Text>
           </View>
-
-          {/* ── Voice call button ── */}
-          <TouchableOpacity
-            onPress={() => setVoiceVisible(true)}
-            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-            style={s.voiceCallBtn}
-            activeOpacity={0.7}
-          >
-            <Ionicons name="call-outline" size={22} color="#25D366" />
-          </TouchableOpacity>
         </View>
       </BlurView>
 
@@ -525,13 +563,10 @@ export default function TeamYPNScreen() {
           keyboardShouldPersistTaps="handled"
           keyboardDismissMode="interactive"
         />
-
         {pending && <UndoToast onUndo={handleUndo} progress={undoProgress} />}
 
+        {/* ── INPUT BAR (Plus Button REMOVED) ── */}
         <View style={s.inputBar}>
-          <TouchableOpacity style={s.plusBtn}>
-            <Ionicons name="add" size={24} color="#8E8E93" />
-          </TouchableOpacity>
           <View style={s.inputContainer}>
             <TextInput
               ref={inputRef}
@@ -543,40 +578,25 @@ export default function TeamYPNScreen() {
               maxLength={2000}
               style={s.input}
               blurOnSubmit={false}
+              onSubmitEditing={handleSend}
+              returnKeyType="send"
             />
           </View>
           <TouchableOpacity
             onPress={handleSend}
-            disabled={!input.trim() || sending}
+            disabled={!input.trim()}
             activeOpacity={0.78}
-            style={[s.sendBtn, (!input.trim() || sending) && s.sendBtnOff]}
+            style={[s.sendBtn, !input.trim() && s.sendBtnOff]}
           >
-            {sending ? (
-              <ActivityIndicator size="small" color="#fff" />
-            ) : (
-              <Ionicons
-                name="send"
-                size={18}
-                color="#fff"
-                style={{ marginLeft: 2 }}
-              />
-            )}
+            <Ionicons
+              name="send"
+              size={18}
+              color="#fff"
+              style={{ marginLeft: 2 }}
+            />
           </TouchableOpacity>
         </View>
       </KeyboardAvoidingView>
-
-      {/* ── VOICE MODAL ── */}
-      <Modal
-        visible={voiceVisible}
-        animationType="slide"
-        presentationStyle="fullScreen"
-        onRequestClose={() => setVoiceVisible(false)}
-      >
-        <VoiceCallScreen
-          onClose={() => setVoiceVisible(false)}
-          sessionId="voice_team_ypn"
-        />
-      </Modal>
     </View>
   );
 }
@@ -614,16 +634,6 @@ const s = StyleSheet.create({
     letterSpacing: 0.3,
   },
   headerSub: { color: "#8696A0", fontSize: 12, marginTop: 1 },
-  voiceCallBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    justifyContent: "center",
-    alignItems: "center",
-    backgroundColor: "rgba(37,211,102,0.1)",
-    borderWidth: 1,
-    borderColor: "rgba(37,211,102,0.2)",
-  },
   listContent: { paddingHorizontal: 16, paddingTop: 10, paddingBottom: 10 },
   dateHeader: {
     alignSelf: "center",
@@ -729,13 +739,6 @@ const s = StyleSheet.create({
     borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: "rgba(255,255,255,0.08)",
     gap: 10,
-  },
-  plusBtn: {
-    width: 36,
-    height: 36,
-    justifyContent: "center",
-    alignItems: "center",
-    marginBottom: 4,
   },
   inputContainer: {
     flex: 1,
