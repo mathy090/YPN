@@ -4,7 +4,7 @@ import * as SecureStore from "expo-secure-store";
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL || "";
 const PROFILE_CACHE_PREFIX = "chat_profile_";
-const CACHE_TTL = 60 * 60 * 1000; // 1 hour
+const CACHE_TTL = 60 * 60 * 1000; // 1 hour cache validity
 
 // 🔑 SECURESTORE KEYS - MATCHES YOUR tokenManager.ts EXACTLY
 const SECURESTORE_KEYS = {
@@ -93,7 +93,7 @@ export const fetchProfileByUid = async (
 
 /**
  * Gets chat profile with smart cache strategy:
- * 1. Try SecureStore cache first (instant, no network)
+ * 1. Try AsyncStorage cache first (instant, no network)
  * 2. If stale or missing, fetch fresh from backend
  * 3. Fallback to SecureStore if network fails (offline mode)
  */

@@ -6,19 +6,25 @@ const multer = require("multer");
 const { getChannels, getChannel } = require("../models/DiscordChannels");
 
 const router = express.Router();
+
+// ✅ Configure multer to store in memory (for Supabase upload)
 const upload = multer({
-  limits: { fileSize: 30 * 1024 * 1024 },
+  limits: { fileSize: 30 * 1024 * 1024 }, // 30MB
   storage: multer.memoryStorage(),
+  fileFilter: (req, file, cb) => {
+    if (
+      file.mimetype.startsWith("image/") ||
+      file.mimetype.startsWith("video/") ||
+      file.mimetype.startsWith("audio/")
+    ) {
+      cb(null, true);
+    } else {
+      cb(new Error("Invalid file type"), false);
+    }
+  },
 });
 
-// ✅ Safe helper: returns null if Supabase not injected
-const getSupabase = (req) => {
-  const client = req.app?.get?.("supabase");
-  if (!client) {
-    console.warn("[Discord] Supabase client not available");
-  }
-  return client;
-};
+const getSupabase = (req) => req.app.get("supabase");
 
 // ────────────────────────────────────────────────────────────────────────────
 // GET /api/discord/channels
@@ -97,11 +103,12 @@ router.get("/profile/:uid", async (req, res) => {
 router.post("/messages", async (req, res) => {
   const supabase = getSupabase(req);
   if (!supabase) {
-    return res.status(503).json({
-      message: "Chat service unavailable",
-      code: "SUPABASE_UNAVAILABLE",
-      hint: "Check server logs for Supabase setup",
-    });
+    return res
+      .status(503)
+      .json({
+        message: "Chat service unavailable",
+        code: "SUPABASE_UNAVAILABLE",
+      });
   }
 
   const { channelId, username, avatarUrl, content, mediaType, mediaUrl } =
@@ -153,15 +160,17 @@ router.post("/messages", async (req, res) => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────
-// GET /api/discord/messages/:channelId - PUBLIC (Incremental sync)
+// GET /api/discord/messages/:channelId - PUBLIC
 // ────────────────────────────────────────────────────────────────────────────
 router.get("/messages/:channelId", async (req, res) => {
   const supabase = getSupabase(req);
   if (!supabase) {
-    return res.status(503).json({
-      message: "Chat service unavailable",
-      code: "SUPABASE_UNAVAILABLE",
-    });
+    return res
+      .status(503)
+      .json({
+        message: "Chat service unavailable",
+        code: "SUPABASE_UNAVAILABLE",
+      });
   }
 
   const { channelId } = req.params;
@@ -247,43 +256,86 @@ router.delete("/messages/:messageId", async (req, res) => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────
-// POST /api/discord/upload-media - PUBLIC
+// POST /api/discord/upload-media - PUBLIC (FIXED)
 // ────────────────────────────────────────────────────────────────────────────
 router.post("/upload-media", upload.single("file"), async (req, res) => {
   const supabase = getSupabase(req);
+
   if (!supabase) {
+    console.error("[Upload] Supabase client not available");
     return res
       .status(503)
       .json({
-        message: "Chat service unavailable",
+        message: "Storage service unavailable",
         code: "SUPABASE_UNAVAILABLE",
       });
   }
 
-  if (!req.file)
+  if (!req.file) {
+    console.error("[Upload] No file in request");
     return res
       .status(400)
       .json({ message: "No file provided", code: "NO_FILE" });
+  }
 
   try {
-    const fileName = `${Date.now()}-${req.file.originalname.replace(/\s/g, "_")}`;
+    console.log("[Upload] File received:", {
+      originalname: req.file.originalname,
+      mimetype: req.file.mimetype,
+      size: req.file.size,
+      buffer: req.file.buffer ? `${req.file.buffer.length} bytes` : "no buffer",
+    });
+
+    const fileName = `media_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const fileExt =
+      req.file.originalname.split(".").pop() ||
+      req.file.mimetype.split("/")[1] ||
+      "bin";
+    const fullFileName = `${fileName}.${fileExt}`;
+
+    console.log("[Upload] Uploading to Supabase:", fullFileName);
+
     const { data, error } = await supabase.storage
       .from("media")
-      .upload(fileName, req.file.buffer, { contentType: req.file.mimetype });
+      .upload(fullFileName, req.file.buffer, {
+        contentType: req.file.mimetype,
+        cacheControl: "3600",
+        upsert: false,
+      });
 
-    if (error) throw error;
+    if (error) {
+      console.error("[Supabase] Upload error:", error);
+      throw error;
+    }
 
-    const { urlData } = supabase.storage.from("media").getPublicUrl(fileName);
+    console.log("[Upload] Supabase upload success:", data);
+
+    // ✅ FIXED: Correct destructuring
+    const { data: urlData } = supabase.storage
+      .from("media")
+      .getPublicUrl(fullFileName);
+
+    if (!urlData || !urlData.publicUrl) {
+      console.error("[Upload] No public URL returned:", urlData);
+      throw new Error("Failed to get public URL");
+    }
+
     const type = req.file.mimetype.startsWith("image")
       ? "image"
       : req.file.mimetype.startsWith("video")
         ? "video"
         : "audio";
 
+    console.log("[Upload] Success:", { url: urlData.publicUrl, type });
+
     res.json({ url: urlData.publicUrl, type });
   } catch (err) {
     console.error("[Discord] Upload error:", err);
-    res.status(500).json({ message: "Upload failed", code: "UPLOAD_FAILED" });
+    res.status(500).json({
+      message: "Upload failed",
+      code: "UPLOAD_FAILED",
+      error: process.env.NODE_ENV === "development" ? err.message : undefined,
+    });
   }
 });
 
