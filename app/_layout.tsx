@@ -178,6 +178,33 @@ export default function RootLayout() {
           <Stack.Screen name="chat" />
           <Stack.Screen name="voice-call" />
           <Stack.Screen name="splash" />
+
+          {/* ✅ NEW: Register Help Center & Legal screens */}
+          <Stack.Screen
+            name="support"
+            options={{
+              presentation: "card",
+              animation: "slide_from_bottom",
+              gestureEnabled: true,
+            }}
+          />
+          <Stack.Screen
+            name="privacy"
+            options={{
+              presentation: "card",
+              animation: "slide_from_bottom",
+              gestureEnabled: true,
+            }}
+          />
+          <Stack.Screen
+            name="terms"
+            options={{
+              presentation: "card",
+              animation: "slide_from_bottom",
+              gestureEnabled: true,
+            }}
+          />
+
           {/* ✅ ADD THIS: Register the chat channel screen */}
           <Stack.Screen
             name="discordChannel"

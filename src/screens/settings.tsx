@@ -787,7 +787,7 @@ export default function SettingsScreen() {
                 <TextInput
                   value={confirmPassword}
                   onChangeText={setConfirmPassword}
-                  placeholder="••••••••"
+                  placeholder="********"
                   placeholderTextColor={COLORS.textSecondary}
                   style={[styles.input, { color: COLORS.text }]}
                   secureTextEntry
