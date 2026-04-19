@@ -61,15 +61,75 @@ else:
 app = FastAPI()
 logger.info("[init] FastAPI app created")
 
-# ── AI Stub (Replace with your real async provider) ───────────────────────────
+# ── Cohere AI Client Setup ────────────────────────────────────────────────────
+import cohere
+
+_cohere_client = None
+
+def get_cohere_client():
+    """Lazy-load Cohere client with API key from env vars."""
+    global _cohere_client
+    if _cohere_client is None:
+        api_key = os.getenv("COHERE_API_KEY")
+        if not api_key:
+            logger.warning("[AI] COHERE_API_KEY not set, using stub response")
+            return None
+        try:
+            _cohere_client = cohere.AsyncClient(api_key=api_key)
+            logger.info("[AI] Cohere client initialized")
+        except Exception as e:
+            logger.error(f"[AI] Failed to initialize Cohere: {e}", exc_info=True)
+            return None
+    return _cohere_client
+
+
+# ── AI Provider: Cohere Integration ───────────────────────────────────────────
 async def run_ai(prompt: str):
-    """Async generator yielding tokens. Replace with Cohere/OpenAI/etc."""
-    logger.debug(f"[AI] Prompt received ({len(prompt)} chars)")
-    await asyncio.sleep(0.2)  # Simulate latency
-    return "I understand. I'm listening carefully and responding step by step."
+    """
+    Generate AI response using Cohere Command-R.
+    Falls back to stub if API key missing or request fails.
+    """
+    client = get_cohere_client()
+    
+    # Fallback if no API key or client failed to init
+    if client is None:
+        logger.warning("[AI] No Cohere client available, returning stub response")
+        await asyncio.sleep(0.2)
+        return "I understand. I'm listening carefully and responding step by step."
+    
+    try:
+        logger.info(f"[AI] Calling Cohere with prompt ({len(prompt)} chars)")
+        
+        response = await client.chat(
+            model="command-r",  # Fast & affordable; use "command-r-plus" for higher quality
+            message=prompt,
+            preamble=SYSTEM_PROMPT,
+            max_tokens=500,
+            temperature=0.7,
+            k=0,  # Disable sampling for more consistent responses
+        )
+        
+        reply = response.text.strip()
+        logger.info(f"[AI] Cohere response received ({len(reply)} chars)")
+        return reply
+        
+    except cohere.UnauthorizedError:
+        logger.error("[AI] Cohere auth failed - check COHERE_API_KEY")
+        return "Sorry, I'm having trouble connecting to my AI service. Please try again later."
+        
+    except cohere.TooManyRequestsError:
+        logger.warning("[AI] Cohere rate limit hit")
+        return "I'm getting a lot of requests right now. Please try again in a moment."
+        
+    except Exception as e:
+        logger.error(f"[AI] Cohere error: {type(e).__name__}: {e}", exc_info=True)
+        # Fallback to stub on any error so chat never breaks
+        return "I understand. I'm listening carefully and responding step by step."
+
 
 # ── Redis Helpers ─────────────────────────────────────────────────────────────
 def add_message(uid, role, text):
+    """Save message to Redis chat history."""
     key = f"chat:{uid}"
     try:
         data = redis.get(key)
@@ -83,7 +143,9 @@ def add_message(uid, role, text):
         logger.error(f"[redis] Error in add_message: {e}", exc_info=True)
         return []
 
+
 def get_chat(uid):
+    """Retrieve chat history from Redis."""
     try:
         data = redis.get(f"chat:{uid}")
         chat = json.loads(data) if data else []
@@ -93,13 +155,17 @@ def get_chat(uid):
         logger.error(f"[redis] Error in get_chat: {e}", exc_info=True)
         return []
 
+
 def update_audio_time(uid):
+    """Update last audio activity timestamp for silence detection."""
     try:
         redis.set(f"last_audio:{uid}", time.time())
     except Exception as e:
         logger.error(f"[redis] Error updating audio time: {e}", exc_info=True)
 
+
 def is_user_silent(uid, threshold=0.8):
+    """Check if user has been silent for longer than threshold seconds."""
     try:
         last = redis.get(f"last_audio:{uid}")
         if not last:
@@ -109,7 +175,9 @@ def is_user_silent(uid, threshold=0.8):
         logger.error(f"[redis] Error checking silence: {e}", exc_info=True)
         return False
 
+
 def build_prompt(uid, user_text):
+    """Build the full prompt for AI with conversation history and context."""
     logger.info(f"[prompt] Building prompt for uid={uid}, user_text='{user_text[:50]}...'")
     try:
         chat = get_chat(uid)
@@ -135,13 +203,14 @@ User:
         # Fallback prompt
         return f"{SYSTEM_PROMPT}\n\nUser: {user_text}"
 
+
 # ── 🔥 HTTP Chat Endpoint (No Auth, No Heartbeat) ────────────────────────────
 @app.post("/chat")
 async def http_chat(request_body: dict):
+    """Handle text-to-text chat requests."""
     logger.info(f"[chat] POST /chat received: {request_body}")
     
     try:
-        # Default to "anonymous" if no uid is provided by client
         uid = request_body.get("uid", "anonymous")
         user_text = request_body.get("message", "").strip()
         
@@ -157,7 +226,7 @@ async def http_chat(request_body: dict):
         # 2. Build prompt with context
         prompt = build_prompt(uid, user_text)
         
-        # 3. Get AI Response
+        # 3. Get AI Response from Cohere
         logger.info("[chat] Calling AI provider...")
         response_text = await run_ai(prompt)
         logger.info(f"[chat] AI response received ({len(response_text)} chars)")
@@ -191,19 +260,26 @@ async def http_chat(request_body: dict):
             content={"error": "Internal server error", "detail": str(e)}
         )
 
-# ── 🔍 DEBUG: Test Supabase Connection (Remove after debugging) ──────────────
+
+# ── 🔍 DEBUG: Test Supabase Connection ───────────────────────────────────────
 @app.get("/debug/test-db")
 async def test_db():
-    """Test Supabase connection and messages table"""
+    """Test Supabase connection and messages table schema."""
     try:
         result = supabase.table("messages").select("id, user_id, role, content").limit(1).execute()
-        return {"status": "ok", "sample": result.data, "count": len(result.data) if result.data else 0}
+        return {
+            "status": "ok", 
+            "sample": result.data, 
+            "count": len(result.data) if result.data else 0
+        }
     except Exception as e:
         return {"status": "error", "message": str(e), "type": type(e).__name__}
 
-# ── WebSocket: Direct Connection (No Auth) ────────────────────────────────────
+
+# ── WebSocket: Voice Streaming (No Auth) ─────────────────────────────────────
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
+    """Handle WebSocket connections for voice chat with real-time streaming."""
     await websocket.accept()
     logger.info("[ws] New WebSocket connection accepted")
 
@@ -328,13 +404,31 @@ async def ws(websocket: WebSocket):
         except:
             pass
 
+
 # ── Health Check Endpoint ─────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    """Simple health check for Render/load balancers"""
+    """Simple health check for Render/load balancers."""
     return {
         "status": "healthy",
         "redis": "connected",
-        "supabase": "connected",
-        "vosk": "loaded" if model else "not_loaded"
+        "supabase": "connected", 
+        "vosk": "loaded" if model else "not_loaded",
+        "cohere": "configured" if os.getenv("COHERE_API_KEY") else "missing_key"
+    }
+
+
+# ── Root Endpoint ─────────────────────────────────────────────────────────────
+@app.get("/")
+async def root():
+    """Root endpoint with API info."""
+    return {
+        "service": "YPN AI Backend",
+        "version": "1.0.0",
+        "endpoints": {
+            "POST /chat": "Text-to-text chat",
+            "GET /ws": "WebSocket for voice chat",
+            "GET /health": "Health check",
+            "GET /debug/test-db": "Test Supabase connection"
+        }
     }
