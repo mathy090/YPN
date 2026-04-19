@@ -97,7 +97,7 @@ async function connectDB() {
     await client.connect();
     db = client.db("ypn_users");
     console.log("✅ Connected to MongoDB");
-    
+
     // Initialize all modules with db instance
     initUserVideos(db);
     initDiscordChannels(db);
@@ -105,7 +105,7 @@ async function connectDB() {
     initNewsArchive(db); // ✅ News archive: 10-min TTL, 30+ sources
     initDriveVideos(db);
     initSignoutStore(db);
-    
+
     registerRoutes();
   } catch (err) {
     console.error("❌ MongoDB connection failed:", err.message);
@@ -482,13 +482,13 @@ function registerRoutes() {
   // 🔓 OPEN: Video routes
   app.use("/api/videos/drive", driveVideoRoutes);
   app.use("/api/videos", videoRoutes);
-  
+
   // 🔓 OPEN: Discord routes
   app.use("/api/discord", discordRoutes);
-  
+
   // 🔓 OPEN: News routes (10-min auto-refresh, 30+ sources)
   app.use("/api/news", newsRoutes);
-  
+
   // 🔐 Protected: Keys and media
   app.use("/api/keys", verifyBackendToken, keyRoutes);
   app.use("/api/media", verifyBackendToken, mediaRoutes);
