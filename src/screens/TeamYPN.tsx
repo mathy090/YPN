@@ -38,12 +38,10 @@ import {
   clearTeamYPNUnreadBadge,
   incrementUnreadBadge,
 } from "../utils/teamYPNBadge";
-// 🔥 Removed auth utils: import { clearAllTokens, getValidBackendToken } from "../utils/tokenManager";
 import VoiceCallScreen from "./VoiceCallScreen";
 
-// 🔥 Point to your Python FastAPI Backend (no auth required now)
+// 🔥 Point to your Python FastAPI Backend (no auth, no heartbeat)
 const AI_API_URL = `${process.env.EXPO_PUBLIC_AI_URL}/chat`;
-const HEARTBEAT_URL = `${process.env.EXPO_PUBLIC_AI_URL}/heartbeat`;
 const CACHE_KEY = "chat_team-ypn";
 const UNDO_MS = 3000;
 
@@ -218,24 +216,16 @@ export default function TeamYPNScreen() {
     setTimeout(() => listRef.current?.scrollToEnd({ animated }), 80);
   }, []);
 
-  // 🔥 Fetch AI Reply - Simplified (No Auth)
+  // 🔥 Fetch AI Reply - Simplified (No Auth, No Heartbeat)
   const fetchAIReply = async (text: string): Promise<string> => {
     try {
-      // Optional: Include a uid if you want session isolation
-      // Otherwise backend uses "anonymous" by default
       const requestBody: { message: string; uid?: string } = {
         message: text,
-        // uid: "your-user-id-here", // Optional: pass if needed
+        // Optional: pass uid for session isolation
+        // uid: "your-user-id-here",
       };
 
-      // 1. Send Heartbeat (no auth)
-      await fetch(HEARTBEAT_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(requestBody),
-      });
-
-      // 2. Send Message (no auth)
+      // Send message to AI backend (no auth headers, no heartbeat)
       const res = await fetch(AI_API_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -243,13 +233,14 @@ export default function TeamYPNScreen() {
       });
 
       if (!res.ok) {
-        throw new Error(`AI ${res.status}`);
+        const errorText = await res.text().catch(() => "");
+        throw new Error(`AI ${res.status}: ${errorText}`);
       }
 
       const data = await res.json();
       return (data.reply ?? data.message ?? "Sorry, no response.") as string;
     } catch (err: any) {
-      // 🔥 Removed auth-specific error handling
+      console.error("[TeamYPN] fetchAIReply error:", err);
       throw err;
     }
   };
@@ -320,7 +311,7 @@ export default function TeamYPNScreen() {
           console.warn("[TeamYPN] fetch:", err);
           setAiTyping(false);
 
-          // 🔥 Removed AUTH_EXPIRED handling
+          // Mark message as failed for retry
           setMessages((prev) =>
             prev.map((m) =>
               m.id === userMsgId ? { ...m, status: "failed" } : m,

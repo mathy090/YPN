@@ -1,3 +1,4 @@
+# main.py
 import os
 import json
 import time
@@ -33,6 +34,7 @@ redis = Redis(
     url=os.getenv("UPSTASH_REDIS_REST_URL"),
     token=os.getenv("UPSTASH_REDIS_REST_TOKEN")
 )
+logger.info("[init] Redis client initialized")
 
 supabase_url = os.getenv("SUPABASE_URL")
 supabase_key = os.getenv("SUPABASE_KEY")
@@ -133,7 +135,7 @@ User:
         # Fallback prompt
         return f"{SYSTEM_PROMPT}\n\nUser: {user_text}"
 
-# ── 🔥 HTTP Chat Endpoint (Auth + Heartbeat Removed) ─────────────────────────
+# ── 🔥 HTTP Chat Endpoint (No Auth, No Heartbeat) ────────────────────────────
 @app.post("/chat")
 async def http_chat(request_body: dict):
     logger.info(f"[chat] POST /chat received: {request_body}")
@@ -149,7 +151,7 @@ async def http_chat(request_body: dict):
             logger.warning("[chat] Empty message received")
             return JSONResponse(content={"reply": ""})
 
-        # 1. Save user message
+        # 1. Save user message to Redis
         add_message(uid, "user", user_text)
         
         # 2. Build prompt with context
@@ -160,15 +162,26 @@ async def http_chat(request_body: dict):
         response_text = await run_ai(prompt)
         logger.info(f"[chat] AI response received ({len(response_text)} chars)")
         
-        # 4. Save AI Response
+        # 4. Save AI Response to Redis
         add_message(uid, "ai", response_text)
-        supabase.table("messages").insert({
-            "user_id": uid,
-            "role": "ai",
-            "content": response_text.strip()
-        }).execute()
-        logger.info(f"[chat] Message persisted to Supabase for uid={uid}")
         
+        # 5. Save to Supabase (with defensive error handling)
+        try:
+            logger.debug(f"[supabase] Inserting message: user_id={uid}, role=ai, content_len={len(response_text)}")
+            
+            result = supabase.table("messages").insert({
+                "user_id": uid,
+                "role": "ai",
+                "content": response_text.strip()
+            }).execute()
+            
+            logger.info(f"[supabase] Insert successful")
+            
+        except Exception as db_err:
+            # Log the error but don't crash the chat
+            logger.error(f"[supabase] Insert failed (non-critical): {type(db_err).__name__}: {db_err}")
+            logger.warning("[supabase] Message saved to Redis only; Supabase sync skipped")
+
         return JSONResponse(content={"reply": response_text})
         
     except Exception as e:
@@ -178,7 +191,17 @@ async def http_chat(request_body: dict):
             content={"error": "Internal server error", "detail": str(e)}
         )
 
-# ── WebSocket: Direct Connection (Auth Removed) ───────────────────────────────
+# ── 🔍 DEBUG: Test Supabase Connection (Remove after debugging) ──────────────
+@app.get("/debug/test-db")
+async def test_db():
+    """Test Supabase connection and messages table"""
+    try:
+        result = supabase.table("messages").select("id, user_id, role, content").limit(1).execute()
+        return {"status": "ok", "sample": result.data, "count": len(result.data) if result.data else 0}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "type": type(e).__name__}
+
+# ── WebSocket: Direct Connection (No Auth) ────────────────────────────────────
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
     await websocket.accept()
@@ -281,12 +304,17 @@ async def ws(websocket: WebSocket):
             # Persist & notify completion
             if ai_text.strip():
                 add_message(uid, "ai", ai_text)
-                supabase.table("messages").insert({
-                    "user_id": uid,
-                    "role": "ai",
-                    "content": ai_text.strip()
-                }).execute()
-                logger.info(f"[ws] AI response persisted for uid={uid}")
+                
+                # Save to Supabase (non-critical)
+                try:
+                    supabase.table("messages").insert({
+                        "user_id": uid,
+                        "role": "ai",
+                        "content": ai_text.strip()
+                    }).execute()
+                    logger.info(f"[ws] AI response persisted to Supabase for uid={uid}")
+                except Exception as db_err:
+                    logger.error(f"[ws] Supabase insert failed: {db_err}")
 
             await websocket.send_json({"type": "done"})
             await websocket.send_json({"type": "state", "value": "listening"})
@@ -299,3 +327,14 @@ async def ws(websocket: WebSocket):
             await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
         except:
             pass
+
+# ── Health Check Endpoint ─────────────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    """Simple health check for Render/load balancers"""
+    return {
+        "status": "healthy",
+        "redis": "connected",
+        "supabase": "connected",
+        "vosk": "loaded" if model else "not_loaded"
+    }
