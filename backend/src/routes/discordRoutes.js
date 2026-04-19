@@ -2,163 +2,245 @@
 "use strict";
 
 const express = require("express");
+const multer = require("multer");
 const { getChannels, getChannel } = require("../models/DiscordChannels");
-const multer = require("multer"); // For handling multipart/form-data if uploading directly to backend first
-const upload = multer({ limits: { fileSize: 30 * 1024 * 1024 } }); // 30MB Limit
 
 const router = express.Router();
+const upload = multer({
+  limits: { fileSize: 30 * 1024 * 1024 }, // 30MB limit
+  storage: multer.memoryStorage(),
+});
 
-// Helper to get Supabase client from request
 const getSupabase = (req) => req.app.get("supabase");
 
-// GET /api/discord/channels (Existing)
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/discord/channels - PUBLIC
+// ────────────────────────────────────────────────────────────────────────────
 router.get("/channels", async (_req, res) => {
   try {
     const channels = await getChannels();
     res.json(channels);
   } catch (e) {
     console.error("[Discord] GET channels:", e.message);
-    res.status(500).json({ message: e.message });
+    res.status(500).json({ message: "Failed to load channels" });
   }
 });
 
-// ✅ NEW: POST /api/discord/messages (Unprotected - Simple Hook)
-// Body: { channelId, senderUid, content, mediaType?, mediaUrl? }
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/discord/channels/:id - PUBLIC
+// ────────────────────────────────────────────────────────────────────────────
+router.get("/channels/:id", async (req, res) => {
+  try {
+    const channel = await getChannel(req.params.id);
+    if (!channel) return res.status(404).json({ message: "Channel not found" });
+    res.json(channel);
+  } catch (e) {
+    console.error("[Discord] GET channel:", e.message);
+    res.status(500).json({ message: "Failed to load channel" });
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/discord/profile/:uid - PUBLIC (Fetch username + avatar from MongoDB)
+// ────────────────────────────────────────────────────────────────────────────
+router.get("/profile/:uid", async (req, res) => {
+  try {
+    const { uid } = req.params;
+    if (!uid)
+      return res
+        .status(400)
+        .json({ message: "UID required", code: "MISSING_UID" });
+
+    const db = req.app.get("db");
+    const user = await db
+      .collection("users")
+      .findOne(
+        { uid },
+        { projection: { _id: 0, uid: 1, username: 1, avatarUrl: 1 } },
+      );
+
+    if (!user)
+      return res
+        .status(404)
+        .json({ message: "User not found", code: "USER_NOT_FOUND" });
+
+    res.json({
+      uid: user.uid,
+      username: user.username || "Guest",
+      avatarUrl: user.avatarUrl || null,
+    });
+  } catch (err) {
+    console.error("[Discord] GET profile error:", err);
+    res
+      .status(500)
+      .json({ message: "Failed to fetch profile", code: "FETCH_FAILED" });
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// POST /api/discord/messages - PUBLIC (No auth, uses username + avatarUrl)
+// Body: { channelId, username, avatarUrl?, content?, mediaType?, mediaUrl? }
+// ────────────────────────────────────────────────────────────────────────────
 router.post("/messages", async (req, res) => {
   const supabase = getSupabase(req);
-  const { channelId, senderUid, content, mediaType, mediaUrl } = req.body;
+  const { channelId, username, avatarUrl, content, mediaType, mediaUrl } =
+    req.body;
 
-  if (!channelId || !senderUid) {
-    return res.status(400).json({ message: "channelId and senderUid are required" });
-  }
+  if (!channelId)
+    return res
+      .status(400)
+      .json({ message: "channelId required", code: "MISSING_CHANNEL" });
+  if (!content && !mediaUrl)
+    return res
+      .status(400)
+      .json({
+        message: "Message must contain text or media",
+        code: "EMPTY_MESSAGE",
+      });
+
+  const cleanUsername = (username || "Guest").trim().slice(0, 30);
+  const senderId = `user_${cleanUsername.toLowerCase().replace(/[^a-z0-9]/g, "_")}`;
 
   try {
-    // 1. Fetch Username from MongoDB (since profiles are there)
-    const db = req.app.get("db");
-    const user = await db.collection("users").findOne(
-      { uid: senderUid }, 
-      { projection: { username: 1, avatarUrl: 1 } }
-    );
-
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    // 2. Insert into Supabase Messages Table
-    // Note: We store the MongoDB UID as sender_id. 
-    // In a pure Supabase app, this would be auth.uid(), but here we mix them.
     const { data, error } = await supabase
-      .from('messages')
+      .from("messages")
       .insert([
         {
           channel_id: channelId,
-          sender_id: senderUid, // Storing Firebase/Mongo UID
+          sender_id: senderId,
           content: content || null,
           media_type: mediaType || null,
           media_url: mediaUrl || null,
-          created_at: new Date().toISOString()
-        }
+          avatar_url: avatarUrl || null,
+          created_at: new Date().toISOString(),
+        },
       ])
       .select()
       .single();
 
     if (error) throw error;
-
-    // 3. Return message with embedded user info for immediate frontend display
-    res.status(201).json({
-      ...data,
-      profiles: {
-        username: user.username,
-        avatar_url: user.avatarUrl
-      }
-    });
-
+    res.status(201).json({ ...data, username: cleanUsername });
   } catch (err) {
     console.error("[Discord] POST message error:", err);
-    res.status(500).json({ message: "Failed to send message", error: err.message });
+    res
+      .status(500)
+      .json({ message: "Failed to send message", code: "SEND_FAILED" });
   }
 });
 
-// ✅ NEW: GET /api/discord/messages/:channelId
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/discord/messages/:channelId - PUBLIC (Incremental sync)
+// Query: ?after=ISO_TIMESTAMP&limit=50 (new messages) or ?before=ISO_TIMESTAMP (older)
+// ────────────────────────────────────────────────────────────────────────────
 router.get("/messages/:channelId", async (req, res) => {
   const supabase = getSupabase(req);
   const { channelId } = req.params;
-  const { limit = 50 } = req.query;
+  const { after, before, limit = 50 } = req.query;
+
+  if (!channelId)
+    return res
+      .status(400)
+      .json({ message: "channelId required", code: "MISSING_CHANNEL" });
 
   try {
-    // 1. Fetch Messages from Supabase
-    const { data: messages, error } = await supabase
-      .from('messages')
-      .select('*')
-      .eq('channel_id', channelId)
-      .order('created_at', { ascending: false })
+    let query = supabase
+      .from("messages")
+      .select("*")
+      .eq("channel_id", channelId)
       .limit(parseInt(limit));
 
+    if (after) {
+      // Fetch NEW messages after timestamp (WhatsApp-style sync)
+      query = query
+        .gt("created_at", after)
+        .order("created_at", { ascending: true });
+    } else if (before) {
+      // Fetch OLDER messages before timestamp (pull-to-refresh)
+      query = query
+        .lt("created_at", before)
+        .order("created_at", { ascending: false });
+    } else {
+      // Initial load
+      query = query.order("created_at", { ascending: true });
+    }
+
+    const { messages, error } = await query;
     if (error) throw error;
 
-    // 2. Enrich with Usernames from MongoDB
-    const db = req.app.get("db");
-    const uniqueUids = [...new Set(messages.map(m => m.sender_id))];
-    
-    const users = await db.collection("users")
-      .find({ uid: { $in: uniqueUids } })
-      .project({ uid: 1, username: 1, avatarUrl: 1 })
-      .toArray();
-
-    const userMap = {};
-    users.forEach(u => {
-      userMap[u.uid] = { username: u.username, avatar_url: u.avatarUrl };
-    });
-
-    // 3. Combine Data
-    const enrichedMessages = messages.map(msg => ({
+    // Parse username from sender_id for fallback display
+    const enriched = (messages || []).map((msg) => ({
       ...msg,
-      profiles: userMap[msg.sender_id] || { username: "Unknown", avatar_url: null }
-    })).reverse(); // Reverse back to ascending order for chat display
+      username:
+        msg.username ||
+        msg.sender_id?.replace(/^user_/, "").replace(/_/g, " ") ||
+        "Guest",
+    }));
 
-    res.json(enrichedMessages);
-
+    res.json(enriched);
   } catch (err) {
     console.error("[Discord] GET messages error:", err);
-    res.status(500).json({ message: "Failed to fetch messages" });
+    res
+      .status(500)
+      .json({ message: "Failed to fetch messages", code: "FETCH_FAILED" });
   }
 });
 
-// ✅ NEW: POST /api/discord/upload-media (Optional Helper)
-// If you want the backend to handle the file and push to Supabase Storage
-router.post("/upload-media", upload.single('file'), async (req, res) => {
+// ────────────────────────────────────────────────────────────────────────────
+// DELETE /api/discord/messages/:messageId - PUBLIC (Anyone can delete for demo)
+// ────────────────────────────────────────────────────────────────────────────
+router.delete("/messages/:messageId", async (req, res) => {
   const supabase = getSupabase(req);
-  
-  if (!req.file) {
-    return res.status(400).json({ message: "No file uploaded" });
-  }
+  const { messageId } = req.params;
+
+  if (!messageId)
+    return res
+      .status(400)
+      .json({ message: "messageId required", code: "MISSING_ID" });
 
   try {
-    const file = req.file;
-    const fileName = `${Date.now()}-${file.originalname}`;
-    
-    // Upload to Supabase Storage bucket 'media'
+    const { error: delErr } = await supabase
+      .from("messages")
+      .delete()
+      .eq("id", messageId);
+    if (delErr) throw delErr;
+    res.json({ success: true });
+  } catch (err) {
+    console.error("[Discord] DELETE error:", err);
+    res
+      .status(500)
+      .json({ message: "Failed to delete message", code: "DELETE_FAILED" });
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// POST /api/discord/upload-media - PUBLIC (Upload to Supabase Storage)
+// ────────────────────────────────────────────────────────────────────────────
+router.post("/upload-media", upload.single("file"), async (req, res) => {
+  const supabase = getSupabase(req);
+  if (!req.file)
+    return res
+      .status(400)
+      .json({ message: "No file provided", code: "NO_FILE" });
+
+  try {
+    const fileName = `${Date.now()}-${req.file.originalname.replace(/\s/g, "_")}`;
     const { data, error } = await supabase.storage
-      .from('media')
-      .upload(fileName, file.buffer, {
-        contentType: file.mimetype,
-        upsert: false
-      });
+      .from("media")
+      .upload(fileName, req.file.buffer, { contentType: req.file.mimetype });
 
     if (error) throw error;
 
-    // Get Public URL
-    const { data: urlData } = supabase.storage.from('media').getPublicUrl(fileName);
+    const { urlData } = supabase.storage.from("media").getPublicUrl(fileName);
+    const type = req.file.mimetype.startsWith("image")
+      ? "image"
+      : req.file.mimetype.startsWith("video")
+        ? "video"
+        : "audio";
 
-    res.json({
-      url: urlData.publicUrl,
-      type: file.mimetype.startsWith('image') ? 'image' : 
-            file.mimetype.startsWith('video') ? 'video' : 'audio'
-    });
-
+    res.json({ url: urlData.publicUrl, type });
   } catch (err) {
     console.error("[Discord] Upload error:", err);
-    res.status(500).json({ message: "Upload failed" });
+    res.status(500).json({ message: "Upload failed", code: "UPLOAD_FAILED" });
   }
 });
 

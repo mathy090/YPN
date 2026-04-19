@@ -5,7 +5,7 @@ import {
   useRootNavigationState,
   useRouter,
 } from "expo-router";
-import * as SecureStore from "expo-secure-store"; // ✅ Direct SecureStore import
+import * as SecureStore from "expo-secure-store";
 import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
 import { SessionExpiredProvider } from "../src/context/SessionExpiredContext";
@@ -13,9 +13,11 @@ import { useSessionHeartbeat } from "../src/hooks/useSessionHeartbeat";
 import { useAuth } from "../src/store/authStore";
 import { getLastRoute } from "../src/utils/cacheAppState";
 import { getUserData } from "../src/utils/tokenManager";
+// ✅ ADD THIS: Import SQLite init
+import { initChatDB } from "../src/utils/chatCache";
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
-const REFRESH_TOKEN_KEY = "app.refresh_token"; // ✅ MUST match your actual key in tokenManager.ts
+const REFRESH_TOKEN_KEY = "app.refresh_token";
 
 export default function RootLayout() {
   const router = useRouter();
@@ -24,20 +26,35 @@ export default function RootLayout() {
   const { checkAuth, isAuthenticated, isChecking } = useAuth();
   const [showExpired, setShowExpired] = useState(false);
 
-  // ✅ Use ref + module flag for bulletproof single execution
   const didBoot = useRef(false);
   const BOOT_LOCKED = useRef(false);
 
   useSessionHeartbeat(isAuthenticated);
 
+  // ✅ ADD THIS: Initialize SQLite database on app start
   useEffect(() => {
-    // 🛑 TRIPLE GUARD - prevents any redirect loops
-    if (BOOT_LOCKED.current || didBoot.current) return;
+    let mounted = true;
 
-    // ✅ Only check pathname AFTER navigation is ready
+    const initDB = async () => {
+      try {
+        await initChatDB();
+        console.log("[RootLayout] ✅ SQLite chat database initialized");
+      } catch (err) {
+        console.warn("[RootLayout] ⚠️ SQLite init failed:", err);
+        // Non-fatal: app can still work with API-only mode
+      }
+    };
+
+    initDB();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (BOOT_LOCKED.current || didBoot.current) return;
     if (!navState?.key) return;
 
-    // ✅ Skip boot check if we're on public/auth routes (prevents loops)
     const publicRoutes = [
       "/welcome",
       "/auth/otp",
@@ -50,16 +67,13 @@ export default function RootLayout() {
       return;
     }
 
-    // 🔒 Lock immediately before any async work
     didBoot.current = true;
     BOOT_LOCKED.current = true;
 
     const boot = async () => {
       try {
-        // 🔥 ADD DELAY: Allow SecureStore writes to commit after login redirects
         await new Promise((resolve) => setTimeout(resolve, 300));
 
-        // 🔐 DIRECT SECURESTORE CHECK (bypasses any caching in getBackendToken)
         console.log(
           "[RootLayout] Checking SecureStore for:",
           REFRESH_TOKEN_KEY,
@@ -71,14 +85,12 @@ export default function RootLayout() {
           console.log(
             "[RootLayout] ❌ No refresh token → redirect to /welcome",
           );
-          // ✅ Use replace with explicit pathname object for reliability
           router.replace({ pathname: "/welcome" });
           return;
         }
 
         console.log("[RootLayout] ✅ Token found, proceeding with auth...");
 
-        // ✅ Token exists → validate with backend
         const valid = await checkAuth();
         if (!valid) {
           console.log(
@@ -88,7 +100,6 @@ export default function RootLayout() {
           return;
         }
 
-        // ✅ Auth passed → check profile completion
         const user = await getUserData();
         if (!user?.hasProfile) {
           console.log(
@@ -101,10 +112,9 @@ export default function RootLayout() {
           return;
         }
 
-        // ✅ All checks passed → restore session
         console.log("[RootLayout] ✅ All checks passed, restoring session...");
         const lastRoute = await getLastRoute();
-        const publicRoutes = [
+        const protectedRoutes = [
           "/welcome",
           "/auth/otp",
           "/auth/phone",
@@ -112,14 +122,13 @@ export default function RootLayout() {
           "/auth/device",
         ];
 
-        if (lastRoute && !publicRoutes.includes(lastRoute)) {
+        if (lastRoute && !protectedRoutes.includes(lastRoute)) {
           router.replace(lastRoute as any);
         } else {
           router.replace("/(tabs)/discord");
         }
       } catch (error) {
         console.error("[RootLayout] 💥 Boot error:", error);
-        // ✅ On any error, safely redirect to welcome
         if (!pathname?.startsWith("/welcome")) {
           router.replace({ pathname: "/welcome" });
         }
@@ -127,14 +136,12 @@ export default function RootLayout() {
     };
 
     boot();
-  }, [navState?.key]); // ✅ Only depend on navState - pathname changes handled inside
+  }, [navState?.key]);
 
-  // ✅ Show splash ONLY during initial auth check, never block navigation
   const shouldShowSplash = isChecking && !pathname?.startsWith("/welcome");
 
   return (
     <>
-      {/* ✅ Splash overlay - pointerEvents=none ensures it doesn't block touches */}
       {shouldShowSplash && (
         <View style={StyleSheet.absoluteFillObject} pointerEvents="none">
           <View style={styles.splash}>
@@ -151,7 +158,6 @@ export default function RootLayout() {
           router.replace("/auth/otp");
         }}
       >
-        {/* ✅ Stack ALWAYS renders - navigation works even during splash */}
         <Stack
           screenOptions={{
             headerShown: false,
@@ -172,6 +178,11 @@ export default function RootLayout() {
           <Stack.Screen name="chat" />
           <Stack.Screen name="voice-call" />
           <Stack.Screen name="splash" />
+          {/* ✅ ADD THIS: Register the chat channel screen */}
+          <Stack.Screen
+            name="discordChannel"
+            options={{ presentation: "card", animation: "slide_from_bottom" }}
+          />
         </Stack>
       </SessionExpiredProvider>
     </>
