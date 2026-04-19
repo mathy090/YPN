@@ -2,20 +2,15 @@
 import { Ionicons } from "@expo/vector-icons";
 import NetInfo from "@react-native-community/netinfo";
 import { useFocusEffect, useNavigation } from "@react-navigation/native";
-import { Audio, ResizeMode, Video } from "expo-av";
-import * as FileSystem from "expo-file-system";
-import * as ImagePicker from "expo-image-picker";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
   BackHandler,
-  Dimensions,
   FlatList,
-  Image,
+  Image, // ✅ IMPORTED Image for user icons
   KeyboardAvoidingView,
-  Modal,
   Platform,
   StyleSheet,
   Text,
@@ -31,8 +26,7 @@ import {
   deleteMessageLocally,
   getCachedMessages,
   initChatDB,
-  removeFailedOptimistic,
-  type CachedMessage,
+  type CachedMessage
 } from "../utils/chatCache";
 import {
   getChatProfile,
@@ -42,9 +36,11 @@ import {
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL;
 const MAX_RETRIES = 3;
-const SCREEN_WIDTH = Dimensions.get("window").width;
 
-type Message = CachedMessage & { localId?: string; failed?: boolean };
+type Message = CachedMessage & {
+  localId?: string;
+  failed?: boolean;
+};
 
 export default function DiscordChannelScreen() {
   const router = useRouter();
@@ -73,17 +69,6 @@ export default function DiscordChannelScreen() {
   const [loading, setLoading] = useState(true);
   const [isOnline, setIsOnline] = useState(true);
   const [chatProfile, setChatProfile] = useState<ChatProfile | null>(null);
-
-  const [previewAsset, setPreviewAsset] =
-    useState<ImagePicker.ImagePickerAsset | null>(null);
-  const [viewingMedia, setViewingMedia] = useState<{
-    uri: string;
-    type: string;
-  } | null>(null);
-
-  // ✅ Audio recording state
-  const [recording, setRecording] = useState<Audio.Recording | null>(null);
-  const [isRecording, setIsRecording] = useState(false);
 
   const listRef = useRef<FlatList>(null);
 
@@ -123,7 +108,14 @@ export default function DiscordChannelScreen() {
   const loadCachedMessages = async () => {
     try {
       const cached = await getCachedMessages(channelId);
-      setMessages(cached);
+      // ✅ FIX: Filter out deleted messages and correctly flag 'isMe' using username
+      const visible = cached
+        .filter((m) => m.is_deleted_local !== 1)
+        .map((m) => ({
+          ...m,
+          isMe: m.username === chatProfile?.username,
+        }));
+      setMessages(visible);
       setLoading(false);
       setTimeout(() => listRef.current?.scrollToEnd({ animated: false }), 50);
       if (isOnline) fetchNewMessages();
@@ -144,12 +136,18 @@ export default function DiscordChannelScreen() {
       if (!res.ok) return;
       const newMsgs: CachedMessage[] = await res.json();
       if (newMsgs.length === 0) return;
+
       setMessages((prev) => {
         const ids = new Set(prev.map((m) => m.id));
-        const unique = newMsgs.filter((m) => !ids.has(m.id));
+        // ✅ FIX: Map 'isMe' using username to ensure alignment is correct
+        const unique = newMsgs
+          .filter((m) => !ids.has(m.id) && m.is_deleted_local !== 1)
+          .map((m) => ({ ...m, isMe: m.username === chatProfile?.username }));
         return [...prev, ...unique].slice(-200);
       });
-      await cacheMessages(channelId, newMsgs);
+
+      const toCache = newMsgs.filter((m) => m.is_deleted_local !== 1);
+      if (toCache.length > 0) await cacheMessages(channelId, toCache);
     } catch (e) {
       console.warn("[Sync] Failed:", e);
     }
@@ -166,8 +164,17 @@ export default function DiscordChannelScreen() {
       if (!res.ok) return;
       const older: CachedMessage[] = await res.json();
       if (older.length === 0) return;
-      setMessages((prev) => [...older, ...prev]);
-      await cacheMessages(channelId, [...older, ...messages]);
+
+      const visible = older.filter((m) => m.is_deleted_local !== 1);
+      if (visible.length === 0) return;
+
+      // ✅ FIX: Map 'isMe' using username
+      const mapped = visible.map((m) => ({
+        ...m,
+        isMe: m.username === chatProfile?.username,
+      }));
+      setMessages((prev) => [...mapped, ...prev]);
+      await cacheMessages(channelId, visible);
     } catch (e) {
       console.warn("[Older] Error:", e);
     }
@@ -194,10 +201,11 @@ export default function DiscordChannelScreen() {
       setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 100);
   }, [messages]);
 
-  // 📝 Send text (only called when text exists)
+  // 📝 Send text (INSTANT button reset)
   const sendTextMessage = async () => {
     const text = input.trim();
     if (!text || sending || !channelId || !chatProfile) return;
+
     const localId = `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const msg: CachedMessage = {
       id: localId,
@@ -207,19 +215,28 @@ export default function DiscordChannelScreen() {
       media_type: null,
       media_url: null,
       username: chatProfile.username,
-      avatar_url: chatProfile.avatarUrl,
+      avatar_url: chatProfile.avatarUrl, // ✅ Ensure avatar_url is sent
       created_at: new Date().toISOString(),
       is_optimistic: 1,
       is_deleted_local: 0,
     };
+
+    // ✅ Clear input and reset button IMMEDIATELY
     setInput("");
-    setSending(true);
+    setSending(false);
+
+    // Add to UI optimistically (force isMe: true for instant display)
     await addOptimisticMessage(msg);
-    setMessages((prev) => [...prev, { ...msg, localId, failed: false }]);
-    await sendMessageWithRetry(msg, localId);
+    setMessages((prev) => [
+      ...prev,
+      { ...msg, localId, failed: false, isMe: true },
+    ]);
+
+    // Send in background
+    sendMessageWithRetry(msg, localId);
   };
 
-  // 🔄 Send/Upload with manual retry only (no auto-retry)
+  // 🔄 Send with manual retry only (runs in background)
   const sendMessageWithRetry = async (msg: CachedMessage, localId: string) => {
     try {
       const res = await fetch(`${API_URL}/api/discord/messages`, {
@@ -228,7 +245,7 @@ export default function DiscordChannelScreen() {
         body: JSON.stringify({
           channelId: msg.channel_id,
           username: msg.username,
-          avatarUrl: msg.avatar_url,
+          avatarUrl: msg.avatar_url, // ✅ Pass avatar to backend
           content: msg.content,
         }),
       });
@@ -238,92 +255,16 @@ export default function DiscordChannelScreen() {
       setMessages((prev) =>
         prev.map((m) =>
           m.localId === localId || m.id === localId
-            ? { ...serverMsg, localId: undefined }
+            ? // ✅ FIX: Recalculate isMe based on server response username
+              {
+                ...serverMsg,
+                localId: undefined,
+                isMe: serverMsg.username === chatProfile?.username,
+              }
             : m,
         ),
       );
-      setSending(false);
     } catch (e: any) {
-      setSending(false);
-      // ✅ Mark as failed - user must tap to retry (no auto-retry)
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.localId === localId || m.id === localId
-            ? { ...m, failed: true }
-            : m,
-        ),
-      );
-    }
-  };
-
-  // 📸 Media Picker
-  const pickMedia = async (type: "image" | "video") => {
-    const mediaType = type === "image" ? "images" : "videos";
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: mediaType as any,
-      quality: 0.8,
-    });
-    if (!result.canceled && result.assets?.[0]) {
-      setPreviewAsset(result.assets[0]);
-    }
-  };
-
-  // ✅ Confirm & Upload Media
-  const confirmSendMedia = async () => {
-    if (!previewAsset || !chatProfile || !channelId) return;
-    const asset = previewAsset;
-    const mediaType = asset.mimeType?.startsWith("video") ? "video" : "image";
-
-    setPreviewAsset(null);
-    setSending(true);
-
-    const localId = `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const msg: CachedMessage = {
-      id: localId,
-      channel_id: channelId,
-      sender_id: chatProfile.uid,
-      content: null,
-      media_type: mediaType,
-      media_url: asset.uri,
-      username: chatProfile.username,
-      avatar_url: chatProfile.avatarUrl,
-      created_at: new Date().toISOString(),
-      is_optimistic: 1,
-      is_deleted_local: 0,
-    };
-
-    setMessages((prev) => [...prev, { ...msg, localId, failed: false }]);
-    await addOptimisticMessage(msg);
-
-    try {
-      const formData = new FormData();
-      formData.append("file", {
-        uri: asset.uri,
-        name: asset.uri.split("/").pop() || `media.${mediaType}`,
-        type:
-          asset.mimeType ||
-          (mediaType === "image" ? "image/jpeg" : "video/mp4"),
-      } as any);
-
-      const uploadRes = await fetch(`${API_URL}/api/discord/upload-media`, {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!uploadRes.ok) {
-        const errText = await uploadRes.text().catch(() => "Upload failed");
-        console.error("[Media] Backend response:", uploadRes.status, errText);
-        throw new Error(`Upload failed: ${uploadRes.status}`);
-      }
-
-      const { url, type } = await uploadRes.json();
-      await sendMessageWithRetry(
-        { ...msg, media_url: url, media_type: type },
-        localId,
-      );
-    } catch (e: any) {
-      console.error("[Media] Upload/send error:", e);
-      setSending(false);
       setMessages((prev) =>
         prev.map((m) =>
           m.localId === localId || m.id === localId
@@ -342,174 +283,55 @@ export default function DiscordChannelScreen() {
         m.id === msg.id || m.localId === msg.id ? { ...m, failed: false } : m,
       ),
     );
-
-    if (
-      msg.media_url?.startsWith("file:") ||
-      msg.media_url?.startsWith("content:")
-    ) {
-      confirmSendMediaWithLocalAsset(msg);
-    } else {
-      sendMessageWithRetry(msg, msg.id || msg.localId!);
-    }
+    sendMessageWithRetry(msg, msg.id || msg.localId!);
   };
 
-  // Helper to re-upload failed media
-  const confirmSendMediaWithLocalAsset = async (msg: Message) => {
-    if (!chatProfile || !channelId || !msg.media_url) return;
-    const mediaType = msg.media_type === "video" ? "video" : "image";
-    setSending(true);
-
-    try {
-      const formData = new FormData();
-      formData.append("file", {
-        uri: msg.media_url,
-        name: msg.media_url.split("/").pop() || `media.${mediaType}`,
-        type: mediaType === "video" ? "video/mp4" : "image/jpeg",
-      } as any);
-
-      const uploadRes = await fetch(`${API_URL}/api/discord/upload-media`, {
-        method: "POST",
-        body: formData,
-      });
-      if (!uploadRes.ok) throw new Error(`Upload failed: ${uploadRes.status}`);
-
-      const { url, type } = await uploadRes.json();
-      await sendMessageWithRetry(
-        { ...msg, media_url: url, media_type: type },
-        msg.id || msg.localId!,
-      );
-    } catch (e: any) {
-      console.error("[Media] Retry upload error:", e);
-      setSending(false);
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === msg.id || m.localId === msg.id ? { ...m, failed: true } : m,
-        ),
-      );
-    }
-  };
-
-  // 🎤 Start voice recording
-  const startRecording = async () => {
-    try {
-      const { granted } = await Audio.requestPermissionsAsync();
-      if (!granted) {
-        Alert.alert(
-          "Permission Required",
-          "Allow microphone access to record voice notes",
-        );
-        return;
-      }
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-      });
-      const { recording } = await Audio.Recording.createAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY,
-      );
-      setRecording(recording);
-      setIsRecording(true);
-    } catch (e) {
-      console.error("[Record] Start error:", e);
-      Alert.alert("Error", "Could not start recording");
-    }
-  };
-
-  // 🎤 Stop recording and send
-  const stopRecording = async () => {
-    if (!recording) return;
-    try {
-      setIsRecording(false);
-      await recording.stopAndUnloadAsync();
-      const uri = recording.getURI();
-      if (!uri) throw new Error("No recording URI");
-
-      const info = await FileSystem.getInfoAsync(uri);
-      if (info.size && info.size > 30 * 1024 * 1024) {
-        Alert.alert("Recording Too Long", "Maximum recording size is 30MB");
-        return;
-      }
-
-      const localId = `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      const msg: CachedMessage = {
-        id: localId,
-        channel_id: channelId,
-        sender_id: chatProfile.uid,
-        content: null,
-        media_type: "audio",
-        media_url: uri,
-        username: chatProfile.username,
-        avatar_url: chatProfile.avatarUrl,
-        created_at: new Date().toISOString(),
-        is_optimistic: 1,
-        is_deleted_local: 0,
-      };
-
-      setSending(true);
-      await addOptimisticMessage(msg);
-      setMessages((prev) => [...prev, { ...msg, localId, failed: false }]);
-
-      const formData = new FormData();
-      formData.append("file", {
-        uri,
-        name: `voice_${Date.now()}.aac`,
-        type: "audio/aac",
-      } as any);
-
-      const uploadRes = await fetch(`${API_URL}/api/discord/upload-media`, {
-        method: "POST",
-        body: formData,
-      });
-      if (!uploadRes.ok) throw new Error(`Upload failed: ${uploadRes.status}`);
-
-      const { url, type } = await uploadRes.json();
-      await sendMessageWithRetry(
-        { ...msg, media_url: url, media_type: type },
-        localId,
-      );
-    } catch (e: any) {
-      console.error("[Record] Stop error:", e);
-      setSending(false);
-      Alert.alert("Error", e.message || "Could not process recording");
-    } finally {
-      setRecording(null);
-      await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
-    }
-  };
-
-  // 🗑️ Delete
+  // 🗑️ Smart Delete: Yours = backend + local, Others = local only
   const handleLongPress = (msg: Message) => {
-    if (msg.id?.startsWith("local-") || msg.localId?.startsWith("local-")) {
-      const idToRemove = msg.id || msg.localId;
-      setMessages((prev) =>
-        prev.filter((m) => m.id !== idToRemove && m.localId !== idToRemove),
-      );
-      removeFailedOptimistic(idToRemove);
-      return;
-    }
-    Alert.alert("Delete?", "Delete this message?", [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "Delete",
-        style: "destructive",
-        onPress: async () => {
-          try {
-            await fetch(`${API_URL}/api/discord/messages/${msg.id}`, {
-              method: "DELETE",
-            });
-            setMessages((prev) => prev.filter((m) => m.id !== msg.id));
-            await deleteMessageLocally(msg.id);
-          } catch {
-            Alert.alert("Error", "Could not delete");
-          }
+    const isMyMessage = msg.username === chatProfile?.username;
+
+    Alert.alert(
+      "Delete Message",
+      isMyMessage
+        ? "Delete for everyone or just for you?"
+        : "Hide this message just for you?",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: isMyMessage ? "Delete for Everyone" : "Hide for Me",
+          style: "destructive",
+          onPress: async () => {
+            if (isMyMessage) {
+              try {
+                await fetch(`${API_URL}/api/discord/messages/${msg.id}`, {
+                  method: "DELETE",
+                });
+                setMessages((prev) => prev.filter((m) => m.id !== msg.id));
+                await deleteMessageLocally(msg.id);
+              } catch {
+                Alert.alert("Error", "Could not delete message");
+              }
+            } else {
+              await deleteMessageLocally(msg.id);
+              setMessages((prev) => prev.filter((m) => m.id !== msg.id));
+            }
+          },
         },
-      },
-    ]);
+        isMyMessage && {
+          text: "Hide for Me Only",
+          onPress: async () => {
+            await deleteMessageLocally(msg.id);
+            setMessages((prev) => prev.filter((m) => m.id !== msg.id));
+          },
+        },
+      ].filter(Boolean) as any[],
+    );
   };
 
-  // 🎨 Render Message
+  // 🎨 Render Message (Fixed alignment + Avatar Import)
   const renderMessage = ({ item }: { item: Message }) => {
-    const isMe = item.sender_id === chatProfile?.uid;
+    // ✅ FIX: Reliable 'isMe' check using username
+    const isMe = item.username === chatProfile?.username || item.isMe === true;
     const time = new Date(item.created_at).toLocaleTimeString([], {
       hour: "2-digit",
       minute: "2-digit",
@@ -522,25 +344,37 @@ export default function DiscordChannelScreen() {
         delayLongPress={300}
         activeOpacity={0.9}
       >
-        {!isMe && (
-          <View
-            style={[
-              bS.avatar,
-              bS.avatarPlaceholder,
-              { backgroundColor: color + "33" },
-            ]}
-          >
-            <Text style={[bS.avatarText, { color }]}>
-              {(item.username?.[0] ?? "?").toUpperCase()}
-            </Text>
-          </View>
-        )}
+        {/* ✅ FIX: Avatar for OTHER users only */}
+        {!isMe &&
+          (item.avatar_url ? (
+            // ✅ Show actual user icon if available
+            <Image
+              source={{ uri: item.avatar_url }}
+              style={bS.avatar}
+              resizeMode="cover"
+            />
+          ) : (
+            // ✅ Fallback to colored circle with initial
+            <View
+              style={[
+                bS.avatar,
+                bS.avatarPlaceholder,
+                { backgroundColor: color + "33" },
+              ]}
+            >
+              <Text style={[bS.avatarText, { color }]}>
+                {(item.username?.[0] ?? "?").toUpperCase()}
+              </Text>
+            </View>
+          ))}
+
         <View
           style={[
             bS.bubble,
             isMe ? [bS.bubbleMe, { backgroundColor: color }] : bS.bubbleThem,
           ]}
         >
+          {/* ✅ FIX: Username for OTHER users only */}
           {!isMe && item.username && (
             <Text style={[bS.senderName, { color }]}>{item.username}</Text>
           )}
@@ -556,61 +390,7 @@ export default function DiscordChannelScreen() {
             </Text>
           )}
 
-          {/* Image Card */}
-          {item.media_type === "image" && item.media_url && (
-            <TouchableOpacity
-              onPress={() =>
-                setViewingMedia({ uri: item.media_url, type: "image" })
-              }
-              activeOpacity={0.9}
-            >
-              <Image
-                source={{ uri: item.media_url }}
-                style={bS.mediaCard}
-                resizeMode="cover"
-              />
-            </TouchableOpacity>
-          )}
-
-          {/* Video Card */}
-          {item.media_type === "video" && item.media_url && (
-            <TouchableOpacity
-              onPress={() =>
-                setViewingMedia({ uri: item.media_url, type: "video" })
-              }
-              activeOpacity={0.9}
-              style={bS.videoCardWrap}
-            >
-              <Video
-                source={{ uri: item.media_url }}
-                style={bS.mediaCard}
-                resizeMode={ResizeMode.COVER}
-                useNativeControls={false}
-                isMuted
-              />
-              <View style={bS.playOverlay}>
-                <Ionicons name="play" size={32} color="#fff" />
-              </View>
-            </TouchableOpacity>
-          )}
-
-          {/* Audio Card */}
-          {item.media_type === "audio" && item.media_url && (
-            <View style={bS.audioCard}>
-              <Ionicons name="waveform" size={24} color="#fff" />
-              <Text style={bS.audioText}>Voice Note</Text>
-            </View>
-          )}
-
-          {/* Sending indicator */}
-          {item.is_optimistic === 1 && !item.failed && (
-            <View style={bS.statusRow}>
-              <ActivityIndicator size="small" color="#fff8" />
-              <Text style={bS.sendingText}>Sending...</Text>
-            </View>
-          )}
-
-          {/* Failed indicator (Red tap-to-retry) */}
+          {/* Failed indicator */}
           {item.failed && (
             <TouchableOpacity
               onPress={() => retryMessage(item)}
@@ -640,97 +420,6 @@ export default function DiscordChannelScreen() {
           </Text>
         </View>
       </TouchableOpacity>
-    );
-  };
-
-  // 🖼️ Full Screen Media Viewer
-  const renderMediaViewer = () => {
-    if (!viewingMedia) return null;
-    return (
-      <Modal visible={!!viewingMedia} transparent animationType="fade">
-        <View style={s.viewerOverlay}>
-          <TouchableOpacity
-            style={s.viewerClose}
-            onPress={() => setViewingMedia(null)}
-          >
-            <Ionicons name="close" size={28} color="#fff" />
-          </TouchableOpacity>
-          {viewingMedia.type === "video" ? (
-            <Video
-              source={{ uri: viewingMedia.uri }}
-              style={s.viewerMedia}
-              resizeMode={ResizeMode.CONTAIN}
-              useNativeControls
-              shouldPlay
-            />
-          ) : (
-            <Image
-              source={{ uri: viewingMedia.uri }}
-              style={s.viewerMedia}
-              resizeMode="contain"
-            />
-          )}
-        </View>
-      </Modal>
-    );
-  };
-
-  // 📸 WhatsApp-Style Preview Modal
-  const renderPreviewModal = () => {
-    if (!previewAsset) return null;
-    const isVideo = previewAsset.mimeType?.startsWith("video");
-    return (
-      <Modal visible={!!previewAsset} transparent animationType="slide">
-        <View style={s.previewOverlay}>
-          <View style={s.previewHeader}>
-            <TouchableOpacity
-              onPress={() => setPreviewAsset(null)}
-              style={s.previewBtn}
-            >
-              <Ionicons name="close" size={24} color="#fff" />
-            </TouchableOpacity>
-            <Text style={s.previewTitle}>Preview</Text>
-            <View style={{ width: 24 }} />
-          </View>
-          <View style={s.previewContent}>
-            {isVideo ? (
-              <Video
-                source={{ uri: previewAsset.uri }}
-                style={s.previewMedia}
-                resizeMode={ResizeMode.CONTAIN}
-                useNativeControls
-                shouldPlay
-              />
-            ) : (
-              <Image
-                source={{ uri: previewAsset.uri }}
-                style={s.previewMedia}
-                resizeMode="contain"
-              />
-            )}
-          </View>
-          <View style={s.previewFooter}>
-            <TouchableOpacity
-              style={[s.previewAction, { backgroundColor: "#333" }]}
-              onPress={() => setPreviewAsset(null)}
-            >
-              <Text style={s.previewActionText}>Cancel</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[s.previewAction, { backgroundColor: color }]}
-              onPress={confirmSendMedia}
-            >
-              <Ionicons
-                name="send"
-                size={20}
-                color="#fff"
-                style={{ marginRight: 6 }}
-              />
-              <Text style={s.previewActionText}>Send</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </Modal>
     );
   };
 
@@ -823,20 +512,6 @@ export default function DiscordChannelScreen() {
         <View
           style={[s.inputBar, { paddingBottom: Math.max(insets.bottom, 8) }]}
         >
-          <TouchableOpacity
-            onPress={() => pickMedia("image")}
-            disabled={sending || !chatProfile}
-            style={s.attachBtn}
-          >
-            <Ionicons name="image-outline" size={24} color="#888" />
-          </TouchableOpacity>
-          <TouchableOpacity
-            onPress={() => pickMedia("video")}
-            disabled={sending || !chatProfile}
-            style={s.attachBtn}
-          >
-            <Ionicons name="videocam-outline" size={24} color="#888" />
-          </TouchableOpacity>
           <TextInput
             value={input}
             onChangeText={setInput}
@@ -848,57 +523,30 @@ export default function DiscordChannelScreen() {
             multiline
             maxLength={2000}
             editable={!sending && !!chatProfile}
+            onSubmitEditing={sendTextMessage}
+            returnKeyType="send"
           />
-
-          {/* ✅ Facebook/iOS Style: Alternating Send/Mic Button */}
           <TouchableOpacity
-            onPress={
-              isRecording
-                ? stopRecording
-                : input.trim()
-                  ? sendTextMessage
-                  : startRecording
-            }
-            disabled={sending || !chatProfile}
+            onPress={input.trim() ? sendTextMessage : undefined}
+            disabled={!input.trim() || sending || !chatProfile}
             style={[
               s.sendBtn,
-              { backgroundColor: isRecording ? "#ED4245" : color },
-              (sending || !chatProfile) && s.sendBtnOff,
+              { backgroundColor: color },
+              (!input.trim() || sending || !chatProfile) && s.sendBtnOff,
             ]}
           >
             {sending ? (
               <ActivityIndicator size="small" color="#fff" />
-            ) : isRecording ? (
-              <Ionicons name="stop" size={20} color="#fff" />
-            ) : input.trim() ? (
+            ) : (
               <Ionicons
                 name="send"
                 size={18}
-                color={color === "#FEE75C" ? "#000" : "#fff"}
-              />
-            ) : (
-              <Ionicons
-                name="mic-outline"
-                size={20}
                 color={color === "#FEE75C" ? "#000" : "#fff"}
               />
             )}
           </TouchableOpacity>
         </View>
       </KeyboardAvoidingView>
-
-      {renderPreviewModal()}
-      {renderMediaViewer()}
-
-      {/* 🎤 Recording Indicator Modal */}
-      <Modal visible={isRecording} transparent animationType="fade">
-        <View style={s.recordModal}>
-          <View style={s.recordContent}>
-            <View style={s.pulseCircle} />
-            <Text style={s.recordText}>Recording... Tap to stop</Text>
-          </View>
-        </View>
-      </Modal>
     </View>
   );
 }
@@ -911,17 +559,17 @@ const bS = StyleSheet.create({
     paddingHorizontal: 12,
     alignItems: "flex-end",
   },
-  rowMe: { flexDirection: "row-reverse" },
+  rowMe: { flexDirection: "row-reverse" }, // ✅ Critical for right alignment
   avatar: {
-    width: 30,
-    height: 30,
-    borderRadius: 15,
-    marginRight: 6,
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    marginRight: 8,
     marginBottom: 2,
     flexShrink: 0,
   },
   avatarPlaceholder: { justifyContent: "center", alignItems: "center" },
-  avatarText: { fontWeight: "700", fontSize: 12 },
+  avatarText: { fontWeight: "700", fontSize: 13 },
   bubble: {
     maxWidth: "85%",
     paddingHorizontal: 12,
@@ -938,47 +586,6 @@ const bS = StyleSheet.create({
     marginTop: 4,
     textAlign: "right",
   },
-  mediaCard: {
-    width: SCREEN_WIDTH * 0.65,
-    height: SCREEN_WIDTH * 0.5,
-    borderRadius: 12,
-    marginTop: 6,
-  },
-  videoCardWrap: {
-    width: SCREEN_WIDTH * 0.65,
-    height: SCREEN_WIDTH * 0.5,
-    borderRadius: 12,
-    marginTop: 6,
-    overflow: "hidden",
-    backgroundColor: "#000",
-  },
-  playOverlay: {
-    position: "absolute",
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    justifyContent: "center",
-    alignItems: "center",
-    backgroundColor: "rgba(0,0,0,0.3)",
-  },
-  audioCard: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    marginTop: 6,
-    padding: 10,
-    backgroundColor: "rgba(0,0,0,0.2)",
-    borderRadius: 8,
-  },
-  audioText: { color: "#fff", fontSize: 13, fontWeight: "500" },
-  statusRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 4,
-    marginTop: 4,
-  },
-  sendingText: { color: "#fff8", fontSize: 10 },
 });
 
 const s = StyleSheet.create({
@@ -1026,7 +633,6 @@ const s = StyleSheet.create({
     borderTopColor: "#111",
     gap: 8,
   },
-  attachBtn: { padding: 8 },
   textInput: {
     flex: 1,
     backgroundColor: "#161616",
@@ -1045,71 +651,4 @@ const s = StyleSheet.create({
     alignItems: "center",
   },
   sendBtnOff: { backgroundColor: "#1A1A1A" },
-
-  // Preview Modal
-  previewOverlay: { flex: 1, backgroundColor: "#000" },
-  previewHeader: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-  },
-  previewTitle: { color: "#fff", fontSize: 18, fontWeight: "600" },
-  previewBtn: { padding: 8 },
-  previewContent: { flex: 1, justifyContent: "center", alignItems: "center" },
-  previewMedia: { width: "100%", height: "70%" },
-  previewFooter: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    padding: 16,
-    gap: 12,
-  },
-  previewAction: {
-    flex: 1,
-    flexDirection: "row",
-    justifyContent: "center",
-    alignItems: "center",
-    paddingVertical: 14,
-    borderRadius: 12,
-  },
-  previewActionText: { color: "#fff", fontWeight: "600", fontSize: 16 },
-
-  // Viewer
-  viewerOverlay: {
-    flex: 1,
-    backgroundColor: "#000",
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  viewerClose: {
-    position: "absolute",
-    top: 50,
-    right: 20,
-    zIndex: 10,
-    padding: 8,
-  },
-  viewerMedia: { width: SCREEN_WIDTH, height: SCREEN_WIDTH },
-
-  // Recording Modal
-  recordModal: {
-    flex: 1,
-    backgroundColor: "rgba(0,0,0,0.8)",
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  recordContent: {
-    backgroundColor: "#1a1a1a",
-    padding: 24,
-    borderRadius: 16,
-    alignItems: "center",
-    gap: 16,
-  },
-  pulseCircle: {
-    width: 64,
-    height: 64,
-    borderRadius: 32,
-    backgroundColor: "#ED4245",
-  },
-  recordText: { color: "#fff", fontSize: 15, fontWeight: "600" },
 });

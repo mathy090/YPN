@@ -1,5 +1,11 @@
 // src/screens/TeamYPN.tsx
+//
+// AI chat screen — connects to the auth-free /chat and /ws endpoints.
+// Session identity uses a stable session_id stored in AsyncStorage
+// (not a Firebase token), so no login is needed for the AI service.
+
 import { Ionicons } from "@expo/vector-icons";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { BlurView } from "expo-blur";
 import { useFocusEffect, useRouter } from "expo-router";
 import React, {
@@ -38,15 +44,25 @@ import {
   clearTeamYPNUnreadBadge,
   incrementUnreadBadge,
 } from "../utils/teamYPNBadge";
-import { clearAllTokens, getValidBackendToken } from "../utils/tokenManager"; // 🔥 Hybrid Auth Utils
 import VoiceCallScreen from "./VoiceCallScreen";
 
-// 🔥 Point to your Python FastAPI Backend
-const AI_API_URL = `${process.env.EXPO_PUBLIC_AI_URL}/chat`;
-const HEARTBEAT_URL = `${process.env.EXPO_PUBLIC_AI_URL}/heartbeat`;
+// ── Constants ─────────────────────────────────────────────────────────────────
+const AI_CHAT_URL = `${process.env.EXPO_PUBLIC_AI_URL}/chat`;
 const CACHE_KEY = "chat_team-ypn";
+const SESSION_KEY = "ypn_ai_session_id";
 const UNDO_MS = 3000;
 
+// ── Session ID (stable per device, persisted in AsyncStorage) ─────────────────
+async function getOrCreateSessionId(): Promise<string> {
+  let id = await AsyncStorage.getItem(SESSION_KEY);
+  if (!id) {
+    id = `session_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    await AsyncStorage.setItem(SESSION_KEY, id);
+  }
+  return id;
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 function fixStatus(msgs: unknown[]): Message[] {
   return (msgs as Message[]).map((m) =>
     (m as Message).status
@@ -55,11 +71,13 @@ function fixStatus(msgs: unknown[]): Message[] {
   );
 }
 
+// ── TypingIndicator ───────────────────────────────────────────────────────────
 function TypingIndicator() {
-  const dot0 = useRef(new Animated.Value(0.4)).current;
-  const dot1 = useRef(new Animated.Value(0.4)).current;
-  const dot2 = useRef(new Animated.Value(0.4)).current;
-  const dots = [dot0, dot1, dot2];
+  const dots = [
+    useRef(new Animated.Value(0.4)).current,
+    useRef(new Animated.Value(0.4)).current,
+    useRef(new Animated.Value(0.4)).current,
+  ];
 
   useEffect(() => {
     const loop = Animated.loop(
@@ -114,6 +132,7 @@ function TypingIndicator() {
   );
 }
 
+// ── UndoToast ─────────────────────────────────────────────────────────────────
 interface UndoToastProps {
   onUndo: () => void;
   progress: Animated.Value;
@@ -139,18 +158,18 @@ function UndoToast({ onUndo, progress }: UndoToastProps) {
   );
 }
 
+// ── Main screen ───────────────────────────────────────────────────────────────
 export default function TeamYPNScreen() {
   const router = useRouter();
   const listRef = useRef<FlatList>(null);
   const inputRef = useRef<TextInput>(null);
+  const sessionIdRef = useRef<string>("");
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [loading, setLoading] = useState(true);
   const [aiTyping, setAiTyping] = useState(false);
-
-  // Voice modal visibility
   const [voiceVisible, setVoiceVisible] = useState(false);
 
   const [pending, setPending] = useState<Message | null>(null);
@@ -161,6 +180,7 @@ export default function TeamYPNScreen() {
   const { isConnected } = useNetworkStatus();
   const isChatOpenRef = useRef(true);
 
+  // ── focus / blur tracking ──────────────────────────────────────────────────
   useFocusEffect(
     useCallback(() => {
       isChatOpenRef.current = true;
@@ -171,14 +191,20 @@ export default function TeamYPNScreen() {
     }, []),
   );
 
+  // ── boot: load session_id + cached messages ────────────────────────────────
   useEffect(() => {
     (async () => {
+      // Stable session identity (no auth required)
+      sessionIdRef.current = await getOrCreateSessionId();
+
       try {
         const cached = await getSecureCache(CACHE_KEY);
         if (Array.isArray(cached) && cached.length > 0) {
           const fixed = fixStatus(cached);
           setMessages(fixed);
           await clearTeamYPNUnreadBadge();
+
+          // Resume any interrupted AI streams
           for (const msg of fixed) {
             if (msg.sender === "ai" && msg.status !== "read") {
               const saved = await getPendingAIReply(msg.id);
@@ -208,6 +234,7 @@ export default function TeamYPNScreen() {
     })();
   }, []);
 
+  // ── persist messages on change ─────────────────────────────────────────────
   useEffect(() => {
     if (!loading && messages.length > 0) {
       setSecureCache(CACHE_KEY, messages).catch(() => {});
@@ -218,54 +245,31 @@ export default function TeamYPNScreen() {
     setTimeout(() => listRef.current?.scrollToEnd({ animated }), 80);
   }, []);
 
-  // 🔥 Fetch AI with Heartbeat & Hybrid Auth
+  // ── fetch AI reply (no auth) ───────────────────────────────────────────────
   const fetchAIReply = async (text: string): Promise<string> => {
-    try {
-      // 1. Get Valid Token (Refreshes if needed)
-      const token = await getValidBackendToken();
+    const res = await fetch(AI_CHAT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: text,
+        session_id: sessionIdRef.current,
+      }),
+    });
 
-      // 2. Send Heartbeat to Main.py (Proof of Life)
-      await fetch(HEARTBEAT_URL, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-      });
+    if (!res.ok) throw new Error(`AI ${res.status}`);
 
-      // 3. Send Message
-      const res = await fetch(AI_API_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ message: text }),
-      });
+    const data = await res.json();
 
-      if (res.status === 401) {
-        await clearAllTokens();
-        router.replace("/auth/otp");
-        throw new Error("AUTH_EXPIRED");
-      }
-
-      if (!res.ok) {
-        throw new Error(`AI ${res.status}`);
-      }
-
-      const data = await res.json();
-      return (data.reply ?? data.message ?? "Sorry, no response.") as string;
-    } catch (err: any) {
-      if (
-        err.message === "NO_FIREBASE_TOKEN" ||
-        err.message === "REFRESH_FAILED" ||
-        err.message === "AUTH_EXPIRED"
-      ) {
-        await clearAllTokens();
-        router.replace("/auth/otp");
-        throw new Error("AUTH_EXPIRED");
-      }
-      throw err;
+    // Server may return a new session_id on first call — persist it
+    if (data.session_id && data.session_id !== sessionIdRef.current) {
+      sessionIdRef.current = data.session_id;
+      await AsyncStorage.setItem(SESSION_KEY, data.session_id);
     }
+
+    return (data.reply ?? "Sorry, no response.") as string;
   };
 
+  // ── send message ───────────────────────────────────────────────────────────
   const sendMessage = useCallback(
     async (text: string, retryId?: string) => {
       if (!text.trim() || !isConnected || sending) return;
@@ -290,9 +294,7 @@ export default function TeamYPNScreen() {
         prev.map((m) => (m.id === userMsgId ? { ...m, status: "read" } : m)),
       );
 
-      const replyPromise = fetchAIReply(text);
-
-      replyPromise
+      fetchAIReply(text)
         .then(async (reply) => {
           if (isChatOpenRef.current) {
             setAiTyping(true);
@@ -331,11 +333,6 @@ export default function TeamYPNScreen() {
         .catch((err: any) => {
           console.warn("[TeamYPN] fetch:", err);
           setAiTyping(false);
-
-          if (err.message === "AUTH_EXPIRED") {
-            return;
-          }
-
           setMessages((prev) =>
             prev.map((m) =>
               m.id === userMsgId ? { ...m, status: "failed" } : m,
@@ -354,6 +351,7 @@ export default function TeamYPNScreen() {
     sendMessage(text);
   }, [input, sendMessage]);
 
+  // ── delete / undo ──────────────────────────────────────────────────────────
   const commitDelete = useCallback(
     (msg: Message) => {
       undoAnimRef.current?.stop();
@@ -389,6 +387,7 @@ export default function TeamYPNScreen() {
     setPending(null);
   }, [pending, undoProgress]);
 
+  // ── date grouping ──────────────────────────────────────────────────────────
   const fmtHeader = (ts: string): string => {
     const d = new Date(ts);
     const now = new Date();
@@ -426,6 +425,7 @@ export default function TeamYPNScreen() {
     return out;
   }, [messages]);
 
+  // ── render message ─────────────────────────────────────────────────────────
   const renderItem = useCallback(
     ({ item }: { item: GroupItem }) => {
       if (item.type === "header") {
@@ -441,6 +441,7 @@ export default function TeamYPNScreen() {
         hour: "2-digit",
         minute: "2-digit",
       });
+
       return (
         <Pressable
           onLongPress={() => commitDelete(msg)}
@@ -481,6 +482,7 @@ export default function TeamYPNScreen() {
 
   const keyExtractor = useCallback((item: GroupItem) => item.key, []);
 
+  // ── loading state ──────────────────────────────────────────────────────────
   if (loading) {
     return (
       <View style={s.loadingWrap}>
@@ -494,7 +496,7 @@ export default function TeamYPNScreen() {
 
   return (
     <View style={s.root}>
-      {/* ── HEADER ── */}
+      {/* ── Header ── */}
       <BlurView
         intensity={90}
         tint="dark"
@@ -519,7 +521,6 @@ export default function TeamYPNScreen() {
             <Text style={s.headerSub}>{aiTyping ? "typing..." : "Online"}</Text>
           </View>
 
-          {/* ── Voice call button ── */}
           <TouchableOpacity
             onPress={() => setVoiceVisible(true)}
             hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
@@ -531,7 +532,7 @@ export default function TeamYPNScreen() {
         </View>
       </BlurView>
 
-      {/* ── BODY ── */}
+      {/* ── Messages ── */}
       <KeyboardAvoidingView
         style={{ flex: 1 }}
         behavior={Platform.OS === "ios" ? "padding" : "height"}
@@ -552,6 +553,7 @@ export default function TeamYPNScreen() {
 
         {pending && <UndoToast onUndo={handleUndo} progress={undoProgress} />}
 
+        {/* ── Input bar ── */}
         <View style={s.inputBar}>
           <TouchableOpacity style={s.plusBtn}>
             <Ionicons name="add" size={24} color="#8E8E93" />
@@ -589,7 +591,7 @@ export default function TeamYPNScreen() {
         </View>
       </KeyboardAvoidingView>
 
-      {/* ── VOICE MODAL ── */}
+      {/* ── Voice modal ── */}
       <Modal
         visible={voiceVisible}
         animationType="slide"
@@ -598,14 +600,14 @@ export default function TeamYPNScreen() {
       >
         <VoiceCallScreen
           onClose={() => setVoiceVisible(false)}
-          sessionId="voice_team_ypn"
+          sessionId={sessionIdRef.current}
         />
       </Modal>
     </View>
   );
 }
 
-// ── Styles ──────────────────────────────────────────────────────────────────
+// ── Styles ────────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#0B141A" },
   loadingWrap: {
@@ -614,6 +616,7 @@ const s = StyleSheet.create({
     alignItems: "center",
     backgroundColor: "#0B141A",
   },
+
   header: {
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: "#1F2C34",
@@ -648,7 +651,9 @@ const s = StyleSheet.create({
     borderWidth: 1,
     borderColor: "rgba(37,211,102,0.2)",
   },
+
   listContent: { paddingHorizontal: 16, paddingTop: 10, paddingBottom: 10 },
+
   dateHeader: {
     alignSelf: "center",
     backgroundColor: "rgba(32,44,51,0.9)",
@@ -658,9 +663,11 @@ const s = StyleSheet.create({
     marginVertical: 12,
   },
   dateHeaderText: { color: "#8696A0", fontSize: 11, fontWeight: "500" },
+
   row: { marginVertical: 2, flexDirection: "row", maxWidth: "85%" },
   rowUser: { justifyContent: "flex-end", alignSelf: "flex-end" },
   rowAI: { justifyContent: "flex-start", alignSelf: "flex-start" },
+
   bubble: {
     paddingHorizontal: 10,
     paddingVertical: 6,
@@ -681,6 +688,7 @@ const s = StyleSheet.create({
     borderBottomLeftRadius: 2,
     borderBottomRightRadius: 8,
   },
+
   msgText: {
     color: "#E9EDEF",
     fontSize: 16.5,
@@ -688,6 +696,7 @@ const s = StyleSheet.create({
     letterSpacing: 0.1,
   },
   msgTextUser: { color: "#E9EDEF" },
+
   metaRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -701,6 +710,7 @@ const s = StyleSheet.create({
   timeUser: { color: "rgba(255,255,255,0.7)" },
   retryRow: { flexDirection: "row", alignItems: "center", gap: 3 },
   retryTxt: { color: "#FF453A", fontSize: 11, fontWeight: "600" },
+
   typingRow: {
     flexDirection: "row",
     paddingHorizontal: 16,
@@ -723,6 +733,7 @@ const s = StyleSheet.create({
     paddingVertical: 8,
   },
   dot: { width: 6, height: 6, borderRadius: 3, backgroundColor: "#8696A0" },
+
   toastCard: {
     position: "absolute",
     bottom: 70,
@@ -744,6 +755,7 @@ const s = StyleSheet.create({
   toastLabel: { color: "#fff", fontSize: 15, flex: 1, fontWeight: "500" },
   toastUndo: { color: "#25D366", fontSize: 15, fontWeight: "600" },
   toastBar: { height: 3, backgroundColor: "#25D366" },
+
   inputBar: {
     flexDirection: "row",
     alignItems: "flex-end",

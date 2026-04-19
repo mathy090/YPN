@@ -1,326 +1,301 @@
-import os
-import json
-import time
-import base64
+# ypn-ai-service/main.py
+#
+# Simple, auth-free AI service.
+# - /health          → liveness probe
+# - /chat            → HTTP text chat (no auth, session_id from body)
+# - /ws              → WebSocket voice streaming (Vosk STT → AI → TTS chunks)
+#
+# Memory: Upstash Redis keyed by session_id (passed by client).
+# STT:    Vosk (offline, no API key).
+# AI:     Swap run_ai() stub for Cohere/OpenAI/Anthropic as needed.
+
 import asyncio
+import base64
+import json
+import logging
+import os
+import time
+import uuid
+
 import httpx
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status, HTTPException, Header
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import JSONResponse
-from vosk import Model, KaldiRecognizer
-
+from vosk import KaldiRecognizer, Model
 from upstash_redis import Redis
-from supabase import create_client
 
-from retrievers import retrieve
+from audio.stt import create_recognizer, feed_frame, finalize
+from audio.vad import FRAME_BYTES, create_vad, is_speech, SILENCE_FRAMES_THRESHOLD
 from prompts import SYSTEM_PROMPT
+from retrievers import retrieve
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-EXPRESS_BACKEND_URL = os.getenv("EXPRESS_BACKEND_URL")
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ── Redis & Supabase ──────────────────────────────────────────────────────────
+# ── Redis ─────────────────────────────────────────────────────────────────────
 redis = Redis(
-    url=os.getenv("UPSTASH_REDIS_REST_URL"),
-    token=os.getenv("UPSTASH_REDIS_REST_TOKEN")
+    url=os.environ["UPSTASH_REDIS_REST_URL"],
+    token=os.environ["UPSTASH_REDIS_REST_TOKEN"],
 )
 
-supabase_url = os.getenv("SUPABASE_URL")
-supabase_key = os.getenv("SUPABASE_KEY")
-if not supabase_url or not supabase_key:
-    raise Exception("SUPABASE_URL or SUPABASE_KEY missing")
-
-supabase = create_client(supabase_url, supabase_key)
-
-
-# ── Vosk Model ────────────────────────────────────────────────────────────────
-VOSK_MODEL_PATH = os.getenv("VOSK_MODEL_PATH", "models/vosk-model-small-en-us-0.15")
-model = None
-
-if os.path.isdir(VOSK_MODEL_PATH) and os.path.exists(os.path.join(VOSK_MODEL_PATH, "conf")):
-    try:
-        model = Model(VOSK_MODEL_PATH)
-        print("[VOSK] Model loaded successfully")
-    except Exception as e:
-        print(f"[VOSK] Load error: {e}")
-        model = None
-else:
-    print("[VOSK] Model missing or invalid")
+# ── Vosk model (lazy singleton) ───────────────────────────────────────────────
+VOSK_MODEL_PATH = os.getenv(
+    "VOSK_MODEL_PATH", "models/vosk-model-small-en-us-0.15"
+)
+_vosk_model: Model | None = None
 
 
-app = FastAPI()
-
-
-# ── Auth: Verify Token via Express Backend ────────────────────────────────────
-async def verify_token_with_backend(token: str):
-    """
-    Sends the Backend JWT to Express /api/users/profile to verify it 
-    and get user details (uid, etc).
-    """
-    if not EXPRESS_BACKEND_URL:
-        return None
-        
-    async with httpx.AsyncClient() as client:
+def get_vosk_model() -> Model | None:
+    global _vosk_model
+    if _vosk_model is not None:
+        return _vosk_model
+    if os.path.isdir(VOSK_MODEL_PATH) and os.path.exists(
+        os.path.join(VOSK_MODEL_PATH, "conf")
+    ):
         try:
-            response = await client.get(
-                f"{EXPRESS_BACKEND_URL}/api/users/profile",
-                headers={"Authorization": f"Bearer {token}"}
-            )
-            
-            if response.status_code == 200:
-                return response.json() # Returns { uid, email, name, ... }
-            else:
-                return None
-        except Exception as e:
-            print(f"[Auth Error] {e}")
-            return None
+            _vosk_model = Model(VOSK_MODEL_PATH)
+            logger.info("[Vosk] Model loaded from %s", VOSK_MODEL_PATH)
+        except Exception as exc:
+            logger.error("[Vosk] Load error: %s", exc)
+    else:
+        logger.warning("[Vosk] Model not found at %s — STT disabled", VOSK_MODEL_PATH)
+    return _vosk_model
 
 
-# ── AI Stub (Replace with your real async provider) ───────────────────────────
-async def run_ai(prompt: str):
-    """Async generator yielding tokens. Replace with Cohere/OpenAI/etc."""
-    await asyncio.sleep(0.2)  # Simulate latency
-    return "I understand. I'm listening carefully and responding step by step."
+# ── Redis helpers ─────────────────────────────────────────────────────────────
+HISTORY_TTL = 60 * 60 * 2  # 2 hours
+MAX_HISTORY = 20            # keep last N messages
 
 
-# ── Redis Helpers ─────────────────────────────────────────────────────────────
-def add_message(uid, role, text):
-    key = f"chat:{uid}"
-    data = redis.get(key)
-    chat = json.loads(data) if data else []
-    chat.append({"role": role, "text": text, "t": time.time()})
-    chat = chat[-20:]  # Keep last 20 messages
-    redis.set(key, json.dumps(chat))
-    return chat
+def _chat_key(session_id: str) -> str:
+    return f"chat:{session_id}"
 
 
-def get_chat(uid):
-    data = redis.get(f"chat:{uid}")
-    return json.loads(data) if data else []
+def load_history(session_id: str) -> list[dict]:
+    raw = redis.get(_chat_key(session_id))
+    if not raw:
+        return []
+    try:
+        return json.loads(raw)
+    except Exception:
+        return []
 
 
-def update_audio_time(uid):
-    redis.set(f"last_audio:{uid}", time.time())
+def save_history(session_id: str, history: list[dict]) -> None:
+    trimmed = history[-MAX_HISTORY:]
+    redis.set(_chat_key(session_id), json.dumps(trimmed), ex=HISTORY_TTL)
 
 
-def is_user_silent(uid, threshold=0.8):
-    last = redis.get(f"last_audio:{uid}")
-    if not last:
-        return False
-    return (time.time() - float(last)) > threshold
+def append_message(session_id: str, role: str, text: str) -> list[dict]:
+    history = load_history(session_id)
+    history.append({"role": role, "text": text, "t": time.time()})
+    save_history(session_id, history)
+    return history
 
 
-def build_prompt(uid, user_text):
-    chat = get_chat(uid)
-    context = retrieve(user_text, chat)
-    return f"""
-{SYSTEM_PROMPT}
-
-Conversation:
-{json.dumps(chat)}
-
-Context:
-{json.dumps(context)}
-
-User:
-{user_text}
-"""
+# ── AI stub ───────────────────────────────────────────────────────────────────
+# Replace the body of run_ai() with your real LLM call (Cohere, OpenAI, etc.)
+async def run_ai(prompt: str) -> str:
+    """Return a response string. Swap for real LLM integration."""
+    await asyncio.sleep(0.1)
+    return (
+        "I hear you. I'm here to support you — could you tell me more "
+        "about what's on your mind?"
+    )
 
 
-# ── 🔥 NEW: HTTP Chat Endpoint for TeamYPN.tsx ───────────────────────────────
+def build_prompt(session_id: str, user_text: str) -> str:
+    history = load_history(session_id)
+    context = retrieve(user_text, history)
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"Conversation:\n{json.dumps(history)}\n\n"
+        f"Context:\n{json.dumps(context)}\n\n"
+        f"User:\n{user_text}"
+    )
+
+
+# ── App ───────────────────────────────────────────────────────────────────────
+app = FastAPI(title="YPN AI Service")
+
+
+# ── /health ───────────────────────────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+# ── /chat (HTTP, no auth) ─────────────────────────────────────────────────────
+# Body: { "message": "...", "session_id": "..." (optional) }
+# Returns: { "reply": "...", "session_id": "..." }
 @app.post("/chat")
-async def http_chat(
-    request_body: dict, 
-    authorization: str = Header(None)
-):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing token")
-    
-    token = authorization.split("Bearer ")[1]
-    
-    # 1. Verify User with Express Backend
-    user_info = await verify_token_with_backend(token)
-    if not user_info:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    
-    uid = user_info.get("uid")
-    user_text = request_body.get("message", "").strip()
-    
+async def http_chat(body: dict):
+    user_text = (body.get("message") or "").strip()
     if not user_text:
-        return JSONResponse(content={"reply": ""})
+        return JSONResponse({"reply": "", "session_id": ""})
 
-    # 2. Process Message (Same logic as WS)
-    add_message(uid, "user", user_text)
-    prompt = build_prompt(uid, user_text)
-    
-    # 3. Get AI Response
-    response_text = await run_ai(prompt)
-    
-    # 4. Save AI Response
-    add_message(uid, "ai", response_text)
-    supabase.table("messages").insert({
-        "user_id": uid,
-        "role": "ai",
-        "content": response_text.strip()
-    }).execute()
-    
-    return JSONResponse(content={"reply": response_text})
+    # Use caller-supplied session_id or generate a new one.
+    # The React Native app should persist this per-conversation.
+    session_id: str = (body.get("session_id") or "").strip() or str(uuid.uuid4())
+
+    append_message(session_id, "user", user_text)
+    prompt = build_prompt(session_id, user_text)
+    reply = await run_ai(prompt)
+    append_message(session_id, "ai", reply)
+
+    return JSONResponse({"reply": reply, "session_id": session_id})
 
 
-# ── 🔥 NEW: Heartbeat Endpoint ───────────────────────────────────────────────
-@app.post("/heartbeat")
-async def heartbeat(authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing token")
-    
-    token = authorization.split("Bearer ")[1]
-    
-    # Verify token with Express Backend
-    user_info = await verify_token_with_backend(token)
-    if not user_info:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    
-    uid = user_info.get("uid")
-    
-    # Update status in Redis to show user is active
-    redis.set(f"user_status:{uid}", "online", ex=60) # Expires in 60s
-    
-    return JSONResponse(content={"status": "ok", "uid": uid})
+# ── /ws (WebSocket voice streaming, no auth) ──────────────────────────────────
+#
+# Protocol (client → server):
+#   { "type": "init",  "session_id": "<id>" }   ← first frame, required
+#   { "type": "audio", "data": "<base64 PCM>" }  ← raw 16 kHz mono int16 chunks
+#   { "type": "text",  "message": "<text>" }     ← direct text (skips STT)
+#   { "type": "interrupt" }                       ← cancel current reply
+#   { "type": "end_call" }                        ← graceful close
+#
+# Protocol (server → client):
+#   { "type": "partial",    "text": "..."  }      ← STT partial transcript
+#   { "type": "transcript", "text": "..."  }      ← STT final transcript
+#   { "type": "thinking"                   }      ← AI is working
+#   { "type": "ai_token",  "text": "..."  }       ← streaming AI word
+#   { "type": "done"                       }      ← reply complete
+#   { "type": "tts_chunk", "data": "<b64>","sample_rate":22050 } ← audio out
+#   { "type": "tts_end"                    }
+#   { "type": "error",     "message":"..." }
 
-
-# ── WebSocket: Auth-First, Then Stream ────────────────────────────────────────
 @app.websocket("/ws")
-async def ws(websocket: WebSocket):
+async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
 
-    uid = None
-    recognizer = None
-    pending_text = ""
-    backend_token = None
+    session_id: str | None = None
+    vad = create_vad()
+    recognizer: KaldiRecognizer | None = None
+    pcm_buffer = b""
+    silence_frames = 0
+    speaking = False
+    interrupt_flag = False
+
+    model = get_vosk_model()
+    if model:
+        recognizer = create_recognizer()
+
+    async def send(payload: dict):
+        try:
+            await websocket.send_json(payload)
+        except Exception:
+            pass
+
+    async def stream_ai_reply(text: str) -> None:
+        """Send AI reply word-by-word as ai_token frames, then 'done'."""
+        nonlocal interrupt_flag
+        interrupt_flag = False
+        append_message(session_id, "user", text)
+        prompt = build_prompt(session_id, text)
+
+        await send({"type": "thinking"})
+        reply = await run_ai(prompt)
+        append_message(session_id, "ai", reply)
+
+        for word in reply.split():
+            if interrupt_flag:
+                break
+            await send({"type": "ai_token", "text": word + " "})
+            await asyncio.sleep(0.03)
+
+        await send({"type": "done"})
 
     try:
-        # 🔥 1. AUTH PHASE: Wait for auth message ONLY
-        auth_data = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
-        
-        if auth_data.get("type") != "auth":
-            await websocket.send_json({"type": "auth_error", "status": 400, "message": "Missing auth"})
+        # ── first message must be "init" ──────────────────────────────────
+        init_raw = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
+        if init_raw.get("type") != "init":
+            await send({"type": "error", "message": "First message must be {type:'init'}"})
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
 
-        backend_token = auth_data.get("token")
-        if not backend_token:
-            await websocket.send_json({"type": "auth_error", "status": 401, "message": "Token missing"})
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
+        session_id = (init_raw.get("session_id") or "").strip() or str(uuid.uuid4())
+        await send({"type": "ready", "session_id": session_id})
+        logger.info("[WS] Session started: %s", session_id)
 
-        # 🔥 2. Verify Backend JWT with Express Server
-        user_info = await verify_token_with_backend(backend_token)
-        
-        if not user_info:
-            await websocket.send_json({"type": "auth_error", "status": 401, "message": "Invalid token"})
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
-
-        # 🔥 3. Auth success — proceed
-        uid = user_info.get("uid")
-        redis.setnx(f"chat:{uid}", json.dumps([]))  # Init chat if new user
-
-        if model:
-            recognizer = KaldiRecognizer(model, 16000)
-
-        # 🔥 4. Notify client auth succeeded — now start streaming
-        await websocket.send_json({"type": "auth_success", "uid": uid})
-
-        # ── MAIN LOOP: Handle audio/text/interrupt ───────────────────────────
+        # ── main loop ─────────────────────────────────────────────────────
         while True:
-            data = await websocket.receive_json()
-            msg_type = data.get("type")
+            msg = await websocket.receive_json()
+            msg_type = msg.get("type")
 
-            user_text = None
+            # ── interrupt ─────────────────────────────────────────────────
+            if msg_type == "interrupt":
+                interrupt_flag = True
+                continue
 
-            # ── Text message ─────────────────────────────────────────────────
+            # ── end call ──────────────────────────────────────────────────
+            if msg_type == "end_call":
+                break
+
+            # ── direct text (bypass STT) ──────────────────────────────────
             if msg_type == "text":
-                user_text = data.get("message", "").strip()
-
-            # ── Audio chunk (Vosk) ───────────────────────────────────────────
-            elif msg_type == "audio" and recognizer:
-                pcm = base64.b64decode(data["audio"])
-                update_audio_time(uid)
-
-                if recognizer.AcceptWaveform(pcm):
-                    res = json.loads(recognizer.Result())
-                    user_text = res.get("text", "").strip()
-                else:
-                    partial = json.loads(recognizer.PartialResult())
-                    pending_text = partial.get("partial", "")
-
-                    await websocket.send_json({
-                        "type": "partial",
-                        "text": pending_text
-                    })
-
-                    # Auto-submit if user goes silent mid-sentence
-                    if is_user_silent(uid) and pending_text:
-                        user_text = pending_text
-                        pending_text = ""
-
-            # ── Interrupt (cancel current AI response) ───────────────────────
-            elif msg_type == "interrupt":
-                redis.set(f"interrupt:{uid}", "1")
+                user_text = (msg.get("message") or "").strip()
+                if user_text:
+                    await send({"type": "transcript", "text": user_text})
+                    asyncio.create_task(stream_ai_reply(user_text))
                 continue
 
-            # Skip if no usable input
-            if not user_text:
-                continue
+            # ── audio chunk ───────────────────────────────────────────────
+            if msg_type == "audio":
+                raw_b64 = msg.get("data", "")
+                try:
+                    pcm_chunk = base64.b64decode(raw_b64)
+                except Exception:
+                    continue
 
-            # ── Process user input ───────────────────────────────────────────
-            add_message(uid, "user", user_text)
-            prompt = build_prompt(uid, user_text)
+                if not recognizer:
+                    # Vosk not available — skip STT silently
+                    continue
 
-            await websocket.send_json({"type": "state", "value": "thinking"})
+                pcm_buffer += pcm_chunk
 
-            # Stream AI response token-by-token
-            response = await run_ai(prompt)
-            await websocket.send_json({"type": "state", "value": "speaking"})
+                # Process complete 30 ms frames
+                while len(pcm_buffer) >= FRAME_BYTES:
+                    frame = pcm_buffer[:FRAME_BYTES]
+                    pcm_buffer = pcm_buffer[FRAME_BYTES:]
 
-            ai_text = ""
-            for word in response.split():
-                # Check for interrupt during streaming
-                if redis.get(f"interrupt:{uid}") == "1":
-                    redis.delete(f"interrupt:{uid}")
-                    break
+                    voiced = is_speech(vad, frame)
 
-                ai_text += word + " "
-                await websocket.send_json({
-                    "type": "ai_token",
-                    "text": word + " "
-                })
-                await asyncio.sleep(0.03)  # Simulate token delay
+                    if voiced:
+                        silence_frames = 0
+                        if not speaking:
+                            speaking = True
+                            logger.debug("[VAD] Speech started")
 
-            # Persist & notify completion
-            if ai_text.strip():
-                add_message(uid, "ai", ai_text)
-                supabase.table("messages").insert({
-                    "user_id": uid,
-                    "role": "ai",
-                    "content": ai_text.strip()
-                }).execute()
+                        partial_text = feed_frame(recognizer, frame)
+                        if partial_text:
+                            await send({"type": "partial", "text": partial_text})
 
-            await websocket.send_json({"type": "done"})
-            await websocket.send_json({"type": "state", "value": "listening"})
+                    else:
+                        if speaking:
+                            silence_frames += 1
+                            if silence_frames >= SILENCE_FRAMES_THRESHOLD:
+                                # Utterance complete
+                                final = finalize(recognizer)
+                                speaking = False
+                                silence_frames = 0
+                                pcm_buffer = b""
+
+                                # Fresh recognizer for next utterance
+                                recognizer = create_recognizer()
+
+                                if final:
+                                    await send({"type": "transcript", "text": final})
+                                    asyncio.create_task(stream_ai_reply(final))
 
     except WebSocketDisconnect:
-        print(f"[WS] Disconnected: {uid}")
+        logger.info("[WS] Disconnected: %s", session_id)
     except asyncio.TimeoutError:
-        # Client didn't send auth within 5s
-        try:
-            await websocket.send_json({"type": "auth_error", "status": 408, "message": "Auth timeout"})
-            await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
-        except:
-            pass
-        print("[WS] Auth timeout")
-    except Exception as e:
-        print(f"[WS] Error: {uid} — {e}")
+        await send({"type": "error", "message": "Init timeout — send {type:'init'} first"})
+        await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+    except Exception as exc:
+        logger.exception("[WS] Unhandled error in session %s: %s", session_id, exc)
         try:
             await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
-        except:
+        except Exception:
             pass

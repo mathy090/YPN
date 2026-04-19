@@ -1,13 +1,28 @@
 // src/screens/VoiceCallScreen.tsx
-// Firebase ID Token Auth + WebSocket Streaming + TTS
+//
+// Voice call screen — connects to the auth-free /ws endpoint.
+// Uses session_id (passed as prop from TeamYPNScreen) so conversation
+// history is shared between text and voice within the same session.
+//
+// WS protocol (matches main.py):
+//   SEND:    { type:"init", session_id }
+//            { type:"audio", data:"<base64 PCM 16kHz mono int16>" }
+//            { type:"text",  message:"..." }
+//            { type:"interrupt" }
+//            { type:"end_call" }
+//   RECEIVE: { type:"ready",      session_id }
+//            { type:"partial",    text }
+//            { type:"transcript", text }
+//            { type:"thinking" }
+//            { type:"ai_token",   text }
+//            { type:"done" }
+//            { type:"error",      message }
 
 import { Ionicons } from "@expo/vector-icons";
 import { BlurView } from "expo-blur";
-import { useRouter } from "expo-router";
 import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
-  Alert,
   Animated,
   Easing,
   Modal,
@@ -21,231 +36,60 @@ import AudioRecord from "react-native-audio-record";
 import { SafeAreaView } from "react-native-safe-area-context";
 import Tts, { Voice } from "react-native-tts";
 
-import { clearToken, getToken } from "../utils/tokenManager";
-
-const API_BASE = process.env.EXPO_PUBLIC_AI_URL || "http://localhost:8000";
-const WS_URL = `${API_BASE.replace("http", "ws")}/ws`;
+// ── Constants ─────────────────────────────────────────────────────────────────
+const WS_URL =
+  (process.env.EXPO_PUBLIC_AI_URL ?? "http://localhost:8000")
+    .replace(/^https/, "wss")
+    .replace(/^http/, "ws") + "/ws";
 
 type Phase = "idle" | "connecting" | "listening" | "thinking" | "speaking";
 
 interface Props {
   onClose: () => void;
-  sessionId?: string;
+  sessionId: string; // shared with text chat for unified history
 }
 
-export default function VoiceCallScreen({
-  onClose,
-  sessionId = "default",
-}: Props) {
-  const router = useRouter();
+export default function VoiceCallScreen({ onClose, sessionId }: Props) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [liveText, setLiveText] = useState("");
   const [aiReply, setAiReply] = useState("");
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [availableVoices, setAvailableVoices] = useState<Voice[]>([]);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [voices, setVoices] = useState<Voice[]>([]);
   const [selectedVoiceId, setSelectedVoiceId] = useState("");
 
   const socketRef = useRef<WebSocket | null>(null);
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const scrollRef = useRef<ScrollView>(null);
   const aiBufferRef = useRef("");
+  const pulseAnim = useRef(new Animated.Value(1)).current;
 
+  // ── TTS init ───────────────────────────────────────────────────────────────
   useEffect(() => {
-    initTTS();
+    (async () => {
+      try {
+        Tts.setDefaultRate(0.95);
+        Tts.setDefaultPitch(1.0);
+        Tts.setDuck(true);
+        const all: Voice[] = await Tts.getVoices();
+        const en = all.filter((v) => v.language?.startsWith("en"));
+        if (en.length) {
+          setVoices(en);
+          const def = en.find((v) => v.name.includes("Google")) ?? en[0];
+          setSelectedVoiceId(def.id);
+          await Tts.setDefaultVoice(def.id);
+        }
+      } catch (e) {
+        console.warn("[VoiceCall] TTS init:", e);
+      }
+    })();
+
     return () => {
       disconnect();
       Tts.stop();
     };
   }, []);
 
-  const initTTS = async () => {
-    try {
-      Tts.setDefaultRate(0.95);
-      Tts.setDefaultPitch(1.0);
-      Tts.setDuck(true);
-
-      const voices = await Tts.getVoices();
-      const englishVoices = voices.filter((v) => v.language?.includes("en"));
-
-      if (englishVoices.length > 0) {
-        setAvailableVoices(englishVoices);
-        const defaultVoice =
-          englishVoices.find((v) => v.name.includes("Google")) ||
-          englishVoices[0];
-
-        setSelectedVoiceId(defaultVoice.id);
-        await Tts.setDefaultVoice(defaultVoice.id);
-      }
-    } catch (e) {
-      console.warn("[TTS] Init error:", e);
-    }
-  };
-
-  // 🔥 Connect with Firebase ID Token Auth
-  const connect = async () => {
-    setPhase("connecting");
-
-    try {
-      // 1. Load Firebase ID Token from SecureStore
-      const token = await getToken();
-      if (!token) {
-        throw new Error("NO_TOKEN");
-      }
-
-      // 2. Create WebSocket
-      const ws = new WebSocket(WS_URL);
-      socketRef.current = ws;
-
-      // 3. On open: send auth IMMEDIATELY
-      ws.onopen = () => {
-        ws.send(JSON.stringify({ type: "auth", token }));
-      };
-
-      // 4. Handle messages
-      ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data);
-
-          // ── Auth Responses ─────────────────────────────────────
-          if (msg.type === "auth_success") {
-            setPhase("listening");
-            startStreaming();
-            return;
-          }
-
-          if (msg.type === "auth_error") {
-            handleAuthFailure(msg.message || "Authentication failed");
-            return;
-          }
-
-          // ── Voice/Transcription ────────────────────────────────
-          if (msg.type === "partial" || msg.type === "transcript_partial") {
-            setLiveText(msg.text || "");
-          }
-
-          if (msg.type === "transcript_final") {
-            setLiveText(msg.text || "");
-          }
-
-          // ── State Changes ──────────────────────────────────────
-          if (msg.type === "state" || msg.type === "mode") {
-            const state = msg.value || msg.state;
-            if (state === "thinking") setPhase("thinking");
-            if (state === "speaking") setPhase("speaking");
-            if (state === "listening") {
-              setPhase("listening");
-              setLiveText("");
-            }
-          }
-
-          // ── AI Streaming ───────────────────────────────────────
-          if (msg.type === "ai_token" || msg.type === "ai_chunk") {
-            aiBufferRef.current += msg.text;
-            setAiReply(aiBufferRef.current);
-          }
-
-          // ── AI Complete ────────────────────────────────────────
-          if (msg.type === "done" || msg.type === "ai_complete") {
-            const fullReply = aiBufferRef.current.trim();
-            aiBufferRef.current = "";
-            setAiReply("");
-
-            if (fullReply) {
-              Tts.stop();
-              Tts.speak(fullReply);
-            }
-            setPhase("listening");
-          }
-        } catch (e) {
-          console.warn("[WS] Parse error:", e);
-        }
-      };
-
-      ws.onerror = (e) => {
-        console.error("[WS] Error:", e);
-        setPhase("idle");
-      };
-
-      ws.onclose = () => {
-        if (phase !== "idle") {
-          setPhase("idle");
-        }
-      };
-    } catch (err: any) {
-      if (err.message === "NO_TOKEN") {
-        handleAuthFailure("Please log in to use voice features.");
-      } else {
-        handleAuthFailure("Connection failed. Check your network.");
-      }
-    }
-  };
-
-  // 🔥 Handle auth failure: clear token + redirect
-  const handleAuthFailure = (message: string) => {
-    clearToken();
-    disconnect();
-    Alert.alert(
-      "Authentication Required",
-      message,
-      [
-        {
-          text: "Log In",
-          onPress: () => {
-            onClose();
-            router.replace("/auth/otp");
-          },
-        },
-        { text: "Cancel", style: "cancel", onPress: onClose },
-      ],
-      { cancelable: false },
-    );
-  };
-
-  const startStreaming = () => {
-    if (intervalRef.current) return;
-
-    const options = {
-      sampleRate: 16000,
-      channels: 1,
-      bitsPerSample: 16,
-      audioSource: 6, // VOICE_COMMUNICATION
-      wavFile: "stream.wav",
-    };
-
-    AudioRecord.init(options);
-    AudioRecord.start();
-
-    intervalRef.current = setInterval(() => {
-      const data = AudioRecord.fetch?.();
-      if (data && socketRef.current?.readyState === WebSocket.OPEN) {
-        // Send raw binary for lower latency
-        socketRef.current.send(data);
-      }
-    }, 120);
-  };
-
-  const disconnect = () => {
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    }
-    AudioRecord.stop();
-    socketRef.current?.close();
-    socketRef.current = null;
-    aiBufferRef.current = "";
-    setLiveText("");
-    setAiReply("");
-    setPhase("idle");
-    Tts.stop();
-  };
-
-  const toggleMic = () => {
-    if (phase === "idle") connect();
-    else disconnect();
-  };
-
-  // Pulse animation for mic ring
-  const pulseAnim = useRef(new Animated.Value(1)).current;
+  // ── Pulse animation for mic ring ───────────────────────────────────────────
   useEffect(() => {
     if (phase === "listening" || phase === "speaking") {
       const loop = Animated.loop(
@@ -257,7 +101,7 @@ export default function VoiceCallScreen({
             useNativeDriver: true,
           }),
           Animated.timing(pulseAnim, {
-            toValue: 1,
+            toValue: 1.0,
             duration: 900,
             easing: Easing.inOut(Easing.ease),
             useNativeDriver: true,
@@ -266,10 +110,154 @@ export default function VoiceCallScreen({
       );
       loop.start();
       return () => loop.stop();
-    } else {
-      pulseAnim.setValue(1);
     }
+    pulseAnim.setValue(1);
   }, [phase]);
+
+  // ── Connect ────────────────────────────────────────────────────────────────
+  const connect = () => {
+    setPhase("connecting");
+    const ws = new WebSocket(WS_URL);
+    socketRef.current = ws;
+
+    ws.onopen = () => {
+      // Send init with shared session_id — no auth token needed
+      ws.send(JSON.stringify({ type: "init", session_id: sessionId }));
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data as string);
+
+        switch (msg.type) {
+          case "ready":
+            setPhase("listening");
+            startMic();
+            break;
+
+          case "partial":
+            setLiveText(msg.text ?? "");
+            break;
+
+          case "transcript":
+            setLiveText(msg.text ?? "");
+            break;
+
+          case "thinking":
+            setPhase("thinking");
+            break;
+
+          case "ai_token":
+            setPhase("speaking");
+            aiBufferRef.current += msg.text ?? "";
+            setAiReply(aiBufferRef.current);
+            scrollRef.current?.scrollToEnd({ animated: true });
+            break;
+
+          case "done": {
+            const full = aiBufferRef.current.trim();
+            aiBufferRef.current = "";
+            setAiReply("");
+            setLiveText("");
+            if (full) {
+              Tts.stop();
+              Tts.speak(full);
+            }
+            setPhase("listening");
+            break;
+          }
+
+          case "error":
+            console.warn("[VoiceCall] Server error:", msg.message);
+            setPhase("idle");
+            break;
+        }
+      } catch (e) {
+        console.warn("[VoiceCall] Parse error:", e);
+      }
+    };
+
+    ws.onerror = () => setPhase("idle");
+    ws.onclose = () => {
+      if (phase !== "idle") setPhase("idle");
+    };
+  };
+
+  // ── Mic streaming (react-native-audio-record) ──────────────────────────────
+  const startMic = () => {
+    if (intervalRef.current) return;
+
+    AudioRecord.init({
+      sampleRate: 16000,
+      channels: 1,
+      bitsPerSample: 16,
+      audioSource: 6, // VOICE_COMMUNICATION
+      wavFile: "stream.wav",
+    });
+    AudioRecord.start();
+
+    // Poll every 30ms — matches Vosk FRAME_DURATION_MS
+    intervalRef.current = setInterval(() => {
+      const data = (AudioRecord as any).fetch?.();
+      if (data && socketRef.current?.readyState === WebSocket.OPEN) {
+        socketRef.current.send(JSON.stringify({ type: "audio", data }));
+      }
+    }, 30);
+  };
+
+  const stopMic = () => {
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+    try {
+      AudioRecord.stop();
+    } catch (_) {}
+  };
+
+  // ── Disconnect ─────────────────────────────────────────────────────────────
+  const disconnect = () => {
+    stopMic();
+    if (socketRef.current) {
+      if (socketRef.current.readyState === WebSocket.OPEN) {
+        socketRef.current.send(JSON.stringify({ type: "end_call" }));
+      }
+      socketRef.current.close();
+      socketRef.current = null;
+    }
+    aiBufferRef.current = "";
+    setLiveText("");
+    setAiReply("");
+    setPhase("idle");
+    Tts.stop();
+  };
+
+  // ── Interrupt (barge-in) ───────────────────────────────────────────────────
+  const interrupt = () => {
+    Tts.stop();
+    if (socketRef.current?.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify({ type: "interrupt" }));
+    }
+    aiBufferRef.current = "";
+    setAiReply("");
+    setPhase("listening");
+  };
+
+  const toggleMic = () => {
+    if (phase === "idle") {
+      connect();
+    } else {
+      disconnect();
+    }
+  };
+
+  const phaseLabel: Record<Phase, string> = {
+    idle: "Tap mic to start",
+    connecting: "Connecting…",
+    listening: "Listening…",
+    thinking: "Thinking…",
+    speaking: "Speaking…",
+  };
 
   return (
     <View style={styles.container}>
@@ -279,32 +267,33 @@ export default function VoiceCallScreen({
         <TouchableOpacity onPress={onClose}>
           <Ionicons name="chevron-down" size={28} color="#fff" />
         </TouchableOpacity>
-
         <View style={{ alignItems: "center" }}>
           <Text style={styles.title}>YPN Voice</Text>
-          <Text style={styles.status}>{phase}</Text>
+          <Text style={styles.status}>{phaseLabel[phase]}</Text>
         </View>
-
-        <TouchableOpacity onPress={() => setIsSettingsOpen(true)}>
+        <TouchableOpacity onPress={() => setSettingsOpen(true)}>
           <Ionicons name="settings-outline" size={24} color="#fff" />
         </TouchableOpacity>
       </SafeAreaView>
 
-      <ScrollView
-        ref={scrollRef}
-        style={styles.chat}
-        onContentSizeChange={() =>
-          scrollRef.current?.scrollToEnd({ animated: true })
-        }
-      >
-        {liveText ? <Text style={styles.userText}>{liveText}</Text> : null}
-        {aiReply ? <Text style={styles.aiText}>{aiReply}</Text> : null}
+      {/* Transcript area */}
+      <ScrollView ref={scrollRef} style={styles.chat}>
+        {!!liveText && <Text style={styles.userText}>{liveText}</Text>}
+        {!!aiReply && <Text style={styles.aiText}>{aiReply}</Text>}
         {phase === "thinking" && (
           <ActivityIndicator color="#1DB954" style={{ marginTop: 8 }} />
         )}
       </ScrollView>
 
+      {/* Controls */}
       <View style={styles.controls}>
+        {/* Barge-in button — visible while AI is speaking */}
+        {phase === "speaking" && (
+          <TouchableOpacity style={styles.interruptBtn} onPress={interrupt}>
+            <Ionicons name="stop-circle-outline" size={28} color="#fff" />
+          </TouchableOpacity>
+        )}
+
         <Animated.View
           style={[styles.ring, { transform: [{ scale: pulseAnim }] }]}
         />
@@ -312,45 +301,49 @@ export default function VoiceCallScreen({
           onPress={toggleMic}
           style={[styles.mic, phase !== "idle" && styles.micActive]}
         >
-          <Ionicons
-            name={phase === "idle" ? "mic" : "stop"}
-            size={32}
-            color="#fff"
-          />
+          {phase === "connecting" ? (
+            <ActivityIndicator color="#fff" />
+          ) : (
+            <Ionicons
+              name={phase === "idle" ? "mic" : "stop"}
+              size={32}
+              color="#fff"
+            />
+          )}
         </TouchableOpacity>
       </View>
 
-      {/* Voice Settings Modal */}
-      <Modal visible={isSettingsOpen} transparent animationType="slide">
+      {/* Voice settings modal */}
+      <Modal visible={settingsOpen} transparent animationType="slide">
         <View style={styles.modal}>
-          <Text style={styles.modalTitle}>Voice Settings</Text>
-          {availableVoices.map((voice) => (
+          <Text style={styles.modalTitle}>Voice</Text>
+          {voices.map((v) => (
             <TouchableOpacity
-              key={voice.id}
+              key={v.id}
               style={[
-                styles.voiceOption,
-                selectedVoiceId === voice.id && styles.voiceOptionActive,
+                styles.voiceOpt,
+                selectedVoiceId === v.id && styles.voiceOptActive,
               ]}
               onPress={() => {
-                setSelectedVoiceId(voice.id);
-                Tts.setDefaultVoice(voice.id);
+                setSelectedVoiceId(v.id);
+                Tts.setDefaultVoice(v.id);
               }}
             >
               <Text
                 style={[
-                  styles.voiceText,
-                  selectedVoiceId === voice.id && styles.voiceTextActive,
+                  styles.voiceTxt,
+                  selectedVoiceId === v.id && styles.voiceTxtActive,
                 ]}
               >
-                {voice.name}
+                {v.name}
               </Text>
             </TouchableOpacity>
           ))}
           <TouchableOpacity
             style={styles.closeBtn}
-            onPress={() => setIsSettingsOpen(false)}
+            onPress={() => setSettingsOpen(false)}
           >
-            <Text style={styles.closeText}>Close</Text>
+            <Text style={styles.closeTxt}>Close</Text>
           </TouchableOpacity>
         </View>
       </Modal>
@@ -366,11 +359,29 @@ const styles = StyleSheet.create({
     padding: 20,
   },
   title: { color: "#fff", fontSize: 18, fontWeight: "700" },
-  status: { color: "#aaa", fontSize: 12 },
+  status: { color: "#aaa", fontSize: 12, marginTop: 2 },
+
   chat: { flex: 1, padding: 20 },
-  userText: { color: "#fff", alignSelf: "flex-end", marginBottom: 8 },
-  aiText: { color: "#1DB954", alignSelf: "flex-start", marginBottom: 8 },
-  controls: { alignItems: "center", paddingBottom: 40 },
+  userText: {
+    color: "#fff",
+    alignSelf: "flex-end",
+    marginBottom: 8,
+    backgroundColor: "#005C4B",
+    padding: 10,
+    borderRadius: 12,
+    maxWidth: "80%",
+  },
+  aiText: {
+    color: "#000",
+    alignSelf: "flex-start",
+    marginBottom: 8,
+    backgroundColor: "#1DB954",
+    padding: 10,
+    borderRadius: 12,
+    maxWidth: "80%",
+  },
+
+  controls: { alignItems: "center", paddingBottom: 50 },
   ring: {
     position: "absolute",
     width: 120,
@@ -387,6 +398,13 @@ const styles = StyleSheet.create({
     backgroundColor: "#333",
   },
   micActive: { backgroundColor: "#1DB954" },
+  interruptBtn: {
+    marginBottom: 16,
+    padding: 12,
+    backgroundColor: "rgba(255,255,255,0.15)",
+    borderRadius: 30,
+  },
+
   modal: {
     flex: 1,
     justifyContent: "flex-end",
@@ -401,10 +419,10 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     marginBottom: 12,
   },
-  voiceOption: { padding: 14, borderRadius: 10, marginBottom: 6 },
-  voiceOptionActive: { backgroundColor: "rgba(29,185,84,0.2)" },
-  voiceText: { color: "#ccc", fontSize: 15 },
-  voiceTextActive: { color: "#1DB954", fontWeight: "600" },
+  voiceOpt: { padding: 14, borderRadius: 10, marginBottom: 6 },
+  voiceOptActive: { backgroundColor: "rgba(29,185,84,0.2)" },
+  voiceTxt: { color: "#ccc", fontSize: 15 },
+  voiceTxtActive: { color: "#1DB954", fontWeight: "600" },
   closeBtn: {
     marginTop: 16,
     padding: 14,
@@ -412,5 +430,5 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     alignItems: "center",
   },
-  closeText: { color: "#000", fontWeight: "700", fontSize: 16 },
+  closeTxt: { color: "#000", fontWeight: "700", fontSize: 16 },
 });
