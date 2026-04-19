@@ -8,6 +8,7 @@ const cors = require("cors");
 const admin = require("firebase-admin");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
+const { createClient } = require("@supabase/supabase-js"); // ✅ ADD THIS
 
 // Route imports
 const {
@@ -25,7 +26,7 @@ const {
 const {
   router: newsRoutes,
   initNewsArchive,
-  SOURCES, // ✅ Expose sources list for health checks
+  SOURCES,
 } = require("./src/routes/newsRoutes");
 const mediaRoutes = require("./src/routes/mediaRoutes");
 const avatarRoutes = require("./src/routes/avatarRoutes");
@@ -51,17 +52,39 @@ try {
 
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
+// ── Supabase Setup ───────────────────────────────────────────────────────────
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+let supabaseClient = null;
+
+if (supabaseUrl && supabaseKey) {
+  try {
+    supabaseClient = createClient(supabaseUrl, supabaseKey, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    console.log("✅ Supabase client initialized");
+  } catch (err) {
+    console.error("❌ Failed to create Supabase client:", err.message);
+  }
+} else {
+  console.warn(
+    "⚠️ Supabase credentials missing. Chat features will be disabled.",
+  );
+}
+
 // ── Express Setup ───────────────────────────────────────────────────────────
 const app = express();
 app.set("trust proxy", 1);
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "50mb" })); // Increased for media metadata
 
-// ── Global DB Injection Middleware ──────────────────────────────────────────
+// ── Global DB & Supabase Injection Middleware ───────────────────────────────
 let db;
 
 app.use((req, _res, next) => {
   if (db) req.app.set("db", db);
+  if (supabaseClient) req.app.set("supabase", supabaseClient); // ✅ Inject Supabase
   next();
 });
 
@@ -83,7 +106,10 @@ app.get("/", (_req, res) => {
     time: new Date().toISOString(),
     news: {
       sources: SOURCES?.length ?? 0,
-      ttlMinutes: 10, // ✅ Document the 10-min cache TTL
+      ttlMinutes: 10,
+    },
+    chat: {
+      supabaseReady: !!supabaseClient,
     },
   });
 });
@@ -102,7 +128,7 @@ async function connectDB() {
     initUserVideos(db);
     initDiscordChannels(db);
     initKeyStore(db);
-    initNewsArchive(db); // ✅ News archive: 10-min TTL, 30+ sources
+    initNewsArchive(db);
     initDriveVideos(db);
     initSignoutStore(db);
 
@@ -472,24 +498,12 @@ function registerRoutes() {
 
   // ── Route Mounting ────────────────────────────────────────────────────────
   app.use("/api/auth", verifyBackendToken, signoutRoutes);
-
-  // 🔓 OPEN: Onboarding avatar upload
   app.use("/api/avatar", avatarRoutes);
-
-  // 🔓 OPEN: Settings avatar update
   app.use("/api/users/update-avatar", updateAvatarRoutes);
-
-  // 🔓 OPEN: Video routes
   app.use("/api/videos/drive", driveVideoRoutes);
   app.use("/api/videos", videoRoutes);
-
-  // 🔓 OPEN: Discord routes
-  app.use("/api/discord", discordRoutes);
-
-  // 🔓 OPEN: News routes (10-min auto-refresh, 30+ sources)
+  app.use("/api/discord", discordRoutes); // ✅ Discord routes (now with Supabase)
   app.use("/api/news", newsRoutes);
-
-  // 🔐 Protected: Keys and media
   app.use("/api/keys", verifyBackendToken, keyRoutes);
   app.use("/api/media", verifyBackendToken, mediaRoutes);
 
@@ -579,10 +593,13 @@ connectDB().then(() => {
     console.log(`🚀 YPN Backend running on port ${PORT}`);
     console.log(`📰 News: ${SOURCES?.length ?? 0} sources, 10-min cache TTL`);
     console.log(
+      `💬 Chat: Supabase ${supabaseClient ? "✅ ready" : "❌ unavailable"}`,
+    );
+    console.log(
       `🔐 Protected: /api/auth/status, /api/users/profile (GET), /api/keys, /api/media`,
     );
     console.log(
-      `🌐 Public: /api/auth/login, /api/auth/refresh, /api/news, /api/avatar`,
+      `🌐 Public: /api/auth/login, /api/auth/refresh, /api/news, /api/avatar, /api/discord`,
     );
   });
 });

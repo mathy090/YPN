@@ -625,7 +625,7 @@ export default function DiscordChannelScreen() {
       <View style={[s.root, { paddingTop: insets.top }]}>
         <View style={s.header}>
           <TouchableOpacity
-            onPress={() => router.replace("/tabs/discord")}
+            onPress={() => router.replace("/(tabs)/discord")}
             style={s.backBtn}
           >
             <Ionicons name="arrow-back" size={22} color="#fff" />
@@ -653,7 +653,7 @@ export default function DiscordChannelScreen() {
       {/* Header */}
       <View style={s.header}>
         <TouchableOpacity
-          onPress={() => router.replace("/tabs/discord")}
+          onPress={() => router.replace("/(tabs)/discord")}
           style={s.backBtn}
         >
           <Ionicons name="arrow-back" size={22} color="#fff" />

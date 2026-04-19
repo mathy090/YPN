@@ -7,14 +7,21 @@ const { getChannels, getChannel } = require("../models/DiscordChannels");
 
 const router = express.Router();
 const upload = multer({
-  limits: { fileSize: 30 * 1024 * 1024 }, // 30MB limit
+  limits: { fileSize: 30 * 1024 * 1024 },
   storage: multer.memoryStorage(),
 });
 
-const getSupabase = (req) => req.app.get("supabase");
+// ✅ Safe helper: returns null if Supabase not injected
+const getSupabase = (req) => {
+  const client = req.app?.get?.("supabase");
+  if (!client) {
+    console.warn("[Discord] Supabase client not available");
+  }
+  return client;
+};
 
 // ────────────────────────────────────────────────────────────────────────────
-// GET /api/discord/channels - PUBLIC
+// GET /api/discord/channels
 // ────────────────────────────────────────────────────────────────────────────
 router.get("/channels", async (_req, res) => {
   try {
@@ -27,7 +34,7 @@ router.get("/channels", async (_req, res) => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────
-// GET /api/discord/channels/:id - PUBLIC
+// GET /api/discord/channels/:id
 // ────────────────────────────────────────────────────────────────────────────
 router.get("/channels/:id", async (req, res) => {
   try {
@@ -41,7 +48,7 @@ router.get("/channels/:id", async (req, res) => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────
-// GET /api/discord/profile/:uid - PUBLIC (Fetch username + avatar from MongoDB)
+// GET /api/discord/profile/:uid - PUBLIC
 // ────────────────────────────────────────────────────────────────────────────
 router.get("/profile/:uid", async (req, res) => {
   try {
@@ -52,6 +59,13 @@ router.get("/profile/:uid", async (req, res) => {
         .json({ message: "UID required", code: "MISSING_UID" });
 
     const db = req.app.get("db");
+    if (!db) {
+      console.error("[Discord] MongoDB not available");
+      return res
+        .status(500)
+        .json({ message: "Database unavailable", code: "DB_ERROR" });
+    }
+
     const user = await db
       .collection("users")
       .findOne(
@@ -78,11 +92,18 @@ router.get("/profile/:uid", async (req, res) => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────
-// POST /api/discord/messages - PUBLIC (No auth, uses username + avatarUrl)
-// Body: { channelId, username, avatarUrl?, content?, mediaType?, mediaUrl? }
+// POST /api/discord/messages - PUBLIC
 // ────────────────────────────────────────────────────────────────────────────
 router.post("/messages", async (req, res) => {
   const supabase = getSupabase(req);
+  if (!supabase) {
+    return res.status(503).json({
+      message: "Chat service unavailable",
+      code: "SUPABASE_UNAVAILABLE",
+      hint: "Check server logs for Supabase setup",
+    });
+  }
+
   const { channelId, username, avatarUrl, content, mediaType, mediaUrl } =
     req.body;
 
@@ -118,7 +139,10 @@ router.post("/messages", async (req, res) => {
       .select()
       .single();
 
-    if (error) throw error;
+    if (error) {
+      console.error("[Supabase] Insert error:", error);
+      throw error;
+    }
     res.status(201).json({ ...data, username: cleanUsername });
   } catch (err) {
     console.error("[Discord] POST message error:", err);
@@ -130,10 +154,16 @@ router.post("/messages", async (req, res) => {
 
 // ────────────────────────────────────────────────────────────────────────────
 // GET /api/discord/messages/:channelId - PUBLIC (Incremental sync)
-// Query: ?after=ISO_TIMESTAMP&limit=50 (new messages) or ?before=ISO_TIMESTAMP (older)
 // ────────────────────────────────────────────────────────────────────────────
 router.get("/messages/:channelId", async (req, res) => {
   const supabase = getSupabase(req);
+  if (!supabase) {
+    return res.status(503).json({
+      message: "Chat service unavailable",
+      code: "SUPABASE_UNAVAILABLE",
+    });
+  }
+
   const { channelId } = req.params;
   const { after, before, limit = 50 } = req.query;
 
@@ -150,24 +180,20 @@ router.get("/messages/:channelId", async (req, res) => {
       .limit(parseInt(limit));
 
     if (after) {
-      // Fetch NEW messages after timestamp (WhatsApp-style sync)
       query = query
         .gt("created_at", after)
         .order("created_at", { ascending: true });
     } else if (before) {
-      // Fetch OLDER messages before timestamp (pull-to-refresh)
       query = query
         .lt("created_at", before)
         .order("created_at", { ascending: false });
     } else {
-      // Initial load
       query = query.order("created_at", { ascending: true });
     }
 
     const { messages, error } = await query;
     if (error) throw error;
 
-    // Parse username from sender_id for fallback display
     const enriched = (messages || []).map((msg) => ({
       ...msg,
       username:
@@ -186,12 +212,20 @@ router.get("/messages/:channelId", async (req, res) => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────
-// DELETE /api/discord/messages/:messageId - PUBLIC (Anyone can delete for demo)
+// DELETE /api/discord/messages/:messageId - PUBLIC
 // ────────────────────────────────────────────────────────────────────────────
 router.delete("/messages/:messageId", async (req, res) => {
   const supabase = getSupabase(req);
-  const { messageId } = req.params;
+  if (!supabase) {
+    return res
+      .status(503)
+      .json({
+        message: "Chat service unavailable",
+        code: "SUPABASE_UNAVAILABLE",
+      });
+  }
 
+  const { messageId } = req.params;
   if (!messageId)
     return res
       .status(400)
@@ -213,10 +247,19 @@ router.delete("/messages/:messageId", async (req, res) => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────
-// POST /api/discord/upload-media - PUBLIC (Upload to Supabase Storage)
+// POST /api/discord/upload-media - PUBLIC
 // ────────────────────────────────────────────────────────────────────────────
 router.post("/upload-media", upload.single("file"), async (req, res) => {
   const supabase = getSupabase(req);
+  if (!supabase) {
+    return res
+      .status(503)
+      .json({
+        message: "Chat service unavailable",
+        code: "SUPABASE_UNAVAILABLE",
+      });
+  }
+
   if (!req.file)
     return res
       .status(400)
