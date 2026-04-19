@@ -1,22 +1,17 @@
-# main.py
+# ypn-ai-service/main.py
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from dotenv import load_dotenv
 import os
+import cohere
+import asyncio
+import hashlib
 import json
 import time
-import base64
-import asyncio
 import logging
 import sys
-import uuid
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
-from fastapi.responses import JSONResponse
-from vosk import Model, KaldiRecognizer
-
-from upstash_redis import Redis
-from supabase import create_client
-
-from retrievers import retrieve
-from prompts import SYSTEM_PROMPT
 
 # ── Logging Setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -26,409 +21,399 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Load environment variables
+load_dotenv()
+
 # ── Configuration ─────────────────────────────────────────────────────────────
-EXPRESS_BACKEND_URL = os.getenv("EXPRESS_BACKEND_URL")
+COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+if not COHERE_API_KEY:
+    raise RuntimeError("COHERE_API_KEY is not set")
 
-# ── Redis & Supabase ──────────────────────────────────────────────────────────
-redis = Redis(
-    url=os.getenv("UPSTASH_REDIS_REST_URL"),
-    token=os.getenv("UPSTASH_REDIS_REST_TOKEN")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+UPSTASH_REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+UPSTASH_REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+
+# ── Initialize Cohere V2 client ───────────────────────────────────────────────
+co = cohere.ClientV2(api_key=COHERE_API_KEY)
+logger.info("[init] Cohere V2 client initialized")
+
+# Use latest supported model
+MODEL = "command-r-plus-08-2024"
+
+# ──  Enhanced System Prompt with Name Handling ─────────────────────────────
+SYSTEM_PROMPT = (
+    "You are YPN AI, a warm and helpful assistant for Team YPN — "
+    "a youth empowerment network based in Zimbabwe. "
+    "Be concise, helpful, and natural like ChatGPT. "
+    "Avoid long explanations unless asked.\n\n"
+    "--- NAME HANDLING RULES ---\n"
+    "1. If the user greets you (e.g., 'hello', 'hi', 'hey') and you DON'T know their name yet, "
+    "   respond warmly and ASK for their name. Example: 'Hello! 👋 I'm YPN AI. What's your name?'\n"
+    "2. Once you learn the user's name, REMEMBER it for the entire conversation.\n"
+    "3. ALWAYS start your replies with the user's name followed by a comma, then your message. "
+    "   Example: 'John, I'd be happy to help you with that!'\n"
+    "4. If the user tells you their name, acknowledge it warmly. Example: 'Nice to meet you, Sarah! 🎉'\n"
+    "5. Be friendly and use the name naturally — don't force it if it doesn't fit.\n"
+    "6. Keep responses concise (2-3 sentences max) unless the user asks for more detail.\n"
+    "--- END RULES ---"
 )
-logger.info("[init] Redis client initialized")
 
-supabase_url = os.getenv("SUPABASE_URL")
-supabase_key = os.getenv("SUPABASE_KEY")
-if not supabase_url or not supabase_key:
-    raise Exception("SUPABASE_URL or SUPABASE_KEY missing")
+# ── Initialize Redis (Upstash) ────────────────────────────────────────────────
+from upstash_redis import Redis
 
-supabase = create_client(supabase_url, supabase_key)
-logger.info("[init] Supabase client created")
-
-# ── Vosk Model ────────────────────────────────────────────────────────────────
-VOSK_MODEL_PATH = os.getenv("VOSK_MODEL_PATH", "models/vosk-model-small-en-us-0.15")
-model = None
-
-if os.path.isdir(VOSK_MODEL_PATH) and os.path.exists(os.path.join(VOSK_MODEL_PATH, "conf")):
+redis = None
+if UPSTASH_REDIS_URL and UPSTASH_REDIS_TOKEN:
     try:
-        model = Model(VOSK_MODEL_PATH)
-        logger.info("[VOSK] Model loaded successfully")
+        redis = Redis(url=UPSTASH_REDIS_URL, token=UPSTASH_REDIS_TOKEN)
+        logger.info("[init] Redis client initialized")
     except Exception as e:
-        logger.error(f"[VOSK] Load error: {e}", exc_info=True)
-        model = None
+        logger.error(f"[init] Redis connection failed: {e}")
 else:
-    logger.warning(f"[VOSK] Model missing or invalid at: {VOSK_MODEL_PATH}")
+    logger.warning("[init] Redis credentials not set, using in-memory fallback")
 
-app = FastAPI()
-logger.info("[init] FastAPI app created")
-
-# ── Cohere AI Client Setup ────────────────────────────────────────────────────
-import cohere
-
-_cohere_client = None
-
-def get_cohere_client():
-    """Lazy-load Cohere client with API key from env vars."""
-    global _cohere_client
-    if _cohere_client is None:
-        api_key = os.getenv("COHERE_API_KEY")
-        if not api_key:
-            logger.warning("[AI] COHERE_API_KEY not set, using stub response")
-            return None
-        try:
-            _cohere_client = cohere.AsyncClient(api_key=api_key)
-            logger.info("[AI] Cohere client initialized")
-        except Exception as e:
-            logger.error(f"[AI] Failed to initialize Cohere: {e}", exc_info=True)
-            return None
-    return _cohere_client
-
-
-# ── AI Provider: Cohere Integration ───────────────────────────────────────────
-async def run_ai(prompt: str):
-    """
-    Generate AI response using Cohere Command-R.
-    Falls back to stub if API key missing or request fails.
-    """
-    client = get_cohere_client()
-    
-    # Fallback if no API key or client failed to init
-    if client is None:
-        logger.warning("[AI] No Cohere client available, returning stub response")
-        await asyncio.sleep(0.2)
-        return "I understand. I'm listening carefully and responding step by step."
-    
+# ── Initialize Supabase ───────────────────────────────────────────────────────
+if SUPABASE_URL and SUPABASE_KEY:
     try:
-        logger.info(f"[AI] Calling Cohere with prompt ({len(prompt)} chars)")
-        
-        response = await client.chat(
-            model="command-r",  # Fast & affordable; use "command-r-plus" for higher quality
-            message=prompt,
-            preamble=SYSTEM_PROMPT,
-            max_tokens=500,
-            temperature=0.7,
-            k=0,  # Disable sampling for more consistent responses
-        )
-        
-        reply = response.text.strip()
-        logger.info(f"[AI] Cohere response received ({len(reply)} chars)")
-        return reply
-        
-    except cohere.UnauthorizedError:
-        logger.error("[AI] Cohere auth failed - check COHERE_API_KEY")
-        return "Sorry, I'm having trouble connecting to my AI service. Please try again later."
-        
-    except cohere.TooManyRequestsError:
-        logger.warning("[AI] Cohere rate limit hit")
-        return "I'm getting a lot of requests right now. Please try again in a moment."
-        
+        from supabase import create_client
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logger.info("[init] Supabase client initialized")
     except Exception as e:
-        logger.error(f"[AI] Cohere error: {type(e).__name__}: {e}", exc_info=True)
-        # Fallback to stub on any error so chat never breaks
-        return "I understand. I'm listening carefully and responding step by step."
+        logger.error(f"[init] Supabase connection failed: {e}")
+        supabase = None
+else:
+    logger.warning("[init] Supabase credentials not set, persistence disabled")
+    supabase = None
+
+# ── In-memory fallback for Redis (if Redis unavailable) ───────────────────────
+sessions: dict = {}  # Fallback only
+cache: dict = {}     # In-memory cache for repeated questions (kept as-is)
+
+# FastAPI app
+app = FastAPI()
+
+# Allow all CORS (for frontend)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# Request model
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str = "default"
 
 
 # ── Redis Helpers ─────────────────────────────────────────────────────────────
-def add_message(uid, role, text):
-    """Save message to Redis chat history."""
-    key = f"chat:{uid}"
-    try:
-        data = redis.get(key)
-        chat = json.loads(data) if data else []
-        chat.append({"role": role, "text": text, "t": time.time()})
-        chat = chat[-20:]  # Keep last 20 messages
-        redis.set(key, json.dumps(chat))
-        logger.debug(f"[redis] Added {role} message for uid={uid}, chat length: {len(chat)}")
-        return chat
-    except Exception as e:
-        logger.error(f"[redis] Error in add_message: {e}", exc_info=True)
-        return []
+def _get_redis_key(session_id: str) -> str:
+    return f"session:{session_id}"
 
 
-def get_chat(uid):
-    """Retrieve chat history from Redis."""
-    try:
-        data = redis.get(f"chat:{uid}")
-        chat = json.loads(data) if data else []
-        logger.debug(f"[redis] Retrieved {len(chat)} messages for uid={uid}")
-        return chat
-    except Exception as e:
-        logger.error(f"[redis] Error in get_chat: {e}", exc_info=True)
-        return []
+def _get_name_redis_key(session_id: str) -> str:
+    return f"name:{session_id}"
 
 
-def update_audio_time(uid):
-    """Update last audio activity timestamp for silence detection."""
-    try:
-        redis.set(f"last_audio:{uid}", time.time())
-    except Exception as e:
-        logger.error(f"[redis] Error updating audio time: {e}", exc_info=True)
-
-
-def is_user_silent(uid, threshold=0.8):
-    """Check if user has been silent for longer than threshold seconds."""
-    try:
-        last = redis.get(f"last_audio:{uid}")
-        if not last:
-            return False
-        return (time.time() - float(last)) > threshold
-    except Exception as e:
-        logger.error(f"[redis] Error checking silence: {e}", exc_info=True)
-        return False
-
-
-def build_prompt(uid, user_text):
-    """Build the full prompt for AI with conversation history and context."""
-    logger.info(f"[prompt] Building prompt for uid={uid}, user_text='{user_text[:50]}...'")
-    try:
-        chat = get_chat(uid)
-        context = retrieve(user_text, chat)
-        logger.debug(f"[prompt] Context retrieved: {context.get('meta', {})}")
-        
-        prompt = f"""
-{SYSTEM_PROMPT}
-
-Conversation:
-{json.dumps(chat)}
-
-Context:
-{json.dumps(context)}
-
-User:
-{user_text}
-"""
-        logger.debug(f"[prompt] Final prompt length: {len(prompt)} chars")
-        return prompt
-    except Exception as e:
-        logger.error(f"[prompt] Error building prompt: {e}", exc_info=True)
-        # Fallback prompt
-        return f"{SYSTEM_PROMPT}\n\nUser: {user_text}"
-
-
-# ── 🔥 HTTP Chat Endpoint (No Auth, No Heartbeat) ────────────────────────────
-@app.post("/chat")
-async def http_chat(request_body: dict):
-    """Handle text-to-text chat requests."""
-    logger.info(f"[chat] POST /chat received: {request_body}")
+def _get_session_from_redis(session_id: str) -> list:
+    """Load session history from Redis."""
+    if not redis:
+        return sessions.get(session_id, [])
     
     try:
-        uid = request_body.get("uid", "anonymous")
-        user_text = request_body.get("message", "").strip()
-        
-        logger.info(f"[chat] Processing: uid={uid}, message_len={len(user_text)}")
-        
-        if not user_text:
-            logger.warning("[chat] Empty message received")
-            return JSONResponse(content={"reply": ""})
-
-        # 1. Save user message to Redis
-        add_message(uid, "user", user_text)
-        
-        # 2. Build prompt with context
-        prompt = build_prompt(uid, user_text)
-        
-        # 3. Get AI Response from Cohere
-        logger.info("[chat] Calling AI provider...")
-        response_text = await run_ai(prompt)
-        logger.info(f"[chat] AI response received ({len(response_text)} chars)")
-        
-        # 4. Save AI Response to Redis
-        add_message(uid, "ai", response_text)
-        
-        # 5. Save to Supabase (with defensive error handling)
-        try:
-            logger.debug(f"[supabase] Inserting message: user_id={uid}, role=ai, content_len={len(response_text)}")
-            
-            result = supabase.table("messages").insert({
-                "user_id": uid,
-                "role": "ai",
-                "content": response_text.strip()
-            }).execute()
-            
-            logger.info(f"[supabase] Insert successful")
-            
-        except Exception as db_err:
-            # Log the error but don't crash the chat
-            logger.error(f"[supabase] Insert failed (non-critical): {type(db_err).__name__}: {db_err}")
-            logger.warning("[supabase] Message saved to Redis only; Supabase sync skipped")
-
-        return JSONResponse(content={"reply": response_text})
-        
+        data = redis.get(_get_redis_key(session_id))
+        return json.loads(data) if data else []
     except Exception as e:
-        logger.error(f"[chat] CRITICAL ERROR: {type(e).__name__}: {e}", exc_info=True)
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Internal server error", "detail": str(e)}
-        )
+        logger.error(f"[redis] Error loading session: {e}")
+        return sessions.get(session_id, [])
 
 
-# ── 🔍 DEBUG: Test Supabase Connection ───────────────────────────────────────
-@app.get("/debug/test-db")
-async def test_db():
-    """Test Supabase connection and messages table schema."""
+def _save_session_to_redis(session_id: str, history: list):
+    """Save session history to Redis with 24h TTL."""
+    if not redis:
+        sessions[session_id] = history
+        return
+    
     try:
-        result = supabase.table("messages").select("id, user_id, role, content").limit(1).execute()
-        return {
-            "status": "ok", 
-            "sample": result.data, 
-            "count": len(result.data) if result.data else 0
-        }
+        key = _get_redis_key(session_id)
+        redis.set(key, json.dumps(history), ex=86400)  # 24 hours
     except Exception as e:
-        return {"status": "error", "message": str(e), "type": type(e).__name__}
+        logger.error(f"[redis] Error saving session: {e}")
+        sessions[session_id] = history  # Fallback to memory
 
 
-# ── WebSocket: Voice Streaming (No Auth) ─────────────────────────────────────
-@app.websocket("/ws")
-async def ws(websocket: WebSocket):
-    """Handle WebSocket connections for voice chat with real-time streaming."""
-    await websocket.accept()
-    logger.info("[ws] New WebSocket connection accepted")
-
-    # Generate a session ID for this connection
-    uid = str(uuid.uuid4())[:8]
-    recognizer = None
-    pending_text = ""
-
+def _get_user_name(session_id: str) -> str:
+    """Get stored user name from Redis."""
+    if not redis:
+        return ""
     try:
-        # Initialize chat & recognizer
-        redis.setnx(f"chat:{uid}", json.dumps([]))
-        if model:
-            recognizer = KaldiRecognizer(model, 16000)
-            logger.info(f"[ws] Vosk recognizer initialized for uid={uid}")
-        else:
-            logger.warning(f"[ws] Vosk model not available, speech recognition disabled for uid={uid}")
-
-        # Notify client connection is ready
-        await websocket.send_json({"type": "connected", "uid": uid})
-        logger.info(f"[ws] Sent 'connected' signal to uid={uid}")
-
-        # ── MAIN LOOP: Handle audio/text/interrupt ───────────────────────────
-        while True:
-            data = await websocket.receive_json()
-            msg_type = data.get("type")
-            logger.debug(f"[ws] Received message type='{msg_type}' for uid={uid}")
-
-            user_text = None
-
-            # ── Text message ─────────────────────────────────────────────────
-            if msg_type == "text":
-                user_text = data.get("message", "").strip()
-                logger.debug(f"[ws] Text input: '{user_text[:50]}...'")
-
-            # ── Audio chunk (Vosk) ───────────────────────────────────────────
-            elif msg_type == "audio" and recognizer:
-                try:
-                    pcm = base64.b64decode(data["audio"])
-                    update_audio_time(uid)
-
-                    if recognizer.AcceptWaveform(pcm):
-                        res = json.loads(recognizer.Result())
-                        user_text = res.get("text", "").strip()
-                        logger.debug(f"[ws] Recognized final: '{user_text}'")
-                    else:
-                        partial = json.loads(recognizer.PartialResult())
-                        pending_text = partial.get("partial", "")
-
-                        await websocket.send_json({
-                            "type": "partial",
-                            "text": pending_text
-                        })
-
-                        # Auto-submit if user goes silent mid-sentence
-                        if is_user_silent(uid) and pending_text:
-                            user_text = pending_text
-                            pending_text = ""
-                            logger.debug(f"[ws] Auto-submitted partial: '{user_text}'")
-                except Exception as e:
-                    logger.error(f"[ws] Audio processing error: {e}", exc_info=True)
-
-            # ── Interrupt (cancel current AI response) ───────────────────────
-            elif msg_type == "interrupt":
-                redis.set(f"interrupt:{uid}", "1")
-                logger.debug(f"[ws] Interrupt signal received for uid={uid}")
-                continue
-
-            # Skip if no usable input
-            if not user_text:
-                continue
-
-            # ── Process user input ───────────────────────────────────────────
-            add_message(uid, "user", user_text)
-            prompt = build_prompt(uid, user_text)
-
-            await websocket.send_json({"type": "state", "value": "thinking"})
-
-            # Stream AI response token-by-token
-            logger.info(f"[ws] Generating AI response for uid={uid}")
-            response = await run_ai(prompt)
-            await websocket.send_json({"type": "state", "value": "speaking"})
-
-            ai_text = ""
-            for word in response.split():
-                # Check for interrupt during streaming
-                if redis.get(f"interrupt:{uid}") == "1":
-                    redis.delete(f"interrupt:{uid}")
-                    logger.debug(f"[ws] Interrupted AI response for uid={uid}")
-                    break
-
-                ai_text += word + " "
-                await websocket.send_json({
-                    "type": "ai_token",
-                    "text": word + " "
-                })
-                await asyncio.sleep(0.03)  # Simulate token delay
-
-            # Persist & notify completion
-            if ai_text.strip():
-                add_message(uid, "ai", ai_text)
-                
-                # Save to Supabase (non-critical)
-                try:
-                    supabase.table("messages").insert({
-                        "user_id": uid,
-                        "role": "ai",
-                        "content": ai_text.strip()
-                    }).execute()
-                    logger.info(f"[ws] AI response persisted to Supabase for uid={uid}")
-                except Exception as db_err:
-                    logger.error(f"[ws] Supabase insert failed: {db_err}")
-
-            await websocket.send_json({"type": "done"})
-            await websocket.send_json({"type": "state", "value": "listening"})
-
-    except WebSocketDisconnect:
-        logger.info(f"[ws] Disconnected: uid={uid}")
+        name = redis.get(_get_name_redis_key(session_id))
+        return name if name else ""
     except Exception as e:
-        logger.error(f"[ws] CRITICAL ERROR for uid={uid}: {type(e).__name__}: {e}", exc_info=True)
-        try:
-            await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
-        except:
-            pass
+        logger.error(f"[redis] Error getting name: {e}")
+        return ""
 
 
-# ── Health Check Endpoint ─────────────────────────────────────────────────────
-@app.get("/health")
-async def health():
-    """Simple health check for Render/load balancers."""
-    return {
-        "status": "healthy",
-        "redis": "connected",
-        "supabase": "connected", 
-        "vosk": "loaded" if model else "not_loaded",
-        "cohere": "configured" if os.getenv("COHERE_API_KEY") else "missing_key"
-    }
+def _save_user_name(session_id: str, name: str):
+    """Save user name to Redis with 7-day TTL."""
+    if not redis:
+        return
+    try:
+        redis.set(_get_name_redis_key(session_id), name, ex=604800)  # 7 days
+        logger.debug(f"[redis] Saved name '{name}' for session={session_id}")
+    except Exception as e:
+        logger.error(f"[redis] Error saving name: {e}")
 
 
-# ── Root Endpoint ─────────────────────────────────────────────────────────────
+# ── Supabase Helpers ──────────────────────────────────────────────────────────
+def _log_message_to_supabase(session_id: str, role: str, content: str, user_name: str = None):
+    """Persist message to Supabase (non-critical, defensive)."""
+    if not supabase:
+        return
+    
+    try:
+        supabase.table("messages").insert({
+            "user_id": session_id,
+            "role": role,
+            "content": content.strip(),
+            "metadata": {"user_name": user_name} if user_name else {}
+        }).execute()
+        logger.debug(f"[supabase] Logged {role} message for session={session_id}")
+    except Exception as e:
+        logger.error(f"[supabase] Insert failed (non-critical): {e}")
+
+
+# ── Helper: build messages for Cohere ─────────────────────────────────────────
+def build_messages(history: list, message: str) -> list:
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    msgs.extend(history)
+    msgs.append({"role": "user", "content": message})
+    return msgs
+
+
+# ── Helper: cache key generator ───────────────────────────────────────────────
+def cache_key(session_id: str, message: str, history: list) -> str:
+    raw = session_id + message + json.dumps(history, sort_keys=True)
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+# ── Helper: Extract name from user message ────────────────────────────────────
+def extract_name_from_message(message: str) -> str:
+    """
+    Simple heuristic to extract name if user says 'my name is X' or 'I am X'.
+    Returns empty string if no name detected.
+    """
+    message_lower = message.lower()
+    
+    # Pattern: "my name is [name]"
+    if "my name is" in message_lower:
+        parts = message_lower.split("my name is")
+        if len(parts) > 1:
+            name = parts[1].strip().split()[0].capitalize()
+            return name.rstrip(".,!?")
+    
+    # Pattern: "I am [name]" or "I'm [name]"
+    if "i am " in message_lower or "i'm " in message_lower:
+        marker = "i am " if "i am " in message_lower else "i'm "
+        parts = message_lower.split(marker)
+        if len(parts) > 1:
+            name = parts[1].strip().split()[0].capitalize()
+            return name.rstrip(".,!?")
+    
+    # Pattern: "call me [name]"
+    if "call me " in message_lower:
+        parts = message_lower.split("call me ")
+        if len(parts) > 1:
+            name = parts[1].strip().split()[0].capitalize()
+            return name.rstrip(".,!?")
+    
+    return ""
+
+
+# ------------------- Endpoints -------------------
+
 @app.get("/")
 async def root():
-    """Root endpoint with API info."""
     return {
-        "service": "YPN AI Backend",
-        "version": "1.0.0",
-        "endpoints": {
-            "POST /chat": "Text-to-text chat",
-            "GET /ws": "WebSocket for voice chat",
-            "GET /health": "Health check",
-            "GET /debug/test-db": "Test Supabase connection"
-        }
+        "status": "⚡ YPN AI FAST MODE",
+        "redis": "connected" if redis else "fallback",
+        "supabase": "connected" if supabase else "disabled"
     }
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "model": MODEL,
+        "redis": "connected" if redis else "fallback",
+        "supabase": "connected" if supabase else "disabled",
+        "cache_size": len(cache),
+    }
+
+
+# Normal chat endpoint (JSON)
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    message = req.message.strip()
+    session_id = req.session_id.strip() or "default"
+
+    if not message:
+        raise HTTPException(400, "Message cannot be empty")
+
+    # Get stored user name
+    user_name = _get_user_name(session_id)
+    
+    # Check if user is providing their name
+    extracted_name = extract_name_from_message(message)
+    if extracted_name:
+        _save_user_name(session_id, extracted_name)
+        user_name = extracted_name
+        logger.info(f"[chat] Captured user name '{user_name}' for session={session_id}")
+
+    # Load history from Redis (or memory fallback)
+    history = _get_session_from_redis(session_id)
+    history = _trim_history(history)
+
+    key = cache_key(session_id, message, history)
+
+    # Return cached reply if available
+    if key in cache:
+        logger.debug(f"[chat] Cache hit for session={session_id}")
+        return {"reply": cache[key], "cached": True, "user_name": user_name}
+
+    try:
+        response = co.chat(
+            model=MODEL,
+            messages=build_messages(history, message),
+            temperature=0.7,
+            max_tokens=200,
+        )
+
+        reply = response.message.content[0].text.strip()
+
+        # Update session history
+        history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": reply})
+        history = history[-20:]
+
+        # Save to Redis (or memory fallback)
+        _save_session_to_redis(session_id, history)
+
+        # Log to Supabase (non-critical)
+        _log_message_to_supabase(session_id, "user", message, user_name)
+        _log_message_to_supabase(session_id, "assistant", reply, user_name)
+
+        # Cache result
+        cache[key] = reply
+
+        return {"reply": reply, "cached": False, "user_name": user_name}
+
+    except Exception as e:
+        logger.error(f"[chat] Error: {type(e).__name__}: {e}")
+        raise HTTPException(500, str(e))
+
+
+# Streaming chat endpoint (ChatGPT-like)
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    message = req.message.strip()
+    session_id = req.session_id.strip() or "default"
+
+    if not message:
+        raise HTTPException(400, "Message cannot be empty")
+
+    # Get stored user name
+    user_name = _get_user_name(session_id)
+    
+    # Check if user is providing their name
+    extracted_name = extract_name_from_message(message)
+    if extracted_name:
+        _save_user_name(session_id, extracted_name)
+        user_name = extracted_name
+        logger.info(f"[stream] Captured user name '{user_name}' for session={session_id}")
+
+    # Load history from Redis (or memory fallback)
+    history = _get_session_from_redis(session_id)
+    history = _trim_history(history)
+
+    async def generate():
+        full_text = ""
+
+        try:
+            stream = co.chat_stream(
+                model=MODEL,
+                messages=build_messages(history, message),
+                temperature=0.7,
+                max_tokens=200,
+            )
+
+            for event in stream:
+                if event.type == "content-delta":
+                    chunk = event.delta.message.content.text
+                    if chunk:
+                        full_text += chunk
+                        yield chunk
+                        await asyncio.sleep(0.01)
+
+            # Save session after streaming ends
+            history.append({"role": "user", "content": message})
+            history.append({"role": "assistant", "content": full_text})
+            history = history[-20:]
+            _save_session_to_redis(session_id, history)
+
+            # Log to Supabase (non-critical)
+            _log_message_to_supabase(session_id, "user", message, user_name)
+            _log_message_to_supabase(session_id, "assistant", full_text, user_name)
+
+        except Exception as e:
+            logger.error(f"[stream] Error: {e}")
+            yield "⚠️ Error: " + str(e)
+
+    return StreamingResponse(generate(), media_type="text/plain")
+
+
+# Clear session (including stored name)
+@app.delete("/chat/{session_id}")
+async def clear_session(session_id: str):
+    if redis:
+        try:
+            redis.delete(_get_redis_key(session_id))
+            redis.delete(_get_name_redis_key(session_id))
+        except Exception as e:
+            logger.error(f"[redis] Error clearing session: {e}")
+    else:
+        sessions.pop(session_id, None)
+    
+    logger.info(f"[chat] Session cleared: {session_id}")
+    return {"cleared": session_id}
+
+
+# ── Helper: trim history ──────────────────────────────────────────────────────
+def _trim_history(history: list, limit: int = 6) -> list:
+    """Trim history to last N turns (user+assistant = 1 turn)."""
+    return history[-limit:] if len(history) > limit else history
+
+
+# ------------------- Background Tasks -------------------
+
+# Periodic cache cleanup
+async def cleanup_cache():
+    while True:
+        await asyncio.sleep(600)  # every 10 minutes
+        cache.clear()
+        logger.info("🧹 In-memory cache cleared")
+
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(cleanup_cache())
+    logger.info("🚀 YPN AI Backend started")
+
+
+# ------------------- Run -------------------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
