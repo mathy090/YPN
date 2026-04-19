@@ -1,301 +1,248 @@
-# ypn-ai-service/main.py
-#
-# Simple, auth-free AI service.
-# - /health          → liveness probe
-# - /chat            → HTTP text chat (no auth, session_id from body)
-# - /ws              → WebSocket voice streaming (Vosk STT → AI → TTS chunks)
-#
-# Memory: Upstash Redis keyed by session_id (passed by client).
-# STT:    Vosk (offline, no API key).
-# AI:     Swap run_ai() stub for Cohere/OpenAI/Anthropic as needed.
-
-import asyncio
-import base64
-import json
-import logging
 import os
+import json
 import time
+import base64
+import asyncio
+import httpx
 import uuid
 
-import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status, HTTPException, Header
 from fastapi.responses import JSONResponse
-from vosk import KaldiRecognizer, Model
+from vosk import Model, KaldiRecognizer
+
 from upstash_redis import Redis
+from supabase import create_client
 
-from audio.stt import create_recognizer, feed_frame, finalize
-from audio.vad import FRAME_BYTES, create_vad, is_speech, SILENCE_FRAMES_THRESHOLD
-from prompts import SYSTEM_PROMPT
 from retrievers import retrieve
+from prompts import SYSTEM_PROMPT
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ── Configuration ─────────────────────────────────────────────────────────────
+EXPRESS_BACKEND_URL = os.getenv("EXPRESS_BACKEND_URL")
 
-# ── Redis ─────────────────────────────────────────────────────────────────────
+# ── Redis & Supabase ──────────────────────────────────────────────────────────
 redis = Redis(
-    url=os.environ["UPSTASH_REDIS_REST_URL"],
-    token=os.environ["UPSTASH_REDIS_REST_TOKEN"],
+    url=os.getenv("UPSTASH_REDIS_REST_URL"),
+    token=os.getenv("UPSTASH_REDIS_REST_TOKEN")
 )
 
-# ── Vosk model (lazy singleton) ───────────────────────────────────────────────
-VOSK_MODEL_PATH = os.getenv(
-    "VOSK_MODEL_PATH", "models/vosk-model-small-en-us-0.15"
-)
-_vosk_model: Model | None = None
+supabase_url = os.getenv("SUPABASE_URL")
+supabase_key = os.getenv("SUPABASE_KEY")
+if not supabase_url or not supabase_key:
+    raise Exception("SUPABASE_URL or SUPABASE_KEY missing")
+
+supabase = create_client(supabase_url, supabase_key)
 
 
-def get_vosk_model() -> Model | None:
-    global _vosk_model
-    if _vosk_model is not None:
-        return _vosk_model
-    if os.path.isdir(VOSK_MODEL_PATH) and os.path.exists(
-        os.path.join(VOSK_MODEL_PATH, "conf")
-    ):
-        try:
-            _vosk_model = Model(VOSK_MODEL_PATH)
-            logger.info("[Vosk] Model loaded from %s", VOSK_MODEL_PATH)
-        except Exception as exc:
-            logger.error("[Vosk] Load error: %s", exc)
-    else:
-        logger.warning("[Vosk] Model not found at %s — STT disabled", VOSK_MODEL_PATH)
-    return _vosk_model
+# ── Vosk Model ────────────────────────────────────────────────────────────────
+VOSK_MODEL_PATH = os.getenv("VOSK_MODEL_PATH", "models/vosk-model-small-en-us-0.15")
+model = None
 
-
-# ── Redis helpers ─────────────────────────────────────────────────────────────
-HISTORY_TTL = 60 * 60 * 2  # 2 hours
-MAX_HISTORY = 20            # keep last N messages
-
-
-def _chat_key(session_id: str) -> str:
-    return f"chat:{session_id}"
-
-
-def load_history(session_id: str) -> list[dict]:
-    raw = redis.get(_chat_key(session_id))
-    if not raw:
-        return []
+if os.path.isdir(VOSK_MODEL_PATH) and os.path.exists(os.path.join(VOSK_MODEL_PATH, "conf")):
     try:
-        return json.loads(raw)
-    except Exception:
-        return []
+        model = Model(VOSK_MODEL_PATH)
+        print("[VOSK] Model loaded successfully")
+    except Exception as e:
+        print(f"[VOSK] Load error: {e}")
+        model = None
+else:
+    print("[VOSK] Model missing or invalid")
 
 
-def save_history(session_id: str, history: list[dict]) -> None:
-    trimmed = history[-MAX_HISTORY:]
-    redis.set(_chat_key(session_id), json.dumps(trimmed), ex=HISTORY_TTL)
+app = FastAPI()
 
 
-def append_message(session_id: str, role: str, text: str) -> list[dict]:
-    history = load_history(session_id)
-    history.append({"role": role, "text": text, "t": time.time()})
-    save_history(session_id, history)
-    return history
+# ── AI Stub (Replace with your real async provider) ───────────────────────────
+async def run_ai(prompt: str):
+    """Async generator yielding tokens. Replace with Cohere/OpenAI/etc."""
+    await asyncio.sleep(0.2)  # Simulate latency
+    return "I understand. I'm listening carefully and responding step by step."
 
 
-# ── AI stub ───────────────────────────────────────────────────────────────────
-# Replace the body of run_ai() with your real LLM call (Cohere, OpenAI, etc.)
-async def run_ai(prompt: str) -> str:
-    """Return a response string. Swap for real LLM integration."""
-    await asyncio.sleep(0.1)
-    return (
-        "I hear you. I'm here to support you — could you tell me more "
-        "about what's on your mind?"
-    )
+# ── Redis Helpers ─────────────────────────────────────────────────────────────
+def add_message(uid, role, text):
+    key = f"chat:{uid}"
+    data = redis.get(key)
+    chat = json.loads(data) if data else []
+    chat.append({"role": role, "text": text, "t": time.time()})
+    chat = chat[-20:]  # Keep last 20 messages
+    redis.set(key, json.dumps(chat))
+    return chat
 
 
-def build_prompt(session_id: str, user_text: str) -> str:
-    history = load_history(session_id)
-    context = retrieve(user_text, history)
-    return (
-        f"{SYSTEM_PROMPT}\n\n"
-        f"Conversation:\n{json.dumps(history)}\n\n"
-        f"Context:\n{json.dumps(context)}\n\n"
-        f"User:\n{user_text}"
-    )
+def get_chat(uid):
+    data = redis.get(f"chat:{uid}")
+    return json.loads(data) if data else []
 
 
-# ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="YPN AI Service")
+def update_audio_time(uid):
+    redis.set(f"last_audio:{uid}", time.time())
 
 
-# ── /health ───────────────────────────────────────────────────────────────────
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
+def is_user_silent(uid, threshold=0.8):
+    last = redis.get(f"last_audio:{uid}")
+    if not last:
+        return False
+    return (time.time() - float(last)) > threshold
 
 
-# ── /chat (HTTP, no auth) ─────────────────────────────────────────────────────
-# Body: { "message": "...", "session_id": "..." (optional) }
-# Returns: { "reply": "...", "session_id": "..." }
+def build_prompt(uid, user_text):
+    chat = get_chat(uid)
+    context = retrieve(user_text, chat)
+    return f"""
+{SYSTEM_PROMPT}
+
+Conversation:
+{json.dumps(chat)}
+
+Context:
+{json.dumps(context)}
+
+User:
+{user_text}
+"""
+
+
+# ── 🔥 HTTP Chat Endpoint (Auth Removed) ─────────────────────────────────────
 @app.post("/chat")
-async def http_chat(body: dict):
-    user_text = (body.get("message") or "").strip()
+async def http_chat(request_body: dict):
+    # Default to "anonymous" if no uid is provided by client
+    uid = request_body.get("uid", "anonymous")
+    user_text = request_body.get("message", "").strip()
+    
     if not user_text:
-        return JSONResponse({"reply": "", "session_id": ""})
+        return JSONResponse(content={"reply": ""})
 
-    # Use caller-supplied session_id or generate a new one.
-    # The React Native app should persist this per-conversation.
-    session_id: str = (body.get("session_id") or "").strip() or str(uuid.uuid4())
+    # 1. Process Message
+    add_message(uid, "user", user_text)
+    prompt = build_prompt(uid, user_text)
+    
+    # 2. Get AI Response
+    response_text = await run_ai(prompt)
+    
+    # 3. Save AI Response
+    add_message(uid, "ai", response_text)
+    supabase.table("messages").insert({
+        "user_id": uid,
+        "role": "ai",
+        "content": response_text.strip()
+    }).execute()
+    
+    return JSONResponse(content={"reply": response_text})
 
-    append_message(session_id, "user", user_text)
-    prompt = build_prompt(session_id, user_text)
-    reply = await run_ai(prompt)
-    append_message(session_id, "ai", reply)
 
-    return JSONResponse({"reply": reply, "session_id": session_id})
+# ── 🔥 Heartbeat Endpoint (Auth Removed) ─────────────────────────────────────
+@app.post("/heartbeat")
+async def heartbeat(request_body: dict):
+    uid = request_body.get("uid", "anonymous")
+    
+    # Update status in Redis to show user is active
+    redis.set(f"user_status:{uid}", "online", ex=60) # Expires in 60s
+    
+    return JSONResponse(content={"status": "ok", "uid": uid})
 
 
-# ── /ws (WebSocket voice streaming, no auth) ──────────────────────────────────
-#
-# Protocol (client → server):
-#   { "type": "init",  "session_id": "<id>" }   ← first frame, required
-#   { "type": "audio", "data": "<base64 PCM>" }  ← raw 16 kHz mono int16 chunks
-#   { "type": "text",  "message": "<text>" }     ← direct text (skips STT)
-#   { "type": "interrupt" }                       ← cancel current reply
-#   { "type": "end_call" }                        ← graceful close
-#
-# Protocol (server → client):
-#   { "type": "partial",    "text": "..."  }      ← STT partial transcript
-#   { "type": "transcript", "text": "..."  }      ← STT final transcript
-#   { "type": "thinking"                   }      ← AI is working
-#   { "type": "ai_token",  "text": "..."  }       ← streaming AI word
-#   { "type": "done"                       }      ← reply complete
-#   { "type": "tts_chunk", "data": "<b64>","sample_rate":22050 } ← audio out
-#   { "type": "tts_end"                    }
-#   { "type": "error",     "message":"..." }
-
+# ── WebSocket: Direct Connection (Auth Removed) ───────────────────────────────
 @app.websocket("/ws")
-async def ws_endpoint(websocket: WebSocket):
+async def ws(websocket: WebSocket):
     await websocket.accept()
 
-    session_id: str | None = None
-    vad = create_vad()
-    recognizer: KaldiRecognizer | None = None
-    pcm_buffer = b""
-    silence_frames = 0
-    speaking = False
-    interrupt_flag = False
+    # Generate a session ID or use a fixed default
+    uid = str(uuid.uuid4())[:8]  # Unique per WS connection
+    recognizer = None
+    pending_text = ""
 
-    model = get_vosk_model()
+    # Initialize chat & recognizer
+    redis.setnx(f"chat:{uid}", json.dumps([]))
     if model:
-        recognizer = create_recognizer()
+        recognizer = KaldiRecognizer(model, 16000)
 
-    async def send(payload: dict):
-        try:
-            await websocket.send_json(payload)
-        except Exception:
-            pass
-
-    async def stream_ai_reply(text: str) -> None:
-        """Send AI reply word-by-word as ai_token frames, then 'done'."""
-        nonlocal interrupt_flag
-        interrupt_flag = False
-        append_message(session_id, "user", text)
-        prompt = build_prompt(session_id, text)
-
-        await send({"type": "thinking"})
-        reply = await run_ai(prompt)
-        append_message(session_id, "ai", reply)
-
-        for word in reply.split():
-            if interrupt_flag:
-                break
-            await send({"type": "ai_token", "text": word + " "})
-            await asyncio.sleep(0.03)
-
-        await send({"type": "done"})
+    # Notify client connection is ready
+    await websocket.send_json({"type": "connected", "uid": uid})
 
     try:
-        # ── first message must be "init" ──────────────────────────────────
-        init_raw = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
-        if init_raw.get("type") != "init":
-            await send({"type": "error", "message": "First message must be {type:'init'}"})
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
-
-        session_id = (init_raw.get("session_id") or "").strip() or str(uuid.uuid4())
-        await send({"type": "ready", "session_id": session_id})
-        logger.info("[WS] Session started: %s", session_id)
-
-        # ── main loop ─────────────────────────────────────────────────────
+        # ── MAIN LOOP: Handle audio/text/interrupt ───────────────────────────
         while True:
-            msg = await websocket.receive_json()
-            msg_type = msg.get("type")
+            data = await websocket.receive_json()
+            msg_type = data.get("type")
 
-            # ── interrupt ─────────────────────────────────────────────────
-            if msg_type == "interrupt":
-                interrupt_flag = True
-                continue
+            user_text = None
 
-            # ── end call ──────────────────────────────────────────────────
-            if msg_type == "end_call":
-                break
-
-            # ── direct text (bypass STT) ──────────────────────────────────
+            # ── Text message ─────────────────────────────────────────────────
             if msg_type == "text":
-                user_text = (msg.get("message") or "").strip()
-                if user_text:
-                    await send({"type": "transcript", "text": user_text})
-                    asyncio.create_task(stream_ai_reply(user_text))
+                user_text = data.get("message", "").strip()
+
+            # ── Audio chunk (Vosk) ───────────────────────────────────────────
+            elif msg_type == "audio" and recognizer:
+                pcm = base64.b64decode(data["audio"])
+                update_audio_time(uid)
+
+                if recognizer.AcceptWaveform(pcm):
+                    res = json.loads(recognizer.Result())
+                    user_text = res.get("text", "").strip()
+                else:
+                    partial = json.loads(recognizer.PartialResult())
+                    pending_text = partial.get("partial", "")
+
+                    await websocket.send_json({
+                        "type": "partial",
+                        "text": pending_text
+                    })
+
+                    # Auto-submit if user goes silent mid-sentence
+                    if is_user_silent(uid) and pending_text:
+                        user_text = pending_text
+                        pending_text = ""
+
+            # ── Interrupt (cancel current AI response) ───────────────────────
+            elif msg_type == "interrupt":
+                redis.set(f"interrupt:{uid}", "1")
                 continue
 
-            # ── audio chunk ───────────────────────────────────────────────
-            if msg_type == "audio":
-                raw_b64 = msg.get("data", "")
-                try:
-                    pcm_chunk = base64.b64decode(raw_b64)
-                except Exception:
-                    continue
+            # Skip if no usable input
+            if not user_text:
+                continue
 
-                if not recognizer:
-                    # Vosk not available — skip STT silently
-                    continue
+            # ── Process user input ───────────────────────────────────────────
+            add_message(uid, "user", user_text)
+            prompt = build_prompt(uid, user_text)
 
-                pcm_buffer += pcm_chunk
+            await websocket.send_json({"type": "state", "value": "thinking"})
 
-                # Process complete 30 ms frames
-                while len(pcm_buffer) >= FRAME_BYTES:
-                    frame = pcm_buffer[:FRAME_BYTES]
-                    pcm_buffer = pcm_buffer[FRAME_BYTES:]
+            # Stream AI response token-by-token
+            response = await run_ai(prompt)
+            await websocket.send_json({"type": "state", "value": "speaking"})
 
-                    voiced = is_speech(vad, frame)
+            ai_text = ""
+            for word in response.split():
+                # Check for interrupt during streaming
+                if redis.get(f"interrupt:{uid}") == "1":
+                    redis.delete(f"interrupt:{uid}")
+                    break
 
-                    if voiced:
-                        silence_frames = 0
-                        if not speaking:
-                            speaking = True
-                            logger.debug("[VAD] Speech started")
+                ai_text += word + " "
+                await websocket.send_json({
+                    "type": "ai_token",
+                    "text": word + " "
+                })
+                await asyncio.sleep(0.03)  # Simulate token delay
 
-                        partial_text = feed_frame(recognizer, frame)
-                        if partial_text:
-                            await send({"type": "partial", "text": partial_text})
+            # Persist & notify completion
+            if ai_text.strip():
+                add_message(uid, "ai", ai_text)
+                supabase.table("messages").insert({
+                    "user_id": uid,
+                    "role": "ai",
+                    "content": ai_text.strip()
+                }).execute()
 
-                    else:
-                        if speaking:
-                            silence_frames += 1
-                            if silence_frames >= SILENCE_FRAMES_THRESHOLD:
-                                # Utterance complete
-                                final = finalize(recognizer)
-                                speaking = False
-                                silence_frames = 0
-                                pcm_buffer = b""
-
-                                # Fresh recognizer for next utterance
-                                recognizer = create_recognizer()
-
-                                if final:
-                                    await send({"type": "transcript", "text": final})
-                                    asyncio.create_task(stream_ai_reply(final))
+            await websocket.send_json({"type": "done"})
+            await websocket.send_json({"type": "state", "value": "listening"})
 
     except WebSocketDisconnect:
-        logger.info("[WS] Disconnected: %s", session_id)
-    except asyncio.TimeoutError:
-        await send({"type": "error", "message": "Init timeout — send {type:'init'} first"})
-        await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
-    except Exception as exc:
-        logger.exception("[WS] Unhandled error in session %s: %s", session_id, exc)
+        print(f"[WS] Disconnected: {uid}")
+    except Exception as e:
+        print(f"[WS] Error: {uid} — {e}")
         try:
             await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
-        except Exception:
+        except:
             pass
