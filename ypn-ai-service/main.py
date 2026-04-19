@@ -1,6 +1,6 @@
 # ypn-ai-service/main.py
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -41,7 +41,7 @@ logger.info("[init] Cohere V2 client initialized")
 # Use latest supported model
 MODEL = "command-r-plus-08-2024"
 
-# ──  Enhanced System Prompt with Name Handling ─────────────────────────────
+# ── Enhanced System Prompt with Name Handling ─────────────────────────────────
 SYSTEM_PROMPT = (
     "You are YPN AI, a warm and helpful assistant for Team YPN — "
     "a youth empowerment network based in Zimbabwe. "
@@ -87,7 +87,7 @@ else:
 
 # ── In-memory fallback for Redis (if Redis unavailable) ───────────────────────
 sessions: dict = {}  # Fallback only
-cache: dict = {}     # In-memory cache for repeated questions (kept as-is)
+cache: dict = {}     # In-memory cache for repeated questions
 
 # FastAPI app
 app = FastAPI()
@@ -120,7 +120,6 @@ def _get_session_from_redis(session_id: str) -> list:
     """Load session history from Redis."""
     if not redis:
         return sessions.get(session_id, [])
-    
     try:
         data = redis.get(_get_redis_key(session_id))
         return json.loads(data) if data else []
@@ -134,13 +133,12 @@ def _save_session_to_redis(session_id: str, history: list):
     if not redis:
         sessions[session_id] = history
         return
-    
     try:
         key = _get_redis_key(session_id)
         redis.set(key, json.dumps(history), ex=86400)  # 24 hours
     except Exception as e:
         logger.error(f"[redis] Error saving session: {e}")
-        sessions[session_id] = history  # Fallback to memory
+        sessions[session_id] = history
 
 
 def _get_user_name(session_id: str) -> str:
@@ -166,9 +164,17 @@ def _save_user_name(session_id: str, name: str):
         logger.error(f"[redis] Error saving name: {e}")
 
 
-# ── Supabase Helpers ──────────────────────────────────────────────────────────
-def _log_message_to_supabase(session_id: str, role: str, content: str, user_name: str = None):
-    """Persist message to Supabase (non-critical, defensive)."""
+# ── Supabase Helpers (Schema-Compatible) ──────────────────────────────────────
+def _log_message_to_supabase(session_id: str, role: str, content: str):
+    """
+    Persist message to Supabase using ONLY existing columns:
+    - user_id (TEXT)
+    - role (TEXT) 
+    - content (TEXT)
+    - created_at (auto-default, not inserted)
+    
+    Non-critical: failures are logged but don't break the chat.
+    """
     if not supabase:
         return
     
@@ -176,15 +182,17 @@ def _log_message_to_supabase(session_id: str, role: str, content: str, user_name
         supabase.table("messages").insert({
             "user_id": session_id,
             "role": role,
-            "content": content.strip(),
-            "metadata": {"user_name": user_name} if user_name else {}
+            "content": content.strip()
+            # ✅ Only these 3 columns - matches your exact schema
+            # ❌ No 'metadata', no 'created_at' (auto-handled by DB)
         }).execute()
         logger.debug(f"[supabase] Logged {role} message for session={session_id}")
     except Exception as e:
+        # Log but don't crash — chat continues with Redis only
         logger.error(f"[supabase] Insert failed (non-critical): {e}")
 
 
-# ── Helper: build messages for Cohere ─────────────────────────────────────────
+# ── Helper: Build messages for Cohere ─────────────────────────────────────────
 def build_messages(history: list, message: str) -> list:
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     msgs.extend(history)
@@ -192,7 +200,7 @@ def build_messages(history: list, message: str) -> list:
     return msgs
 
 
-# ── Helper: cache key generator ───────────────────────────────────────────────
+# ── Helper: Cache key generator ───────────────────────────────────────────────
 def cache_key(session_id: str, message: str, history: list) -> str:
     raw = session_id + message + json.dumps(history, sort_keys=True)
     return hashlib.md5(raw.encode()).hexdigest()
@@ -229,6 +237,12 @@ def extract_name_from_message(message: str) -> str:
             return name.rstrip(".,!?")
     
     return ""
+
+
+# ── Helper: Trim history ──────────────────────────────────────────────────────
+def _trim_history(history: list, limit: int = 6) -> list:
+    """Trim history to last N turns (user+assistant = 1 turn)."""
+    return history[-limit:] if len(history) > limit else history
 
 
 # ------------------- Endpoints -------------------
@@ -301,9 +315,9 @@ async def chat(req: ChatRequest):
         # Save to Redis (or memory fallback)
         _save_session_to_redis(session_id, history)
 
-        # Log to Supabase (non-critical)
-        _log_message_to_supabase(session_id, "user", message, user_name)
-        _log_message_to_supabase(session_id, "assistant", reply, user_name)
+        # Log to Supabase (non-critical, schema-compatible)
+        _log_message_to_supabase(session_id, "user", message)
+        _log_message_to_supabase(session_id, "assistant", reply)
 
         # Cache result
         cache[key] = reply
@@ -364,8 +378,8 @@ async def chat_stream(req: ChatRequest):
             _save_session_to_redis(session_id, history)
 
             # Log to Supabase (non-critical)
-            _log_message_to_supabase(session_id, "user", message, user_name)
-            _log_message_to_supabase(session_id, "assistant", full_text, user_name)
+            _log_message_to_supabase(session_id, "user", message)
+            _log_message_to_supabase(session_id, "assistant", full_text)
 
         except Exception as e:
             logger.error(f"[stream] Error: {e}")
@@ -390,18 +404,12 @@ async def clear_session(session_id: str):
     return {"cleared": session_id}
 
 
-# ── Helper: trim history ──────────────────────────────────────────────────────
-def _trim_history(history: list, limit: int = 6) -> list:
-    """Trim history to last N turns (user+assistant = 1 turn)."""
-    return history[-limit:] if len(history) > limit else history
-
-
 # ------------------- Background Tasks -------------------
 
-# Periodic cache cleanup
 async def cleanup_cache():
+    """Periodic cache cleanup every 10 minutes."""
     while True:
-        await asyncio.sleep(600)  # every 10 minutes
+        await asyncio.sleep(600)
         cache.clear()
         logger.info("🧹 In-memory cache cleared")
 
