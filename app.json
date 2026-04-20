@@ -11,8 +11,10 @@
     "android": {
       "package": "com.ypn.messenger",
       "versionCode": 1,
-      "minSdkVersion": 24,
-      "targetSdkVersion": 34,
+      "versioning": {
+        "minSdkVersion": 24,
+        "targetSdkVersion": 34
+      },
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
