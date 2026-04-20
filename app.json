@@ -2,7 +2,7 @@
   "expo": {
     "name": "YPN",
     "slug": "YPN",
-    "version": "2.0.0",
+    "version": "3.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "ypn",
