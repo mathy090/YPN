@@ -21,6 +21,41 @@
       "api_key": [
         {
           "current_key": "AIzaSyDJtU9grhwUsPruPUDEBfDvrM9GUvqdaZM"
+        },
+        {
+          "current_key": "AIzaSyCMYs93xm5yb5GXwZpNVCIpKC8mtQUJZhM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "361158718918-irp6t2ru8ahtfr0040cirpamvvl41dbb.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:361158718918:android:c78fee1a28aacdd6c6aec7",
+        "android_client_info": {
+          "package_name": "com.ypn.messenger"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "361158718918-irp6t2ru8ahtfr0040cirpamvvl41dbb.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDJtU9grhwUsPruPUDEBfDvrM9GUvqdaZM"
+        },
+        {
+          "current_key": "AIzaSyCMYs93xm5yb5GXwZpNVCIpKC8mtQUJZhM"
         }
       ],
       "services": {
