@@ -9,7 +9,8 @@
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "android": {
-      "package": "com.anonymous.YPN",
+      "package": "com.ypn.messenger",
+      "versionCode": 1,
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
@@ -31,7 +32,7 @@
       "googleServicesFile": "./google-services.json"
     },
     "ios": {
-      "bundleIdentifier": "com.anonymous.YPN",
+      "bundleIdentifier": "com.ypn.messenger",
       "infoPlist": {
         "NSMicrophoneUsageDescription": "YPN needs microphone access to record your voice messages.",
         "NSLocationWhenInUseUsageDescription": "YPN needs your location to provide local context.",
@@ -41,6 +42,12 @@
     },
     "plugins": [
       "expo-router",
+      "expo-font",
+      "expo-secure-store",
+      "expo-sqlite",
+      "expo-web-browser",
+      "expo-audio",
+      "expo-asset",
       [
         "expo-splash-screen",
         {
@@ -53,9 +60,12 @@
           }
         }
       ],
-      "expo-font",
-      "expo-secure-store",
-      "expo-sqlite",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow YPN to access your photos to update your profile picture."
+        }
+      ],
       [
         "expo-video",
         {
@@ -63,8 +73,6 @@
           "supportsPictureInPicture": true
         }
       ],
-      "expo-web-browser",
-      "expo-audio",
       [
         "expo-location",
         {
@@ -78,12 +86,10 @@
           "color": "#E6F4FE",
           "sounds": ["./assets/notification_sound.wav"]
         }
-      ],
-      "expo-asset"
+      ]
     ],
     "experiments": {
-      "typedRoutes": true,
-      "reactCompiler": true
+      "typedRoutes": true
     },
     "extra": {
       "router": {},

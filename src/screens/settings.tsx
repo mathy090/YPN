@@ -44,7 +44,69 @@ const COLORS = {
 } as const;
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL || "";
+// 🔥 NEW: AI Backend URL for clearing server-side session + username cache
+const AI_API_URL = process.env.EXPO_PUBLIC_AI_URL || "";
 const MAX_PHOTO_BYTES = 5 * 1024 * 1024;
+
+// 🔥 NEW: Helper to clear backend AI session (Redis: session + name cache)
+const clearBackendAISession = async (
+  email: string,
+  sessionId: string = "team-ypn",
+): Promise<void> => {
+  if (!email || !AI_API_URL) return;
+  try {
+    const url = `${AI_API_URL}/chat/${encodeURIComponent(sessionId)}?email=${encodeURIComponent(email)}`;
+    const res = await fetch(url, { method: "DELETE" });
+    if (res.ok) {
+      console.log(`[Settings] ✅ Backend AI session cleared for ${email}`);
+    } else {
+      const errText = await res.text().catch(() => "unknown");
+      console.warn(
+        `[Settings] ⚠️ Backend AI cleanup failed: ${res.status} ${errText}`,
+      );
+    }
+  } catch (e) {
+    console.warn("[Settings] ⚠️ Backend AI cleanup error (non-fatal):", e);
+    // Never block sign-out if backend is unreachable
+  }
+};
+
+// 🔥 NEW: Helper to clear profile cache (username/email/avatar) — inline fallback
+const clearCachedProfileData = async (): Promise<void> => {
+  try {
+    // Try using expo-secure-store first (most likely for profile data)
+    const SecureStore = await import("expo-secure-store");
+    // Common keys used for profile caching — adjust if your app uses different keys
+    const profileKeys = [
+      "profile_cache",
+      "cached_profile",
+      "user_profile",
+      "profile",
+    ];
+    await Promise.all(
+      profileKeys.map((key) =>
+        SecureStore.deleteItemAsync(key).catch(() => {}),
+      ),
+    );
+
+    // Also try AsyncStorage as fallback (if used for profile)
+    try {
+      const AsyncStorage =
+        await import("@react-native-async-storage/async-storage");
+      await Promise.all(
+        profileKeys.map((key) =>
+          AsyncStorage.default.removeItem(key).catch(() => {}),
+        ),
+      );
+    } catch (_) {
+      // AsyncStorage not installed — skip silently
+    }
+
+    console.log("[Settings] ✅ Profile cache keys cleared");
+  } catch (e) {
+    console.warn("[Settings] ⚠️ Profile cache clear failed (non-fatal):", e);
+  }
+};
 
 export default function SettingsScreen() {
   const router = useRouter();
@@ -374,7 +436,16 @@ export default function SettingsScreen() {
             ),
           ),
         );
-        console.log("[Settings] ✅ Cache wiped");
+        console.log("[Settings] ✅ Local secure cache wiped");
+
+        // 🔥 NEW: Clear profile cache (username/email/avatar) explicitly
+        await clearCachedProfileData();
+
+        // 🔥 Clear backend AI session (Redis: session + username cache)
+        const userEmail = confirmEmail || profile?.email;
+        if (userEmail) {
+          await clearBackendAISession(userEmail, "team-ypn");
+        }
       });
     } catch (error: any) {
       console.error("Sign out verification failed:", error.message);

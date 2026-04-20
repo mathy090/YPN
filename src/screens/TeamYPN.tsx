@@ -28,7 +28,12 @@ import {
 
 import { resumeOrStartAIStream } from "../errorHandlerAIchat/streamHandler";
 import { Message } from "../types/chat";
-import { getCachedProfile, getSecureCache, setSecureCache } from "../utils/cache"; // ← reads from SQLite
+import { getUserEmail } from "../utils/auth";
+import {
+  getCachedProfile,
+  getSecureCache,
+  setSecureCache,
+} from "../utils/cache"; // 🔥 Added getCachedProfile
 import { useNetworkStatus } from "../utils/network";
 import {
   clearPendingAIReply,
@@ -39,6 +44,7 @@ import {
   incrementUnreadBadge,
 } from "../utils/teamYPNBadge";
 
+// 🔥 Point to your Python FastAPI Backend
 const AI_API_URL = `${process.env.EXPO_PUBLIC_AI_URL}/chat`;
 const CACHE_KEY = "chat_team-ypn";
 const UNDO_MS = 3000;
@@ -151,36 +157,16 @@ export default function TeamYPNScreen() {
   const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const undoAnimRef = useRef<Animated.CompositeAnimation | null>(null);
 
+  // 🔥 Username state — loaded from same cache as settings.tsx
+  const [username, setUsername] = useState<string>("");
+
+  // 🔥 Message Queue System for handling rapid sends
   const messageQueueRef = useRef<string[]>([]);
   const isProcessingRef = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  // ── Cached profile ref — loaded once, reused for every message ──────────────
-  const cachedProfileRef = useRef<{
-    email: string | null;
-    username: string | null;
-  }>({ email: null, username: null });
-
   const { isConnected } = useNetworkStatus();
   const isChatOpenRef = useRef(true);
-
-  // ── Load profile from SQLite once on mount ──────────────────────────────────
-  useEffect(() => {
-    const loadProfile = async () => {
-      try {
-        const profile = await getCachedProfile();
-        if (profile) {
-          cachedProfileRef.current = {
-            email: profile.email || null,
-            username: profile.username || null,
-          };
-        }
-      } catch (e) {
-        console.warn("[TeamYPN] profile load failed:", e);
-      }
-    };
-    loadProfile();
-  }, []);
 
   useFocusEffect(
     useCallback(() => {
@@ -192,6 +178,26 @@ export default function TeamYPNScreen() {
     }, []),
   );
 
+  // 🔥 Load username from cache (same source as settings.tsx)
+  useEffect(() => {
+    let isMounted = true;
+    const loadUsername = async () => {
+      try {
+        const cached = await getCachedProfile();
+        if (isMounted && cached?.username) {
+          setUsername(cached.username);
+        }
+      } catch (e) {
+        console.warn("[TeamYPN] Username cache load:", e);
+      }
+    };
+    loadUsername();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  // 🔥 Keyboard listener to scroll to bottom when keyboard hides
   useEffect(() => {
     const keyboardDidHideListener = Keyboard.addListener(
       "keyboardDidHide",
@@ -251,24 +257,24 @@ export default function TeamYPNScreen() {
     setTimeout(() => listRef.current?.scrollToEnd({ animated }), 80);
   }, []);
 
-  // ── AI request — sends email + username from SQLite cache ───────────────────
+  // 🔥 Fetch AI Reply — now includes username for personalization
   const fetchAIReply = async (
     text: string,
     signal?: AbortSignal,
   ): Promise<string> => {
     try {
-      const { email, username } = cachedProfileRef.current;
+      const userEmail = await getUserEmail();
 
       const requestBody: {
         message: string;
-        session_id: string;
+        session_id?: string;
         email?: string;
-        username?: string;
+        username?: string; // 🔥 NEW: Send username from cache
       } = {
         message: text,
         session_id: "team-ypn",
-        ...(email ? { email } : {}),
-        ...(username ? { username } : {}),
+        email: userEmail || undefined,
+        username: username || undefined, // 🔥 Inject cached username
       };
 
       const res = await fetch(AI_API_URL, {
@@ -294,6 +300,7 @@ export default function TeamYPNScreen() {
     }
   };
 
+  // 🔥 Process a single message from the queue
   const processNextMessage = useCallback(async () => {
     if (isProcessingRef.current || messageQueueRef.current.length === 0) {
       return;
@@ -361,7 +368,7 @@ export default function TeamYPNScreen() {
         setTimeout(() => processNextMessage(), 300);
       }
     }
-  }, [scrollToBottom]);
+  }, [scrollToBottom, username]); // 🔥 Added username to dependency array
 
   const sendMessage = useCallback(
     (text: string) => {
@@ -541,6 +548,7 @@ export default function TeamYPNScreen() {
 
   return (
     <View style={s.root}>
+      {/* ── HEADER ── */}
       <BlurView
         intensity={90}
         tint="dark"
@@ -565,6 +573,7 @@ export default function TeamYPNScreen() {
         </View>
       </BlurView>
 
+      {/* ── BODY ── */}
       <KeyboardAvoidingView
         style={{ flex: 1 }}
         behavior={Platform.OS === "ios" ? "padding" : "height"}
@@ -584,6 +593,7 @@ export default function TeamYPNScreen() {
         />
         {pending && <UndoToast onUndo={handleUndo} progress={undoProgress} />}
 
+        {/* ── INPUT BAR ── */}
         <View style={s.inputBar}>
           <View style={s.inputContainer}>
             <TextInput
@@ -619,6 +629,7 @@ export default function TeamYPNScreen() {
   );
 }
 
+// ── Styles ──────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#0B141A" },
   loadingWrap: {

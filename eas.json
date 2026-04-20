@@ -20,7 +20,14 @@
     "production": {
       "autoIncrement": true,
       "android": {
-        "buildType": "app-bundle"
+        "buildType": "app-bundle",
+        "minSdkVersion": 24,
+        "targetSdkVersion": 34,
+        "image": "latest"
+      },
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://api.yourdomain.com",
+        "EXPO_PUBLIC_AI_URL": "https://ai.yourdomain.com"
       }
     }
   },
