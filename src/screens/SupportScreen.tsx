@@ -1,19 +1,19 @@
-// src/screens/SupportScreen.tsx
+// src/screens/SupportScreen.tsx (or app/support.tsx)
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import React, { useState } from "react";
 import {
-    Alert,
-    Keyboard,
-    KeyboardAvoidingView,
-    Linking,
-    Platform,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
+  Alert,
+  Keyboard,
+  KeyboardAvoidingView,
+  Linking,
+  Platform,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
@@ -50,7 +50,6 @@ export default function SupportScreen() {
     Keyboard.dismiss();
 
     try {
-      // 🔥 Frontend-only: Open mailto link with pre-filled content
       const mailtoUrl = `mailto:${SUPPORT_EMAIL}?subject=${encodeURIComponent(
         `[YPN Support] ${subject.trim()}`,
       )}&body=${encodeURIComponent(
@@ -69,7 +68,7 @@ export default function SupportScreen() {
       } else {
         Alert.alert(
           "Email Not Available",
-          "No email app found. Please contact support directly at tafadzwarunowanda@gmail.com",
+          `No email app found. Please contact support directly at ${SUPPORT_EMAIL}`,
           [{ text: "OK" }],
         );
       }
@@ -77,7 +76,7 @@ export default function SupportScreen() {
       console.error("[Support] Email error:", error);
       Alert.alert(
         "Error",
-        "Could not open email app. Please contact tafadzwarunowanda@gmail.com directly.",
+        `Could not open email app. Please contact ${SUPPORT_EMAIL} directly.`,
         [{ text: "OK" }],
       );
     } finally {
@@ -100,7 +99,7 @@ export default function SupportScreen() {
         <Text style={[styles.headerTitle, { color: COLORS.text }]}>
           Help Center
         </Text>
-        <View style={{ width: 28 }} /> {/* Spacer for alignment */}
+        <View style={{ width: 28 }} />
       </View>
 
       <ScrollView

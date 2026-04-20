@@ -1,5 +1,6 @@
 // src/store/authStore.ts
 import { router } from "expo-router";
+import * as SecureStore from "expo-secure-store"; // ✅ Add SecureStore import
 import { getAuth } from "firebase/auth";
 import { create } from "zustand";
 import {
@@ -18,16 +19,27 @@ import {
   stopBackgroundRetry,
   UIDMismatchError,
   UserData,
-  validateUIDBinding
+  validateUIDBinding,
 } from "../utils/tokenManager";
+
+// ✅ Add constant for terms agreement storage
+const TERMS_AGREED_KEY = "user.terms_agreed";
 
 interface AuthState {
   isAuthenticated: boolean;
   isChecking: boolean;
   isSessionExpired: boolean;
   user: UserData | null;
+
+  // ✅ NEW: Terms agreement state
+  hasAgreed: boolean;
+
   checkAuth: () => Promise<boolean>;
   login: (email: string, password: string) => Promise<void>;
+
+  // ✅ NEW: Terms agreement action
+  agreeToTerms: () => Promise<void>;
+
   requestSignOut: () => void;
   confirmSignOut: (
     email: string,
@@ -46,6 +58,20 @@ export const useAuth = create<AuthState>((set, get) => ({
   isChecking: true,
   isSessionExpired: false,
   user: null,
+
+  // ✅ Initialize hasAgreed from SecureStore
+  hasAgreed: false,
+
+  // ✅ Load terms agreement status on store creation
+  // Call this once when app starts (e.g., in _layout.tsx)
+  initAuth: async () => {
+    try {
+      const agreed = await SecureStore.getItemAsync(TERMS_AGREED_KEY);
+      set({ hasAgreed: agreed === "true" });
+    } catch (error) {
+      console.warn("[AuthStore] Failed to load terms agreement:", error);
+    }
+  },
 
   // ✅ Login: Firebase auth + UID binding + token exchange
   login: async (email: string, password: string) => {
@@ -85,13 +111,13 @@ export const useAuth = create<AuthState>((set, get) => ({
       const TokenResponse = await response.json();
 
       // 🔥 Save tokens with UID validation
-      await saveTokens(data, user.uid);
+      await saveTokens(TokenResponse, user.uid);
 
       set({
         isAuthenticated: true,
         isChecking: false,
         isSessionExpired: false,
-        user: data.user,
+        user: TokenResponse.user,
       });
 
       get().startHeartbeat();
@@ -105,6 +131,19 @@ export const useAuth = create<AuthState>((set, get) => ({
       }
 
       throw error;
+    }
+  },
+
+  // ✅ NEW: Save terms agreement to SecureStore
+  agreeToTerms: async () => {
+    try {
+      await SecureStore.setItemAsync(TERMS_AGREED_KEY, "true");
+      set({ hasAgreed: true });
+      console.log("[AuthStore] ✅ Terms agreement saved");
+    } catch (error) {
+      console.error("[AuthStore] Failed to save terms agreement:", error);
+      // Still update state even if storage fails (non-critical)
+      set({ hasAgreed: true });
     }
   },
 

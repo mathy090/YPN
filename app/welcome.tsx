@@ -156,7 +156,7 @@ export default function Welcome() {
                 size={18}
                 color="#1DB954"
               />
-              <Text style={s.featureText}>End-to-end encrypted</Text>
+              <Text style={s.featureText}>Ubuntu Promoted</Text>
             </View>
             <View style={s.featureRow}>
               <Ionicons name="people-outline" size={18} color="#1DB954" />
@@ -164,7 +164,9 @@ export default function Welcome() {
             </View>
             <View style={s.featureRow}>
               <Ionicons name="flash-outline" size={18} color="#1DB954" />
-              <Text style={s.featureText}>AI-powered support</Text>
+              <Text style={s.featureText}>
+                AI-powered support for research{" "}
+              </Text>
             </View>
           </View>
         </View>
