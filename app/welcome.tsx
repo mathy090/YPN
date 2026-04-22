@@ -1,4 +1,4 @@
-// app/welcome.tsx
+// app/welcome.tsx — Simplified: Just push to /auth/phone
 import { Ionicons } from "@expo/vector-icons";
 import { LinearGradient } from "expo-linear-gradient";
 import { useLocalSearchParams, useRouter } from "expo-router";
@@ -22,6 +22,7 @@ export default function Welcome() {
   const { kicked } = useLocalSearchParams<{ kicked?: string }>();
   const wasKicked = kicked === "true";
 
+  // Android back button: exit app
   useEffect(() => {
     if (Platform.OS !== "android") return;
     const sub = BackHandler.addEventListener("hardwareBackPress", () => {
@@ -31,16 +32,18 @@ export default function Welcome() {
     return () => sub.remove();
   }, []);
 
+  // ✅ SIMPLE: Agree → phone verification
   const handleAgree = async () => {
     await agreeToTerms();
-    router.replace("/auth/phone");
+    router.replace("/auth/phone"); // ← That's it.
   };
 
+  // ✅ Login → OTP screen
   const handleLogin = () => {
     router.replace("/auth/otp");
   };
 
-  // WhatsApp style — already agreed before, show sign-in view
+  // ── Already agreed: Show sign-in view ───────────────────────────────
   if (hasAgreed) {
     return (
       <View style={s.root}>
@@ -66,7 +69,6 @@ export default function Welcome() {
               <Text style={s.badgeText}>YPN MESSENGER</Text>
             </View>
 
-            {/* Kicked banner */}
             {wasKicked && (
               <View style={s.kickedBanner}>
                 <Ionicons name="shield-outline" size={16} color="#FFA500" />
@@ -119,7 +121,7 @@ export default function Welcome() {
     );
   }
 
-  // First ever open — full onboarding
+  // ── First open: Full onboarding ─────────────────────────────────────
   return (
     <View style={s.root}>
       <StatusBar style="light" />
@@ -164,9 +166,7 @@ export default function Welcome() {
             </View>
             <View style={s.featureRow}>
               <Ionicons name="flash-outline" size={18} color="#1DB954" />
-              <Text style={s.featureText}>
-                AI-powered support for research{" "}
-              </Text>
+              <Text style={s.featureText}>AI-powered support for research</Text>
             </View>
           </View>
         </View>
@@ -175,6 +175,8 @@ export default function Welcome() {
           <Text style={s.terms}>
             By continuing you accept our Privacy Policy and Terms of Service.
           </Text>
+
+          {/* ✅ MAIN ACTION: Agree & Create → /auth/phone */}
           <TouchableOpacity
             onPress={handleAgree}
             activeOpacity={0.85}
@@ -186,7 +188,7 @@ export default function Welcome() {
               start={{ x: 0, y: 0 }}
               end={{ x: 1, y: 1 }}
             >
-              <Text style={s.primaryText}>Agree &amp; Create Account</Text>
+              <Text style={s.primaryText}>Agree & Create Account</Text>
             </LinearGradient>
           </TouchableOpacity>
 
@@ -205,6 +207,7 @@ export default function Welcome() {
   );
 }
 
+// ── Styles (unchanged, just cleaned) ─────────────────────────────────
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#000" },
   safe: { flex: 1, justifyContent: "space-between" },

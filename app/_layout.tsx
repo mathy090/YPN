@@ -120,6 +120,8 @@ export default function RootLayout() {
           "/auth/phone",
           "/auth/login",
           "/auth/device",
+          "/auth/forgot-password",
+          "/auth/reset-sent",
         ];
 
         if (lastRoute && !protectedRoutes.includes(lastRoute)) {
@@ -176,7 +178,7 @@ export default function RootLayout() {
           <Stack.Screen name="TeamYPN" />
           <Stack.Screen name="settings" />
           <Stack.Screen name="chat" />
-          <Stack.Screen name="voice-call" />
+
           <Stack.Screen name="splash" />
 
           {/* ✅ NEW: Register Help Center & Legal screens */}

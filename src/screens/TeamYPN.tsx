@@ -33,7 +33,7 @@ import {
   getCachedProfile,
   getSecureCache,
   setSecureCache,
-} from "../utils/cache"; // 🔥 Added getCachedProfile
+} from "../utils/cache";
 import { useNetworkStatus } from "../utils/network";
 import {
   clearPendingAIReply,
@@ -44,7 +44,6 @@ import {
   incrementUnreadBadge,
 } from "../utils/teamYPNBadge";
 
-// 🔥 Point to your Python FastAPI Backend
 const AI_API_URL = `${process.env.EXPO_PUBLIC_AI_URL}/chat`;
 const CACHE_KEY = "chat_team-ypn";
 const UNDO_MS = 3000;
@@ -57,6 +56,7 @@ function fixStatus(msgs: unknown[]): Message[] {
   );
 }
 
+// ── Glassmorphism Typing Indicator ─────────────────────────────────────
 function TypingIndicator() {
   const dot0 = useRef(new Animated.Value(0.4)).current;
   const dot1 = useRef(new Animated.Value(0.4)).current;
@@ -89,7 +89,7 @@ function TypingIndicator() {
 
   return (
     <View style={s.typingRow}>
-      <BlurView intensity={80} tint="dark" style={s.glassBubble}>
+      <BlurView intensity={85} tint="dark" style={s.glassBubble}>
         <View style={s.dotsWrap}>
           {dots.map((d, i) => (
             <Animated.View
@@ -116,6 +116,7 @@ function TypingIndicator() {
   );
 }
 
+// ── Glassmorphism Undo Toast ───────────────────────────────────────────
 interface UndoToastProps {
   onUndo: () => void;
   progress: Animated.Value;
@@ -127,16 +128,18 @@ function UndoToast({ onUndo, progress }: UndoToastProps) {
   });
   return (
     <View style={s.toastCard}>
-      <View style={s.toastRow}>
-        <Text style={s.toastLabel}>Message deleted</Text>
-        <TouchableOpacity
-          onPress={onUndo}
-          hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
-        >
-          <Text style={s.toastUndo}>UNDO</Text>
-        </TouchableOpacity>
-      </View>
-      <Animated.View style={[s.toastBar, { width: barWidth }]} />
+      <BlurView intensity={70} tint="dark" style={s.toastGlass}>
+        <View style={s.toastRow}>
+          <Text style={s.toastLabel}>Message deleted</Text>
+          <TouchableOpacity
+            onPress={onUndo}
+            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+          >
+            <Text style={s.toastUndo}>UNDO</Text>
+          </TouchableOpacity>
+        </View>
+        <Animated.View style={[s.toastBar, { width: barWidth }]} />
+      </BlurView>
     </View>
   );
 }
@@ -157,10 +160,7 @@ export default function TeamYPNScreen() {
   const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const undoAnimRef = useRef<Animated.CompositeAnimation | null>(null);
 
-  // 🔥 Username state — loaded from same cache as settings.tsx
   const [username, setUsername] = useState<string>("");
-
-  // 🔥 Message Queue System for handling rapid sends
   const messageQueueRef = useRef<string[]>([]);
   const isProcessingRef = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -178,7 +178,6 @@ export default function TeamYPNScreen() {
     }, []),
   );
 
-  // 🔥 Load username from cache (same source as settings.tsx)
   useEffect(() => {
     let isMounted = true;
     const loadUsername = async () => {
@@ -197,7 +196,6 @@ export default function TeamYPNScreen() {
     };
   }, []);
 
-  // 🔥 Keyboard listener to scroll to bottom when keyboard hides
   useEffect(() => {
     const keyboardDidHideListener = Keyboard.addListener(
       "keyboardDidHide",
@@ -257,24 +255,22 @@ export default function TeamYPNScreen() {
     setTimeout(() => listRef.current?.scrollToEnd({ animated }), 80);
   }, []);
 
-  // 🔥 Fetch AI Reply — now includes username for personalization
   const fetchAIReply = async (
     text: string,
     signal?: AbortSignal,
   ): Promise<string> => {
     try {
       const userEmail = await getUserEmail();
-
       const requestBody: {
         message: string;
         session_id?: string;
         email?: string;
-        username?: string; // 🔥 NEW: Send username from cache
+        username?: string;
       } = {
         message: text,
         session_id: "team-ypn",
         email: userEmail || undefined,
-        username: username || undefined, // 🔥 Inject cached username
+        username: username || undefined,
       };
 
       const res = await fetch(AI_API_URL, {
@@ -300,7 +296,6 @@ export default function TeamYPNScreen() {
     }
   };
 
-  // 🔥 Process a single message from the queue
   const processNextMessage = useCallback(async () => {
     if (isProcessingRef.current || messageQueueRef.current.length === 0) {
       return;
@@ -368,7 +363,7 @@ export default function TeamYPNScreen() {
         setTimeout(() => processNextMessage(), 300);
       }
     }
-  }, [scrollToBottom, username]); // 🔥 Added username to dependency array
+  }, [scrollToBottom, username]);
 
   const sendMessage = useCallback(
     (text: string) => {
@@ -477,7 +472,9 @@ export default function TeamYPNScreen() {
       if (item.type === "header") {
         return (
           <View style={s.dateHeader}>
-            <Text style={s.dateHeaderText}>{item.text}</Text>
+            <BlurView intensity={40} tint="dark" style={s.dateHeaderGlass}>
+              <Text style={s.dateHeaderText}>{item.text}</Text>
+            </BlurView>
           </View>
         );
       }
@@ -538,7 +535,9 @@ export default function TeamYPNScreen() {
   if (loading) {
     return (
       <View style={s.loadingWrap}>
-        <ActivityIndicator size="large" color="#25D366" />
+        <BlurView intensity={60} tint="dark" style={s.loadingGlass}>
+          <ActivityIndicator size="large" color="#25D366" />
+        </BlurView>
       </View>
     );
   }
@@ -548,9 +547,14 @@ export default function TeamYPNScreen() {
 
   return (
     <View style={s.root}>
-      {/* ── HEADER ── */}
+      {/* ── DYNAMIC BACKGROUND ── */}
+      <View style={s.bgGradient} />
+      <View style={s.bgMesh1} pointerEvents="none" />
+      <View style={s.bgMesh2} pointerEvents="none" />
+
+      {/* ── GLASS HEADER ── */}
       <BlurView
-        intensity={90}
+        intensity={92}
         tint="dark"
         style={[s.header, { paddingTop: STATUS_H }]}
       >
@@ -562,10 +566,13 @@ export default function TeamYPNScreen() {
           >
             <Ionicons name="chevron-back" size={28} color="#25D366" />
           </Pressable>
-          <Image
-            source={require("../../assets/images/YPN.png")}
-            style={s.avatar}
-          />
+          <View style={s.avatarWrap}>
+            <Image
+              source={require("../../assets/images/YPN.png")}
+              style={s.avatar}
+            />
+            <View style={s.onlineDot} />
+          </View>
           <View style={s.headerTextContainer}>
             <Text style={s.headerName}>Team YPN</Text>
             <Text style={s.headerSub}>{aiTyping ? "typing..." : "Online"}</Text>
@@ -593,212 +600,382 @@ export default function TeamYPNScreen() {
         />
         {pending && <UndoToast onUndo={handleUndo} progress={undoProgress} />}
 
-        {/* ── INPUT BAR ── */}
+        {/* ── GLASS INPUT BAR ── */}
         <View style={s.inputBar}>
-          <View style={s.inputContainer}>
-            <TextInput
-              ref={inputRef}
-              value={input}
-              onChangeText={setInput}
-              placeholder="Message"
-              placeholderTextColor="#8E8E93"
-              multiline
-              maxLength={2000}
-              style={s.input}
-              blurOnSubmit={false}
-              onSubmitEditing={handleSend}
-              returnKeyType="send"
-            />
-          </View>
-          <TouchableOpacity
-            onPress={handleSend}
-            disabled={!input.trim()}
-            activeOpacity={0.78}
-            style={[s.sendBtn, !input.trim() && s.sendBtnOff]}
-          >
-            <Ionicons
-              name="send"
-              size={18}
-              color="#fff"
-              style={{ marginLeft: 2 }}
-            />
-          </TouchableOpacity>
+          <BlurView intensity={88} tint="dark" style={s.inputGlass}>
+            <View style={s.inputContainer}>
+              <TextInput
+                ref={inputRef}
+                value={input}
+                onChangeText={setInput}
+                placeholder="Message..."
+                placeholderTextColor="#8E8E93"
+                multiline
+                maxLength={2000}
+                style={s.input}
+                blurOnSubmit={false}
+                onSubmitEditing={handleSend}
+                returnKeyType="send"
+              />
+            </View>
+            <TouchableOpacity
+              onPress={handleSend}
+              disabled={!input.trim()}
+              activeOpacity={0.78}
+              style={[s.sendBtn, !input.trim() && s.sendBtnOff]}
+            >
+              <Ionicons
+                name="send"
+                size={18}
+                color="#fff"
+                style={{ marginLeft: 2 }}
+              />
+            </TouchableOpacity>
+          </BlurView>
         </View>
       </KeyboardAvoidingView>
     </View>
   );
 }
 
-// ── Styles ──────────────────────────────────────────────────────────────────
+// ── GLASSMORPHISM STYLES ───────────────────────────────────────────────
 const s = StyleSheet.create({
-  root: { flex: 1, backgroundColor: "#0B141A" },
+  root: {
+    flex: 1,
+    backgroundColor: "#0B141A",
+    overflow: "hidden",
+  },
+
+  // Dynamic Background Layers
+  bgGradient: {
+    position: "absolute",
+    inset: 0,
+    backgroundColor: "#0B141A",
+  },
+  bgMesh1: {
+    position: "absolute",
+    width: 400,
+    height: 400,
+    borderRadius: 200,
+    backgroundColor: "rgba(37, 211, 102, 0.08)",
+    top: -100,
+    right: -100,
+  },
+  bgMesh2: {
+    position: "absolute",
+    width: 300,
+    height: 300,
+    borderRadius: 150,
+    backgroundColor: "rgba(83, 189, 235, 0.06)",
+    bottom: -50,
+    left: -50,
+  },
+
   loadingWrap: {
     flex: 1,
     justifyContent: "center",
     alignItems: "center",
     backgroundColor: "#0B141A",
   },
+  loadingGlass: {
+    padding: 24,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.1)",
+  },
+
+  // Glass Header
   header: {
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "#1F2C34",
+    borderBottomColor: "rgba(255,255,255,0.08)",
     zIndex: 10,
     overflow: "hidden",
-    backgroundColor: "#111B21",
+    backgroundColor: "transparent",
   },
   headerContent: {
     flexDirection: "row",
     alignItems: "center",
-    paddingHorizontal: 16,
-    paddingVertical: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
     height: 60,
   },
-  backBtn: { marginRight: 8 },
-  avatar: { width: 36, height: 36, borderRadius: 18, marginRight: 10 },
-  headerTextContainer: { flex: 1, justifyContent: "center" },
+  backBtn: {
+    marginRight: 4,
+    padding: 6,
+  },
+  avatarWrap: {
+    position: "relative",
+    marginRight: 10,
+  },
+  avatar: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    borderWidth: 2,
+    borderColor: "rgba(255,255,255,0.15)",
+  },
+  onlineDot: {
+    position: "absolute",
+    bottom: 2,
+    right: 2,
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: "#25D366",
+    borderWidth: 2,
+    borderColor: "#0B141A",
+  },
+  headerTextContainer: {
+    flex: 1,
+    justifyContent: "center",
+    marginRight: 8,
+  },
   headerName: {
     color: "#fff",
     fontSize: 17,
     fontWeight: "600",
     letterSpacing: 0.3,
   },
-  headerSub: { color: "#8696A0", fontSize: 12, marginTop: 1 },
-  listContent: { paddingHorizontal: 16, paddingTop: 10, paddingBottom: 10 },
+  headerSub: {
+    color: "#8696A0",
+    fontSize: 12,
+    marginTop: 1,
+    fontWeight: "400",
+  },
+
+  // Messages List
+  listContent: {
+    paddingHorizontal: 14,
+    paddingTop: 12,
+    paddingBottom: 12,
+  },
+
+  // Glass Date Header
   dateHeader: {
     alignSelf: "center",
-    backgroundColor: "rgba(32,44,51,0.9)",
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 4,
-    marginVertical: 12,
+    marginVertical: 14,
   },
-  dateHeaderText: { color: "#8696A0", fontSize: 11, fontWeight: "500" },
-  row: { marginVertical: 2, flexDirection: "row", maxWidth: "85%" },
-  rowUser: { justifyContent: "flex-end", alignSelf: "flex-end" },
-  rowAI: { justifyContent: "flex-start", alignSelf: "flex-start" },
+  dateHeaderGlass: {
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 5,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
+  },
+  dateHeaderText: {
+    color: "#8696A0",
+    fontSize: 11,
+    fontWeight: "500",
+    letterSpacing: 0.3,
+  },
+
+  // Message Rows & Bubbles
+  row: {
+    marginVertical: 3,
+    flexDirection: "row",
+    maxWidth: "82%",
+  },
+  rowUser: {
+    justifyContent: "flex-end",
+    alignSelf: "flex-end",
+  },
+  rowAI: {
+    justifyContent: "flex-start",
+    alignSelf: "flex-start",
+  },
   bubble: {
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 8,
-    minWidth: 60,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 18,
+    minWidth: 64,
+    borderWidth: 1,
   },
   userBubble: {
-    backgroundColor: "#005C4B",
-    borderTopLeftRadius: 8,
-    borderTopRightRadius: 8,
-    borderBottomLeftRadius: 8,
-    borderBottomRightRadius: 2,
+    backgroundColor: "rgba(37, 211, 102, 0.18)",
+    borderColor: "rgba(37, 211, 102, 0.35)",
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    borderBottomLeftRadius: 18,
+    borderBottomRightRadius: 6,
+    shadowColor: "#25D366",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.15,
+    shadowRadius: 8,
+    elevation: 3,
   },
   aiBubble: {
-    backgroundColor: "#202C33",
-    borderTopLeftRadius: 8,
-    borderTopRightRadius: 8,
-    borderBottomLeftRadius: 2,
-    borderBottomRightRadius: 8,
+    backgroundColor: "rgba(32, 44, 51, 0.75)",
+    borderColor: "rgba(255,255,255,0.12)",
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    borderBottomLeftRadius: 6,
+    borderBottomRightRadius: 18,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 2,
   },
   msgText: {
     color: "#E9EDEF",
-    fontSize: 16.5,
-    lineHeight: 21,
-    letterSpacing: 0.1,
+    fontSize: 16,
+    lineHeight: 22,
+    letterSpacing: 0.15,
   },
-  msgTextUser: { color: "#E9EDEF" },
+  msgTextUser: {
+    color: "#E9EDEF",
+    fontWeight: "400",
+  },
   metaRow: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "flex-end",
-    marginTop: 2,
-    marginBottom: -2,
-    gap: 4,
+    marginTop: 3,
+    marginBottom: -3,
+    gap: 5,
     alignSelf: "flex-end",
   },
-  timeText: { color: "rgba(255,255,255,0.6)", fontSize: 11 },
-  timeUser: { color: "rgba(255,255,255,0.7)" },
-  retryRow: { flexDirection: "row", alignItems: "center", gap: 3 },
-  retryTxt: { color: "#FF453A", fontSize: 11, fontWeight: "600" },
+  timeText: {
+    color: "rgba(255,255,255,0.55)",
+    fontSize: 11,
+    fontWeight: "400",
+  },
+  timeUser: {
+    color: "rgba(255,255,255,0.65)",
+  },
+  retryRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 3,
+    marginLeft: 4,
+  },
+  retryTxt: {
+    color: "#FF453A",
+    fontSize: 11,
+    fontWeight: "600",
+  },
+
+  // Glass Typing Indicator
   typingRow: {
     flexDirection: "row",
-    paddingHorizontal: 16,
-    marginVertical: 4,
+    paddingHorizontal: 14,
+    marginVertical: 6,
     alignSelf: "flex-start",
   },
   glassBubble: {
-    borderRadius: 16,
+    borderRadius: 18,
     overflow: "hidden",
-    borderBottomLeftRadius: 4,
+    borderBottomLeftRadius: 6,
     borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.1)",
-    backgroundColor: "#202C33",
+    borderColor: "rgba(255,255,255,0.12)",
+    backgroundColor: "rgba(32, 44, 51, 0.7)",
   },
   dotsWrap: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 4,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
+    gap: 5,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
   },
-  dot: { width: 6, height: 6, borderRadius: 3, backgroundColor: "#8696A0" },
+  dot: {
+    width: 7,
+    height: 7,
+    borderRadius: 3.5,
+    backgroundColor: "#8696A0",
+  },
+
+  // Glass Undo Toast
   toastCard: {
     position: "absolute",
-    bottom: 70,
-    left: 16,
-    right: 16,
-    borderRadius: 12,
+    bottom: 85,
+    left: 18,
+    right: 18,
+    borderRadius: 14,
     overflow: "hidden",
-    backgroundColor: "#2C2C2E",
-    borderWidth: 1,
-    borderColor: "#3A3A3C",
     zIndex: 100,
+  },
+  toastGlass: {
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.15)",
   },
   toastRow: {
     flexDirection: "row",
     alignItems: "center",
-    paddingHorizontal: 16,
-    paddingVertical: 12,
+    paddingHorizontal: 18,
+    paddingVertical: 14,
   },
-  toastLabel: { color: "#fff", fontSize: 15, flex: 1, fontWeight: "500" },
-  toastUndo: { color: "#25D366", fontSize: 15, fontWeight: "600" },
-  toastBar: { height: 3, backgroundColor: "#25D366" },
+  toastLabel: {
+    color: "#fff",
+    fontSize: 15,
+    flex: 1,
+    fontWeight: "500",
+  },
+  toastUndo: {
+    color: "#25D366",
+    fontSize: 15,
+    fontWeight: "700",
+    paddingHorizontal: 8,
+  },
+  toastBar: {
+    height: 3,
+    backgroundColor: "#25D366",
+  },
+
+  // Glass Input Bar
   inputBar: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    backgroundColor: "transparent",
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: "rgba(255,255,255,0.06)",
+  },
+  inputGlass: {
     flexDirection: "row",
     alignItems: "flex-end",
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    backgroundColor: "#111B21",
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: "rgba(255,255,255,0.08)",
-    gap: 10,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.15)",
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    gap: 8,
+    backgroundColor: "rgba(26, 38, 45, 0.85)",
   },
   inputContainer: {
     flex: 1,
-    backgroundColor: "#2A3942",
-    borderRadius: 20,
-    borderWidth: 1,
-    borderColor: "#2A3942",
-    minHeight: 36,
-    maxHeight: 100,
+    minHeight: 38,
+    maxHeight: 110,
     justifyContent: "center",
-    paddingHorizontal: 12,
-    paddingVertical: 6,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
   },
   input: {
     color: "#fff",
     fontSize: 16,
-    lineHeight: 20,
-    maxHeight: 90,
+    lineHeight: 22,
+    maxHeight: 95,
     textAlignVertical: "center",
+    fontWeight: "400",
   },
   sendBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
     backgroundColor: "#25D366",
     justifyContent: "center",
     alignItems: "center",
-    marginBottom: 4,
+    marginBottom: 2,
+    shadowColor: "#25D366",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 10,
+    elevation: 5,
   },
   sendBtnOff: {
-    backgroundColor: "#1F2C34",
+    backgroundColor: "rgba(255,255,255,0.12)",
     borderWidth: 1,
-    borderColor: "#333",
+    borderColor: "rgba(255,255,255,0.15)",
+    shadowColor: "transparent",
+    elevation: 0,
   },
 });

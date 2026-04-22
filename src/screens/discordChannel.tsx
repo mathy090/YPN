@@ -26,7 +26,7 @@ import {
   deleteMessageLocally,
   getCachedMessages,
   initChatDB,
-  type CachedMessage
+  type CachedMessage,
 } from "../utils/chatCache";
 import {
   getChatProfile,
