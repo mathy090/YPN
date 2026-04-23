@@ -7,11 +7,10 @@ const { getChannels, getChannel } = require("../models/DiscordChannels");
 
 const router = express.Router();
 
-// ✅ Configure multer to store in memory (for Supabase upload)
 const upload = multer({
   limits: { fileSize: 30 * 1024 * 1024 }, // 30MB
   storage: multer.memoryStorage(),
-  fileFilter: (req, file, cb) => {
+  fileFilter: (_req, file, cb) => {
     if (
       file.mimetype.startsWith("image/") ||
       file.mimetype.startsWith("video/") ||
@@ -26,9 +25,7 @@ const upload = multer({
 
 const getSupabase = (req) => req.app.get("supabase");
 
-// ────────────────────────────────────────────────────────────────────────────
-// GET /api/discord/channels
-// ────────────────────────────────────────────────────────────────────────────
+// ── GET /api/discord/channels ────────────────────────────────────────────────
 router.get("/channels", async (_req, res) => {
   try {
     const channels = await getChannels();
@@ -39,9 +36,7 @@ router.get("/channels", async (_req, res) => {
   }
 });
 
-// ────────────────────────────────────────────────────────────────────────────
-// GET /api/discord/channels/:id
-// ────────────────────────────────────────────────────────────────────────────
+// ── GET /api/discord/channels/:id ────────────────────────────────────────────
 router.get("/channels/:id", async (req, res) => {
   try {
     const channel = await getChannel(req.params.id);
@@ -53,20 +48,18 @@ router.get("/channels/:id", async (req, res) => {
   }
 });
 
-// ────────────────────────────────────────────────────────────────────────────
-// GET /api/discord/profile/:uid - PUBLIC
-// ────────────────────────────────────────────────────────────────────────────
+// ── GET /api/discord/profile/:uid ────────────────────────────────────────────
 router.get("/profile/:uid", async (req, res) => {
   try {
     const { uid } = req.params;
-    if (!uid)
+    if (!uid) {
       return res
         .status(400)
         .json({ message: "UID required", code: "MISSING_UID" });
+    }
 
     const db = req.app.get("db");
     if (!db) {
-      console.error("[Discord] MongoDB not available");
       return res
         .status(500)
         .json({ message: "Database unavailable", code: "DB_ERROR" });
@@ -79,10 +72,11 @@ router.get("/profile/:uid", async (req, res) => {
         { projection: { _id: 0, uid: 1, username: 1, avatarUrl: 1 } },
       );
 
-    if (!user)
+    if (!user) {
       return res
         .status(404)
         .json({ message: "User not found", code: "USER_NOT_FOUND" });
+    }
 
     res.json({
       uid: user.uid,
@@ -97,9 +91,7 @@ router.get("/profile/:uid", async (req, res) => {
   }
 });
 
-// ────────────────────────────────────────────────────────────────────────────
-// POST /api/discord/messages - PUBLIC
-// ────────────────────────────────────────────────────────────────────────────
+// ── POST /api/discord/messages ───────────────────────────────────────────────
 router.post("/messages", async (req, res) => {
   const supabase = getSupabase(req);
   if (!supabase) {
@@ -114,20 +106,23 @@ router.post("/messages", async (req, res) => {
   const { channelId, username, avatarUrl, content, mediaType, mediaUrl } =
     req.body;
 
-  if (!channelId)
+  if (!channelId) {
     return res
       .status(400)
       .json({ message: "channelId required", code: "MISSING_CHANNEL" });
-  if (!content && !mediaUrl)
+  }
+  if (!content && !mediaUrl) {
     return res
       .status(400)
       .json({
         message: "Message must contain text or media",
         code: "EMPTY_MESSAGE",
       });
+  }
 
   const cleanUsername = (username || "Guest").trim().slice(0, 30);
-  const senderId = `user_${cleanUsername.toLowerCase().replace(/[^a-z0-9]/g, "_")}`;
+  // Use username as sender_id so isMe checks work reliably on the frontend
+  const senderId = cleanUsername.toLowerCase().replace(/[^a-z0-9_]/g, "_");
 
   try {
     const { data, error } = await supabase
@@ -136,6 +131,7 @@ router.post("/messages", async (req, res) => {
         {
           channel_id: channelId,
           sender_id: senderId,
+          username: cleanUsername, // ✅ Store username in DB
           content: content || null,
           media_type: mediaType || null,
           media_url: mediaUrl || null,
@@ -150,6 +146,7 @@ router.post("/messages", async (req, res) => {
       console.error("[Supabase] Insert error:", error);
       throw error;
     }
+
     res.status(201).json({ ...data, username: cleanUsername });
   } catch (err) {
     console.error("[Discord] POST message error:", err);
@@ -159,9 +156,8 @@ router.post("/messages", async (req, res) => {
   }
 });
 
-// ────────────────────────────────────────────────────────────────────────────
-// GET /api/discord/messages/:channelId - PUBLIC
-// ────────────────────────────────────────────────────────────────────────────
+// ── GET /api/discord/messages/:channelId ─────────────────────────────────────
+// ✅ FIX: Was destructuring { messages, error } — Supabase returns { data, error }
 router.get("/messages/:channelId", async (req, res) => {
   const supabase = getSupabase(req);
   if (!supabase) {
@@ -176,10 +172,11 @@ router.get("/messages/:channelId", async (req, res) => {
   const { channelId } = req.params;
   const { after, before, limit = 50 } = req.query;
 
-  if (!channelId)
+  if (!channelId) {
     return res
       .status(400)
       .json({ message: "channelId required", code: "MISSING_CHANNEL" });
+  }
 
   try {
     let query = supabase
@@ -200,10 +197,13 @@ router.get("/messages/:channelId", async (req, res) => {
       query = query.order("created_at", { ascending: true });
     }
 
-    const { messages, error } = await query;
+    // ✅ FIXED: was { messages, error } — Supabase always returns { data, error }
+    const { data, error } = await query;
+
     if (error) throw error;
 
-    const enriched = (messages || []).map((msg) => ({
+    // Normalize username field for frontend display
+    const enriched = (data || []).map((msg) => ({
       ...msg,
       username:
         msg.username ||
@@ -220,9 +220,7 @@ router.get("/messages/:channelId", async (req, res) => {
   }
 });
 
-// ────────────────────────────────────────────────────────────────────────────
-// DELETE /api/discord/messages/:messageId - PUBLIC
-// ────────────────────────────────────────────────────────────────────────────
+// ── DELETE /api/discord/messages/:messageId ───────────────────────────────────
 router.delete("/messages/:messageId", async (req, res) => {
   const supabase = getSupabase(req);
   if (!supabase) {
@@ -235,17 +233,18 @@ router.delete("/messages/:messageId", async (req, res) => {
   }
 
   const { messageId } = req.params;
-  if (!messageId)
+  if (!messageId) {
     return res
       .status(400)
       .json({ message: "messageId required", code: "MISSING_ID" });
+  }
 
   try {
-    const { error: delErr } = await supabase
+    const { error } = await supabase
       .from("messages")
       .delete()
       .eq("id", messageId);
-    if (delErr) throw delErr;
+    if (error) throw error;
     res.json({ success: true });
   } catch (err) {
     console.error("[Discord] DELETE error:", err);
@@ -255,14 +254,10 @@ router.delete("/messages/:messageId", async (req, res) => {
   }
 });
 
-// ────────────────────────────────────────────────────────────────────────────
-// POST /api/discord/upload-media - PUBLIC (FIXED)
-// ────────────────────────────────────────────────────────────────────────────
+// ── POST /api/discord/upload-media ────────────────────────────────────────────
 router.post("/upload-media", upload.single("file"), async (req, res) => {
   const supabase = getSupabase(req);
-
   if (!supabase) {
-    console.error("[Upload] Supabase client not available");
     return res
       .status(503)
       .json({
@@ -270,30 +265,19 @@ router.post("/upload-media", upload.single("file"), async (req, res) => {
         code: "SUPABASE_UNAVAILABLE",
       });
   }
-
   if (!req.file) {
-    console.error("[Upload] No file in request");
     return res
       .status(400)
       .json({ message: "No file provided", code: "NO_FILE" });
   }
 
   try {
-    console.log("[Upload] File received:", {
-      originalname: req.file.originalname,
-      mimetype: req.file.mimetype,
-      size: req.file.size,
-      buffer: req.file.buffer ? `${req.file.buffer.length} bytes` : "no buffer",
-    });
-
     const fileName = `media_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const fileExt =
       req.file.originalname.split(".").pop() ||
       req.file.mimetype.split("/")[1] ||
       "bin";
     const fullFileName = `${fileName}.${fileExt}`;
-
-    console.log("[Upload] Uploading to Supabase:", fullFileName);
 
     const { data, error } = await supabase.storage
       .from("media")
@@ -303,22 +287,12 @@ router.post("/upload-media", upload.single("file"), async (req, res) => {
         upsert: false,
       });
 
-    if (error) {
-      console.error("[Supabase] Upload error:", error);
-      throw error;
-    }
+    if (error) throw error;
 
-    console.log("[Upload] Supabase upload success:", data);
-
-    // ✅ FIXED: Correct destructuring
     const { data: urlData } = supabase.storage
       .from("media")
       .getPublicUrl(fullFileName);
-
-    if (!urlData || !urlData.publicUrl) {
-      console.error("[Upload] No public URL returned:", urlData);
-      throw new Error("Failed to get public URL");
-    }
+    if (!urlData?.publicUrl) throw new Error("Failed to get public URL");
 
     const type = req.file.mimetype.startsWith("image")
       ? "image"
@@ -326,16 +300,10 @@ router.post("/upload-media", upload.single("file"), async (req, res) => {
         ? "video"
         : "audio";
 
-    console.log("[Upload] Success:", { url: urlData.publicUrl, type });
-
     res.json({ url: urlData.publicUrl, type });
   } catch (err) {
     console.error("[Discord] Upload error:", err);
-    res.status(500).json({
-      message: "Upload failed",
-      code: "UPLOAD_FAILED",
-      error: process.env.NODE_ENV === "development" ? err.message : undefined,
-    });
+    res.status(500).json({ message: "Upload failed", code: "UPLOAD_FAILED" });
   }
 });
 

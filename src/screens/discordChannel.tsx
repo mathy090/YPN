@@ -1,7 +1,14 @@
 // src/screens/discordChannel.tsx
+//
+// Key fixes:
+// 1. Profile loaded from SecureStore (app.user_data) first — always available after login
+// 2. API profile fetch runs in background only — never blocks UI
+// 3. isMe check uses username string comparison — consistent with DB
+// 4. Send button enabled as soon as local profile resolves (instant)
+
 import { Ionicons } from "@expo/vector-icons";
 import NetInfo from "@react-native-community/netinfo";
-import { useFocusEffect, useNavigation } from "@react-navigation/native";
+import { useFocusEffect } from "@react-navigation/native";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -9,7 +16,7 @@ import {
   Alert,
   BackHandler,
   FlatList,
-  Image, // ✅ IMPORTED Image for user icons
+  Image,
   KeyboardAvoidingView,
   Platform,
   StyleSheet,
@@ -31,20 +38,20 @@ import {
 import {
   getChatProfile,
   getStoredUid,
+  getStoredUserData,
   type ChatProfile,
 } from "../utils/chatProfile";
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL;
-const MAX_RETRIES = 3;
 
 type Message = CachedMessage & {
   localId?: string;
   failed?: boolean;
+  isMe?: boolean;
 };
 
 export default function DiscordChannelScreen() {
   const router = useRouter();
-  const navigation = useNavigation();
   const insets = useSafeAreaInsets();
 
   const {
@@ -65,97 +72,115 @@ export default function DiscordChannelScreen() {
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
-  const [sending, setSending] = useState(false);
   const [loading, setLoading] = useState(true);
   const [isOnline, setIsOnline] = useState(true);
   const [chatProfile, setChatProfile] = useState<ChatProfile | null>(null);
 
   const listRef = useRef<FlatList>(null);
 
-  // Load profile
+  // ── Step 1: Load profile from SecureStore FIRST (instant, no network)
+  // Then optionally refresh from API in the background
   useEffect(() => {
     const loadProfile = async () => {
-      const uid = await getStoredUid();
-      if (!uid) {
+      // Try SecureStore (always available after login)
+      const stored = await getStoredUserData();
+      if (stored?.uid && stored?.username) {
+        setChatProfile({
+          uid: stored.uid,
+          username: stored.username,
+          avatarUrl: stored.avatarUrl || null,
+        });
         setLoading(false);
+
+        // Background refresh from API (non-blocking)
+        const uid = stored.uid;
+        getChatProfile(uid, false)
+          .then((fresh) => {
+            if (fresh) setChatProfile(fresh);
+          })
+          .catch(() => {
+            // Non-fatal — keep using SecureStore data
+          });
+
         return;
       }
-      const profile = await getChatProfile(uid);
-      if (profile) setChatProfile(profile);
+
+      // Fallback: try API
+      const uid = await getStoredUid();
+      if (uid) {
+        const profile = await getChatProfile(uid).catch(() => null);
+        if (profile) setChatProfile(profile);
+      }
       setLoading(false);
     };
+
     loadProfile();
   }, []);
 
-  // Init DB & NetInfo
+  // ── Network status
   useEffect(() => {
-    const setup = async () => {
-      await initChatDB();
-      const unsubscribe = NetInfo.addEventListener((state) => {
-        setIsOnline(!!state.isConnected);
-      });
-      return () => unsubscribe();
-    };
-    setup();
+    const unsubscribe = NetInfo.addEventListener((state) => {
+      setIsOnline(!!state.isConnected);
+    });
+    return () => unsubscribe();
   }, []);
 
-  // Load cached messages
+  // ── Init DB + load cached messages
   useEffect(() => {
     if (!channelId) return;
-    loadCachedMessages();
+    const setup = async () => {
+      await initChatDB();
+      await loadCachedMessages();
+    };
+    setup();
   }, [channelId]);
 
   const loadCachedMessages = async () => {
     try {
       const cached = await getCachedMessages(channelId);
-      // ✅ FIX: Filter out deleted messages and correctly flag 'isMe' using username
-      const visible = cached
-        .filter((m) => m.is_deleted_local !== 1)
-        .map((m) => ({
-          ...m,
-          isMe: m.username === chatProfile?.username,
-        }));
+      const visible = cached.filter((m) => m.is_deleted_local !== 1);
       setMessages(visible);
-      setLoading(false);
       setTimeout(() => listRef.current?.scrollToEnd({ animated: false }), 50);
-      if (isOnline) fetchNewMessages();
+      if (isOnline) fetchNewMessages(visible);
     } catch {
-      setLoading(false);
+      // ignore
     }
   };
 
-  // 📡 Incremental sync
-  const fetchNewMessages = async () => {
+  // ── Fetch new messages from server (incremental)
+  const fetchNewMessages = async (currentMessages?: Message[]) => {
     if (!channelId || !isOnline) return;
     try {
-      const lastMsg = messages[messages.length - 1];
-      const after = lastMsg?.created_at || undefined;
+      const msgs = currentMessages ?? messages;
+      const lastMsg = msgs[msgs.length - 1];
       const url = new URL(`${API_URL}/api/discord/messages/${channelId}`);
-      if (after) url.searchParams.append("after", after);
+      if (lastMsg?.created_at)
+        url.searchParams.append("after", lastMsg.created_at);
+
       const res = await fetch(url.toString());
       if (!res.ok) return;
+
       const newMsgs: CachedMessage[] = await res.json();
-      if (newMsgs.length === 0) return;
+      if (!newMsgs.length) return;
 
       setMessages((prev) => {
         const ids = new Set(prev.map((m) => m.id));
-        // ✅ FIX: Map 'isMe' using username to ensure alignment is correct
-        const unique = newMsgs
-          .filter((m) => !ids.has(m.id) && m.is_deleted_local !== 1)
-          .map((m) => ({ ...m, isMe: m.username === chatProfile?.username }));
+        const unique = newMsgs.filter(
+          (m) => !ids.has(m.id) && m.is_deleted_local !== 1,
+        );
         return [...prev, ...unique].slice(-200);
       });
 
       const toCache = newMsgs.filter((m) => m.is_deleted_local !== 1);
       if (toCache.length > 0) await cacheMessages(channelId, toCache);
     } catch (e) {
-      console.warn("[Sync] Failed:", e);
+      console.warn("[Discord] Sync failed:", e);
     }
   };
 
-  // 🔄 Pull-to-refresh older
+  // ── Pull-to-refresh older messages
   const fetchOlderMessages = async () => {
-    if (!channelId || !isOnline || loading || messages.length === 0) return;
+    if (!channelId || !isOnline || messages.length === 0) return;
     try {
       const oldest = messages[0].created_at;
       const res = await fetch(
@@ -163,20 +188,12 @@ export default function DiscordChannelScreen() {
       );
       if (!res.ok) return;
       const older: CachedMessage[] = await res.json();
-      if (older.length === 0) return;
-
       const visible = older.filter((m) => m.is_deleted_local !== 1);
-      if (visible.length === 0) return;
-
-      // ✅ FIX: Map 'isMe' using username
-      const mapped = visible.map((m) => ({
-        ...m,
-        isMe: m.username === chatProfile?.username,
-      }));
-      setMessages((prev) => [...mapped, ...prev]);
+      if (!visible.length) return;
+      setMessages((prev) => [...visible, ...prev]);
       await cacheMessages(channelId, visible);
     } catch (e) {
-      console.warn("[Older] Error:", e);
+      console.warn("[Discord] Older messages error:", e);
     }
   };
 
@@ -185,6 +202,7 @@ export default function DiscordChannelScreen() {
       fetchNewMessages();
     }, [channelId, isOnline]),
   );
+
   useFocusEffect(
     useCallback(() => {
       const onBack = () => {
@@ -197,47 +215,44 @@ export default function DiscordChannelScreen() {
   );
 
   useEffect(() => {
-    if (messages.length > 0)
+    if (messages.length > 0) {
       setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 100);
+    }
   }, [messages]);
 
-  // 📝 Send text (INSTANT button reset)
+  // ── Send message
   const sendTextMessage = async () => {
     const text = input.trim();
-    if (!text || sending || !channelId || !chatProfile) return;
+    if (!text || !channelId || !chatProfile) return;
 
     const localId = `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const msg: CachedMessage = {
       id: localId,
       channel_id: channelId,
-      sender_id: chatProfile.uid,
+      sender_id: chatProfile.username.toLowerCase().replace(/[^a-z0-9_]/g, "_"),
       content: text,
       media_type: null,
       media_url: null,
       username: chatProfile.username,
-      avatar_url: chatProfile.avatarUrl, // ✅ Ensure avatar_url is sent
+      avatar_url: chatProfile.avatarUrl,
       created_at: new Date().toISOString(),
       is_optimistic: 1,
       is_deleted_local: 0,
     };
 
-    // ✅ Clear input and reset button IMMEDIATELY
+    // Clear input immediately — don't wait for network
     setInput("");
-    setSending(false);
 
-    // Add to UI optimistically (force isMe: true for instant display)
     await addOptimisticMessage(msg);
     setMessages((prev) => [
       ...prev,
       { ...msg, localId, failed: false, isMe: true },
     ]);
 
-    // Send in background
-    sendMessageWithRetry(msg, localId);
+    sendMessageToServer(msg, localId);
   };
 
-  // 🔄 Send with manual retry only (runs in background)
-  const sendMessageWithRetry = async (msg: CachedMessage, localId: string) => {
+  const sendMessageToServer = async (msg: CachedMessage, localId: string) => {
     try {
       const res = await fetch(`${API_URL}/api/discord/messages`, {
         method: "POST",
@@ -245,26 +260,24 @@ export default function DiscordChannelScreen() {
         body: JSON.stringify({
           channelId: msg.channel_id,
           username: msg.username,
-          avatarUrl: msg.avatar_url, // ✅ Pass avatar to backend
+          avatarUrl: msg.avatar_url,
           content: msg.content,
         }),
       });
+
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
       const serverMsg = await res.json();
       await confirmMessage(serverMsg.id, localId);
+
       setMessages((prev) =>
         prev.map((m) =>
           m.localId === localId || m.id === localId
-            ? // ✅ FIX: Recalculate isMe based on server response username
-              {
-                ...serverMsg,
-                localId: undefined,
-                isMe: serverMsg.username === chatProfile?.username,
-              }
+            ? { ...serverMsg, localId: undefined, failed: false, isMe: true }
             : m,
         ),
       );
-    } catch (e: any) {
+    } catch (e) {
       setMessages((prev) =>
         prev.map((m) =>
           m.localId === localId || m.id === localId
@@ -275,7 +288,6 @@ export default function DiscordChannelScreen() {
     }
   };
 
-  // ✅ Retry failed messages (manual tap only)
   const retryMessage = (msg: Message) => {
     if (!msg.failed) return;
     setMessages((prev) =>
@@ -283,18 +295,18 @@ export default function DiscordChannelScreen() {
         m.id === msg.id || m.localId === msg.id ? { ...m, failed: false } : m,
       ),
     );
-    sendMessageWithRetry(msg, msg.id || msg.localId!);
+    sendMessageToServer(msg, msg.localId ?? msg.id);
   };
 
-  // 🗑️ Smart Delete: Yours = backend + local, Others = local only
+  // ── Delete message
   const handleLongPress = (msg: Message) => {
-    const isMyMessage = msg.username === chatProfile?.username;
+    const isMyMessage = msg.username === chatProfile?.username || msg.isMe;
 
     Alert.alert(
       "Delete Message",
       isMyMessage
         ? "Delete for everyone or just for you?"
-        : "Hide this message just for you?",
+        : "Hide this message?",
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -317,21 +329,24 @@ export default function DiscordChannelScreen() {
             }
           },
         },
-        isMyMessage && {
-          text: "Hide for Me Only",
-          onPress: async () => {
-            await deleteMessageLocally(msg.id);
-            setMessages((prev) => prev.filter((m) => m.id !== msg.id));
-          },
-        },
-      ].filter(Boolean) as any[],
+        ...(isMyMessage
+          ? [
+              {
+                text: "Hide for Me Only",
+                onPress: async () => {
+                  await deleteMessageLocally(msg.id);
+                  setMessages((prev) => prev.filter((m) => m.id !== msg.id));
+                },
+              },
+            ]
+          : []),
+      ],
     );
   };
 
-  // 🎨 Render Message (Fixed alignment + Avatar Import)
+  // ── Render single message
   const renderMessage = ({ item }: { item: Message }) => {
-    // ✅ FIX: Reliable 'isMe' check using username
-    const isMe = item.username === chatProfile?.username || item.isMe === true;
+    const isMe = item.isMe === true || item.username === chatProfile?.username;
     const time = new Date(item.created_at).toLocaleTimeString([], {
       hour: "2-digit",
       minute: "2-digit",
@@ -344,17 +359,15 @@ export default function DiscordChannelScreen() {
         delayLongPress={300}
         activeOpacity={0.9}
       >
-        {/* ✅ FIX: Avatar for OTHER users only */}
+        {/* Avatar — only for other users */}
         {!isMe &&
           (item.avatar_url ? (
-            // ✅ Show actual user icon if available
             <Image
               source={{ uri: item.avatar_url }}
               style={bS.avatar}
               resizeMode="cover"
             />
           ) : (
-            // ✅ Fallback to colored circle with initial
             <View
               style={[
                 bS.avatar,
@@ -374,12 +387,11 @@ export default function DiscordChannelScreen() {
             isMe ? [bS.bubbleMe, { backgroundColor: color }] : bS.bubbleThem,
           ]}
         >
-          {/* ✅ FIX: Username for OTHER users only */}
           {!isMe && item.username && (
             <Text style={[bS.senderName, { color }]}>{item.username}</Text>
           )}
 
-          {item.content && (
+          {item.content ? (
             <Text
               style={[
                 bS.text,
@@ -388,22 +400,15 @@ export default function DiscordChannelScreen() {
             >
               {item.content}
             </Text>
-          )}
+          ) : null}
 
-          {/* Failed indicator */}
           {item.failed && (
             <TouchableOpacity
               onPress={() => retryMessage(item)}
-              activeOpacity={0.6}
-              style={{ marginTop: 4, alignSelf: "flex-end" }}
+              style={{ marginTop: 4 }}
             >
               <Text
-                style={{
-                  color: "#ff4444",
-                  fontSize: 11,
-                  fontWeight: "700",
-                  letterSpacing: 0.5,
-                }}
+                style={{ color: "#ff4444", fontSize: 11, fontWeight: "700" }}
               >
                 Tap to retry
               </Text>
@@ -423,29 +428,35 @@ export default function DiscordChannelScreen() {
     );
   };
 
+  // ── Header (reused in loading and normal state)
+  const Header = () => (
+    <View style={s.header}>
+      <TouchableOpacity
+        onPress={() => router.replace("/(tabs)/discord")}
+        style={s.backBtn}
+      >
+        <Ionicons name="arrow-back" size={22} color="#fff" />
+      </TouchableOpacity>
+      <Text style={s.headerEmoji}>{channelEmoji}</Text>
+      <View style={s.headerText}>
+        <Text style={s.headerTitle}>#{channelName}</Text>
+        <Text style={s.headerDesc} numberOfLines={1}>
+          {channelDescription}
+        </Text>
+      </View>
+      {!isOnline && (
+        <View style={s.offlineBadge}>
+          <Text style={s.offlineText}>Offline</Text>
+        </View>
+      )}
+    </View>
+  );
+
+  // ── Loading state (only while profile hasn't resolved yet)
   if (loading && !chatProfile) {
     return (
       <View style={[s.root, { paddingTop: insets.top }]}>
-        <View style={s.header}>
-          <TouchableOpacity
-            onPress={() => router.replace("/(tabs)/discord")}
-            style={s.backBtn}
-          >
-            <Ionicons name="arrow-back" size={22} color="#fff" />
-          </TouchableOpacity>
-          <Text style={s.headerEmoji}>{channelEmoji}</Text>
-          <View style={s.headerText}>
-            <Text style={s.headerTitle}>#{channelName}</Text>
-            <Text style={s.headerDesc} numberOfLines={1}>
-              {channelDescription}
-            </Text>
-          </View>
-          {!isOnline && (
-            <View style={s.offlineBadge}>
-              <Text style={s.offlineText}>Offline</Text>
-            </View>
-          )}
-        </View>
+        <Header />
         <View style={s.centre}>
           <ActivityIndicator color={color} size="large" />
           <Text style={{ color: "#888", marginTop: 12 }}>Loading...</Text>
@@ -456,58 +467,31 @@ export default function DiscordChannelScreen() {
 
   return (
     <View style={[s.root, { paddingTop: insets.top }]}>
-      <View style={s.header}>
-        <TouchableOpacity
-          onPress={() => router.replace("/(tabs)/discord")}
-          style={s.backBtn}
-        >
-          <Ionicons name="arrow-back" size={22} color="#fff" />
-        </TouchableOpacity>
-        <Text style={s.headerEmoji}>{channelEmoji}</Text>
-        <View style={s.headerText}>
-          <Text style={s.headerTitle}>#{channelName}</Text>
-          <Text style={s.headerDesc} numberOfLines={1}>
-            {channelDescription}
-          </Text>
-        </View>
-        {!isOnline && (
-          <View style={s.offlineBadge}>
-            <Text style={s.offlineText}>Offline</Text>
-          </View>
-        )}
-      </View>
+      <Header />
 
       <KeyboardAvoidingView
         style={{ flex: 1 }}
         behavior="padding"
         keyboardVerticalOffset={Platform.OS === "ios" ? insets.top + 56 : 0}
       >
-        {loading && messages.length === 0 ? (
-          <View style={s.centre}>
-            <ActivityIndicator color={color} size="large" />
-          </View>
-        ) : (
-          <FlatList
-            ref={listRef}
-            data={messages}
-            keyExtractor={(m) => m.id || m.localId || Math.random().toString()}
-            renderItem={renderMessage}
-            contentContainerStyle={s.list}
-            showsVerticalScrollIndicator={false}
-            onRefresh={fetchOlderMessages}
-            refreshing={false}
-            ListEmptyComponent={
-              <View style={s.empty}>
-                <Text style={{ fontSize: 48 }}>{channelEmoji}</Text>
-                <Text style={s.emptyTitle}>#{channelName}</Text>
-                <Text style={s.emptyDesc}>{channelDescription}</Text>
-                <Text style={s.emptyHint}>
-                  Be the first to say something 👋
-                </Text>
-              </View>
-            }
-          />
-        )}
+        <FlatList
+          ref={listRef}
+          data={messages}
+          keyExtractor={(m) => m.localId ?? m.id ?? Math.random().toString()}
+          renderItem={renderMessage}
+          contentContainerStyle={s.list}
+          showsVerticalScrollIndicator={false}
+          onRefresh={fetchOlderMessages}
+          refreshing={false}
+          ListEmptyComponent={
+            <View style={s.empty}>
+              <Text style={{ fontSize: 48 }}>{channelEmoji}</Text>
+              <Text style={s.emptyTitle}>#{channelName}</Text>
+              <Text style={s.emptyDesc}>{channelDescription}</Text>
+              <Text style={s.emptyHint}>Be the first to say something 👋</Text>
+            </View>
+          }
+        />
 
         <View
           style={[s.inputBar, { paddingBottom: Math.max(insets.bottom, 8) }]}
@@ -516,34 +500,32 @@ export default function DiscordChannelScreen() {
             value={input}
             onChangeText={setInput}
             placeholder={
-              chatProfile ? `Message as ${chatProfile.username}` : "Loading..."
+              chatProfile
+                ? `Message as ${chatProfile.username}`
+                : "Loading profile..."
             }
             placeholderTextColor="#444"
             style={s.textInput}
             multiline
             maxLength={2000}
-            editable={!sending && !!chatProfile}
-            onSubmitEditing={sendTextMessage}
+            editable={!!chatProfile}
             returnKeyType="send"
+            onSubmitEditing={sendTextMessage}
           />
           <TouchableOpacity
             onPress={input.trim() ? sendTextMessage : undefined}
-            disabled={!input.trim() || sending || !chatProfile}
+            disabled={!input.trim() || !chatProfile}
             style={[
               s.sendBtn,
               { backgroundColor: color },
-              (!input.trim() || sending || !chatProfile) && s.sendBtnOff,
+              (!input.trim() || !chatProfile) && s.sendBtnOff,
             ]}
           >
-            {sending ? (
-              <ActivityIndicator size="small" color="#fff" />
-            ) : (
-              <Ionicons
-                name="send"
-                size={18}
-                color={color === "#FEE75C" ? "#000" : "#fff"}
-              />
-            )}
+            <Ionicons
+              name="send"
+              size={18}
+              color={color === "#FEE75C" ? "#000" : "#fff"}
+            />
           </TouchableOpacity>
         </View>
       </KeyboardAvoidingView>
@@ -551,7 +533,7 @@ export default function DiscordChannelScreen() {
   );
 }
 
-// Styles
+// ── Bubble styles
 const bS = StyleSheet.create({
   row: {
     flexDirection: "row",
@@ -559,7 +541,7 @@ const bS = StyleSheet.create({
     paddingHorizontal: 12,
     alignItems: "flex-end",
   },
-  rowMe: { flexDirection: "row-reverse" }, // ✅ Critical for right alignment
+  rowMe: { flexDirection: "row-reverse" },
   avatar: {
     width: 32,
     height: 32,
@@ -588,6 +570,7 @@ const bS = StyleSheet.create({
   },
 });
 
+// ── Screen styles
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#000" },
   header: {

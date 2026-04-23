@@ -12,12 +12,26 @@ import { SessionExpiredProvider } from "../src/context/SessionExpiredContext";
 import { useSessionHeartbeat } from "../src/hooks/useSessionHeartbeat";
 import { useAuth } from "../src/store/authStore";
 import { getLastRoute } from "../src/utils/cacheAppState";
-import { getUserData } from "../src/utils/tokenManager";
-// ✅ ADD THIS: Import SQLite init
 import { initChatDB } from "../src/utils/chatCache";
+import { getUserData } from "../src/utils/tokenManager";
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
 const REFRESH_TOKEN_KEY = "app.refresh_token";
+
+// All routes that should NEVER show the loading splash
+const PUBLIC_ROUTES = [
+  "/welcome",
+  "/auth/otp",
+  "/auth/phone",
+  "/auth/login",
+  "/auth/device",
+  "/auth/forgot-password",
+  "/auth/reset-sent",
+];
+
+const isPublicRoute = (path: string | undefined): boolean => {
+  if (!path) return false;
+  return PUBLIC_ROUTES.some((route) => path.startsWith(route));
+};
 
 export default function RootLayout() {
   const router = useRouter();
@@ -31,38 +45,19 @@ export default function RootLayout() {
 
   useSessionHeartbeat(isAuthenticated);
 
-  // ✅ ADD THIS: Initialize SQLite database on app start
+  // Initialize SQLite on startup
   useEffect(() => {
-    let mounted = true;
-
-    const initDB = async () => {
-      try {
-        await initChatDB();
-        console.log("[RootLayout] ✅ SQLite chat database initialized");
-      } catch (err) {
-        console.warn("[RootLayout] ⚠️ SQLite init failed:", err);
-        // Non-fatal: app can still work with API-only mode
-      }
-    };
-
-    initDB();
-    return () => {
-      mounted = false;
-    };
+    initChatDB().catch((err) =>
+      console.warn("[RootLayout] SQLite init failed:", err),
+    );
   }, []);
 
   useEffect(() => {
     if (BOOT_LOCKED.current || didBoot.current) return;
     if (!navState?.key) return;
 
-    const publicRoutes = [
-      "/welcome",
-      "/auth/otp",
-      "/auth/phone",
-      "/auth/login",
-      "/auth/device",
-    ];
-    if (publicRoutes.some((route) => pathname?.startsWith(route))) {
+    // Don't run boot logic on public/auth routes — let them navigate freely
+    if (isPublicRoute(pathname)) {
       didBoot.current = true;
       return;
     }
@@ -74,37 +69,22 @@ export default function RootLayout() {
       try {
         await new Promise((resolve) => setTimeout(resolve, 300));
 
-        console.log(
-          "[RootLayout] Checking SecureStore for:",
-          REFRESH_TOKEN_KEY,
-        );
         const refreshToken = await SecureStore.getItemAsync(REFRESH_TOKEN_KEY);
         const hasValidToken = !!refreshToken && refreshToken.trim() !== "";
 
         if (!hasValidToken) {
-          console.log(
-            "[RootLayout] ❌ No refresh token → redirect to /welcome",
-          );
           router.replace({ pathname: "/welcome" });
           return;
         }
 
-        console.log("[RootLayout] ✅ Token found, proceeding with auth...");
-
         const valid = await checkAuth();
         if (!valid) {
-          console.log(
-            "[RootLayout] ❌ Auth validation failed → redirect to /welcome",
-          );
           router.replace({ pathname: "/welcome" });
           return;
         }
 
         const user = await getUserData();
         if (!user?.hasProfile) {
-          console.log(
-            "[RootLayout] ⚠️ Profile incomplete → redirect to /auth/device",
-          );
           router.replace({
             pathname: "/auth/device",
             params: { userEmail: user?.email || "" },
@@ -112,26 +92,15 @@ export default function RootLayout() {
           return;
         }
 
-        console.log("[RootLayout] ✅ All checks passed, restoring session...");
         const lastRoute = await getLastRoute();
-        const protectedRoutes = [
-          "/welcome",
-          "/auth/otp",
-          "/auth/phone",
-          "/auth/login",
-          "/auth/device",
-          "/auth/forgot-password",
-          "/auth/reset-sent",
-        ];
-
-        if (lastRoute && !protectedRoutes.includes(lastRoute)) {
+        if (lastRoute && !isPublicRoute(lastRoute)) {
           router.replace(lastRoute as any);
         } else {
           router.replace("/(tabs)/discord");
         }
       } catch (error) {
-        console.error("[RootLayout] 💥 Boot error:", error);
-        if (!pathname?.startsWith("/welcome")) {
+        console.error("[RootLayout] Boot error:", error);
+        if (!isPublicRoute(pathname)) {
           router.replace({ pathname: "/welcome" });
         }
       }
@@ -140,7 +109,9 @@ export default function RootLayout() {
     boot();
   }, [navState?.key]);
 
-  const shouldShowSplash = isChecking && !pathname?.startsWith("/welcome");
+  // ✅ FIX: Never show splash on public/auth routes — this was blocking navigation
+  const shouldShowSplash =
+    isChecking && !isPublicRoute(pathname) && !pathname?.startsWith("/welcome");
 
   return (
     <>
@@ -178,10 +149,7 @@ export default function RootLayout() {
           <Stack.Screen name="TeamYPN" />
           <Stack.Screen name="settings" />
           <Stack.Screen name="chat" />
-
           <Stack.Screen name="splash" />
-
-          {/* ✅ NEW: Register Help Center & Legal screens */}
           <Stack.Screen
             name="support"
             options={{
@@ -206,8 +174,6 @@ export default function RootLayout() {
               gestureEnabled: true,
             }}
           />
-
-          {/* ✅ ADD THIS: Register the chat channel screen */}
           <Stack.Screen
             name="discordChannel"
             options={{ presentation: "card", animation: "slide_from_bottom" }}
