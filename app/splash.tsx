@@ -28,7 +28,7 @@ export default function SplashScreen() {
         duration: 400,
         useNativeDriver: true,
       }).start(() => {
-        router.replace("/tabs/discord");
+        router.replace("/(tabs)/discord"); // Bug 3 fixed
       });
     }, 2200);
 

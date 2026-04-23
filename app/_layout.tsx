@@ -18,9 +18,6 @@ import { getUserData } from "../src/utils/tokenManager";
 
 const REFRESH_TOKEN_KEY = "app.refresh_token";
 
-// ─────────────────────────────────────────────────────────────
-// Public routes (NO auth interference)
-// ─────────────────────────────────────────────────────────────
 const PUBLIC_ROUTES = [
   "/welcome",
   "/auth",
@@ -42,87 +39,79 @@ export default function RootLayout() {
   const pathname = usePathname();
   const navState = useRootNavigationState();
 
-  const { checkAuth, isChecking, isAuthenticated } = useAuth();
+  // Bug 7 fix: destructure initAuth from store
+  const { checkAuth, isChecking, isAuthenticated, initAuth } = useAuth();
   const [showExpired, setShowExpired] = useState(false);
 
   const didBoot = useRef(false);
 
   useSessionHeartbeat(isAuthenticated);
 
-  // ─────────────────────────────────────────────────────────────
-  // Init local DB
-  // ─────────────────────────────────────────────────────────────
   useEffect(() => {
     initChatDB().catch((err) =>
       console.warn("[RootLayout] SQLite init failed:", err),
     );
+    // Bug 7 fix: call initAuth on mount to load hasAgreed from SecureStore
+    initAuth().catch((err) =>
+      console.warn("[RootLayout] initAuth failed:", err),
+    );
   }, []);
 
-  // ─────────────────────────────────────────────────────────────
-  // BOOT STRATEGY (SAFE VERSION)
-  // ─────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!navState?.key) return;
-
-    // ❗ Never interfere with auth/public routes
     if (isPublicRoute(pathname)) return;
-
-    // prevent double boot
     if (didBoot.current) return;
     didBoot.current = true;
 
-    const boot = async () => {
-      try {
-        const refreshToken = await SecureStore.getItemAsync(REFRESH_TOKEN_KEY);
+    // Bug 4 fix: small delay so navigator is fully mounted before push
+    const timer = setTimeout(() => {
+      boot();
+    }, 50);
 
-        // 1. No token → welcome
-        if (!refreshToken) {
-          router.replace("/welcome");
-          return;
-        }
-
-        // 2. Validate session
-        const valid = await checkAuth();
-        if (!valid) {
-          router.replace("/welcome");
-          return;
-        }
-
-        // 3. Get user profile
-        const user = await getUserData();
-
-        // 4. No profile → onboarding
-        if (!user?.hasProfile) {
-          router.replace({
-            pathname: "/auth/device",
-            params: {
-              userEmail: user?.email || "",
-              userUid: user?.uid || "",
-            },
-          } as any);
-          return;
-        }
-
-        // 5. Restore last route or go home
-        const lastRoute = await getLastRoute();
-
-        if (lastRoute && !isPublicRoute(lastRoute)) {
-          router.replace(lastRoute as any);
-        } else {
-          router.replace("/(tabs)/discord");
-        }
-      } catch (error) {
-        console.error("[RootLayout] Boot error:", error);
-        router.replace("/welcome");
-      }
-    };
-
-    boot();
+    return () => clearTimeout(timer);
   }, [navState?.key]);
 
-  // ─────────────────────────────────────────────────────────────
-  // Splash only for protected routes
-  // ─────────────────────────────────────────────────────────────
+  const boot = async () => {
+    try {
+      const refreshToken = await SecureStore.getItemAsync(REFRESH_TOKEN_KEY);
+
+      if (!refreshToken) {
+        router.replace("/welcome");
+        return;
+      }
+
+      const valid = await checkAuth();
+      if (!valid) {
+        router.replace("/welcome");
+        return;
+      }
+
+      const user = await getUserData();
+
+      if (!user?.hasProfile) {
+        router.replace({
+          pathname: "/auth/device",
+          params: {
+            userEmail: user?.email || "",
+            userUid: user?.uid || "",
+          },
+        } as any);
+        return;
+      }
+
+      const lastRoute = await getLastRoute();
+
+      if (lastRoute && !isPublicRoute(lastRoute)) {
+        router.replace(lastRoute as any);
+      } else {
+        router.replace("/(tabs)/discord");
+      }
+    } catch (error) {
+      console.error("[RootLayout] Boot error:", error);
+      router.replace("/welcome");
+    }
+  };
+
   const shouldShowSplash =
     isChecking &&
     !isPublicRoute(pathname) &&
@@ -154,13 +143,8 @@ export default function RootLayout() {
             contentStyle: { backgroundColor: "#121212" },
           }}
         >
-          {/* Root */}
           <Stack.Screen name="index" />
-
-          {/* Tabs */}
           <Stack.Screen name="(tabs)" options={{ animation: "none" }} />
-
-          {/* Main app routes */}
           <Stack.Screen
             name="discord"
             options={{ presentation: "fullScreenModal" }}
@@ -169,11 +153,7 @@ export default function RootLayout() {
           <Stack.Screen name="settings" />
           <Stack.Screen name="TeamYPN" />
           <Stack.Screen name="splash" />
-
-          {/* Auth group (IMPORTANT: isolated) */}
           <Stack.Screen name="auth" options={{ headerShown: false }} />
-
-          {/* Public screens */}
           <Stack.Screen name="welcome" options={{ animation: "fade" }} />
           <Stack.Screen
             name="support"
@@ -199,7 +179,6 @@ export default function RootLayout() {
               gestureEnabled: true,
             }}
           />
-
           <Stack.Screen
             name="discordChannel"
             options={{
@@ -207,6 +186,7 @@ export default function RootLayout() {
               animation: "slide_from_bottom",
             }}
           />
+          <Stack.Screen name="article/[id]" options={{ headerShown: false }} />
         </Stack>
       </SessionExpiredProvider>
     </>

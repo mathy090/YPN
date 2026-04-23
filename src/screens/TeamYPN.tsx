@@ -296,6 +296,7 @@ export default function TeamYPNScreen() {
     }
   };
 
+  // Bug 5 fix applied here
   const processNextMessage = useCallback(async () => {
     if (isProcessingRef.current || messageQueueRef.current.length === 0) {
       return;
@@ -349,7 +350,12 @@ export default function TeamYPNScreen() {
         await incrementUnreadBadge();
       }
     } catch (err: any) {
+      // Bug 5 fix: AbortError cleans up properly instead of leaving stuck message
       if (err.message === "REQUEST_ABORTED") {
+        setMessages((prev) => prev.filter((m) => m.id !== userMsgId));
+        setAiTyping(false);
+        isProcessingRef.current = false;
+        abortControllerRef.current = null;
         return;
       }
       console.warn("[TeamYPN] processNextMessage error:", err);
@@ -547,12 +553,10 @@ export default function TeamYPNScreen() {
 
   return (
     <View style={s.root}>
-      {/* ── DYNAMIC BACKGROUND ── */}
       <View style={s.bgGradient} />
       <View style={s.bgMesh1} pointerEvents="none" />
       <View style={s.bgMesh2} pointerEvents="none" />
 
-      {/* ── GLASS HEADER ── */}
       <BlurView
         intensity={92}
         tint="dark"
@@ -580,7 +584,6 @@ export default function TeamYPNScreen() {
         </View>
       </BlurView>
 
-      {/* ── BODY ── */}
       <KeyboardAvoidingView
         style={{ flex: 1 }}
         behavior={Platform.OS === "ios" ? "padding" : "height"}
@@ -600,7 +603,6 @@ export default function TeamYPNScreen() {
         />
         {pending && <UndoToast onUndo={handleUndo} progress={undoProgress} />}
 
-        {/* ── GLASS INPUT BAR ── */}
         <View style={s.inputBar}>
           <BlurView intensity={88} tint="dark" style={s.inputGlass}>
             <View style={s.inputContainer}>
@@ -638,15 +640,12 @@ export default function TeamYPNScreen() {
   );
 }
 
-// ── GLASSMORPHISM STYLES ───────────────────────────────────────────────
 const s = StyleSheet.create({
   root: {
     flex: 1,
     backgroundColor: "#0B141A",
     overflow: "hidden",
   },
-
-  // Dynamic Background Layers
   bgGradient: {
     position: "absolute",
     inset: 0,
@@ -670,7 +669,6 @@ const s = StyleSheet.create({
     bottom: -50,
     left: -50,
   },
-
   loadingWrap: {
     flex: 1,
     justifyContent: "center",
@@ -683,8 +681,6 @@ const s = StyleSheet.create({
     borderWidth: 1,
     borderColor: "rgba(255,255,255,0.1)",
   },
-
-  // Glass Header
   header: {
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: "rgba(255,255,255,0.08)",
@@ -742,15 +738,11 @@ const s = StyleSheet.create({
     marginTop: 1,
     fontWeight: "400",
   },
-
-  // Messages List
   listContent: {
     paddingHorizontal: 14,
     paddingTop: 12,
     paddingBottom: 12,
   },
-
-  // Glass Date Header
   dateHeader: {
     alignSelf: "center",
     marginVertical: 14,
@@ -768,8 +760,6 @@ const s = StyleSheet.create({
     fontWeight: "500",
     letterSpacing: 0.3,
   },
-
-  // Message Rows & Bubbles
   row: {
     marginVertical: 3,
     flexDirection: "row",
@@ -854,8 +844,6 @@ const s = StyleSheet.create({
     fontSize: 11,
     fontWeight: "600",
   },
-
-  // Glass Typing Indicator
   typingRow: {
     flexDirection: "row",
     paddingHorizontal: 14,
@@ -883,8 +871,6 @@ const s = StyleSheet.create({
     borderRadius: 3.5,
     backgroundColor: "#8696A0",
   },
-
-  // Glass Undo Toast
   toastCard: {
     position: "absolute",
     bottom: 85,
@@ -921,8 +907,6 @@ const s = StyleSheet.create({
     height: 3,
     backgroundColor: "#25D366",
   },
-
-  // Glass Input Bar
   inputBar: {
     paddingHorizontal: 14,
     paddingVertical: 10,
