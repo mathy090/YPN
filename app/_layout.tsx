@@ -39,78 +39,71 @@ export default function RootLayout() {
   const pathname = usePathname();
   const navState = useRootNavigationState();
 
-  // Bug 7 fix: destructure initAuth from store
   const { checkAuth, isChecking, isAuthenticated, initAuth } = useAuth();
   const [showExpired, setShowExpired] = useState(false);
 
-  const didBoot = useRef(false);
+  const booting = useRef(false);
 
   useSessionHeartbeat(isAuthenticated);
 
+  // Init DB + auth
   useEffect(() => {
     initChatDB().catch((err) =>
-      console.warn("[RootLayout] SQLite init failed:", err),
+      console.warn("[RootLayout] SQLite init failed:", err)
     );
-    // Bug 7 fix: call initAuth on mount to load hasAgreed from SecureStore
+
     initAuth().catch((err) =>
-      console.warn("[RootLayout] initAuth failed:", err),
+      console.warn("[RootLayout] initAuth failed:", err)
     );
   }, []);
 
+  // SAFE BOOT (FIXES ERROR 139)
   useEffect(() => {
     if (!navState?.key) return;
     if (isPublicRoute(pathname)) return;
-    if (didBoot.current) return;
-    didBoot.current = true;
+    if (booting.current) return;
 
-    // Bug 4 fix: small delay so navigator is fully mounted before push
-    const timer = setTimeout(() => {
-      boot();
-    }, 50);
+    booting.current = true;
 
-    return () => clearTimeout(timer);
-  }, [navState?.key]);
+    const run = async () => {
+      try {
+        const refreshToken = await SecureStore.getItemAsync(
+          REFRESH_TOKEN_KEY
+        );
 
-  const boot = async () => {
-    try {
-      const refreshToken = await SecureStore.getItemAsync(REFRESH_TOKEN_KEY);
+        if (!refreshToken) {
+          return router.replace("/welcome");
+        }
 
-      if (!refreshToken) {
-        router.replace("/welcome");
-        return;
-      }
+        const valid = await checkAuth();
+        if (!valid) {
+          return router.replace("/welcome");
+        }
 
-      const valid = await checkAuth();
-      if (!valid) {
-        router.replace("/welcome");
-        return;
-      }
+        const user = await getUserData();
 
-      const user = await getUserData();
+        if (!user?.hasProfile) {
+          return router.replace("/auth/device");
+        }
 
-      if (!user?.hasProfile) {
-        router.replace({
-          pathname: "/auth/device",
-          params: {
-            userEmail: user?.email || "",
-            userUid: user?.uid || "",
-          },
-        } as any);
-        return;
-      }
+        const lastRoute = await getLastRoute();
 
-      const lastRoute = await getLastRoute();
+        if (lastRoute && !isPublicRoute(lastRoute)) {
+          return router.replace(lastRoute as any);
+        }
 
-      if (lastRoute && !isPublicRoute(lastRoute)) {
-        router.replace(lastRoute as any);
-      } else {
         router.replace("/(tabs)/discord");
+      } catch (error) {
+        console.error("[RootLayout] Boot error:", error);
+        router.replace("/welcome");
       }
-    } catch (error) {
-      console.error("[RootLayout] Boot error:", error);
-      router.replace("/welcome");
-    }
-  };
+    };
+
+    // CRITICAL: wait until navigation fully mounts
+    requestAnimationFrame(() => {
+      run();
+    });
+  }, [navState?.key]);
 
   const shouldShowSplash =
     isChecking &&
