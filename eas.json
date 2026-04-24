@@ -24,8 +24,8 @@
         "image": "latest"
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://ypn-iilv.onrender.com",
-        "EXPO_PUBLIC_AI_URL": "https://ypn-1-7rwd.onrender.com"
+        "EXPO_PUBLIC_API_URL": "https://ypn.onrender.com",
+        "EXPO_PUBLIC_AI_URL": "https://ypn-1.onrender.com"
       }
     }
   },
