@@ -15,7 +15,6 @@ import {
   FlatList,
   Image,
   Keyboard,
-  KeyboardAvoidingView,
   Platform,
   Pressable,
   StatusBar,
@@ -149,6 +148,11 @@ export default function TeamYPNScreen() {
   const listRef = useRef<FlatList>(null);
   const inputRef = useRef<TextInput>(null);
 
+  // 🔥 1. ADD THIS STATE
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
+  const [isAtBottom, setIsAtBottom] = useState(true);
+  const [replyTo, setReplyTo] = useState<Message | null>(null);
+
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -196,16 +200,20 @@ export default function TeamYPNScreen() {
     };
   }, []);
 
+  // 🔥 2. ADD THIS EFFECT (keyboard tracking)
   useEffect(() => {
-    const keyboardDidHideListener = Keyboard.addListener(
-      "keyboardDidHide",
-      () => {
-        setTimeout(() => {
-          listRef.current?.scrollToEnd({ animated: true });
-        }, 100);
-      },
-    );
-    return () => keyboardDidHideListener.remove();
+    const showSub = Keyboard.addListener("keyboardDidShow", (e) => {
+      setKeyboardHeight(e.endCoordinates.height);
+    });
+
+    const hideSub = Keyboard.addListener("keyboardDidHide", () => {
+      setKeyboardHeight(0);
+    });
+
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
   }, []);
 
   useEffect(() => {
@@ -382,12 +390,15 @@ export default function TeamYPNScreen() {
     [isConnected, processNextMessage],
   );
 
+  // 🔥 3. FIX SEND (VERY IMPORTANT)
   const handleSend = useCallback(() => {
     const text = input.trim();
     if (!text) return;
+
     setInput("");
     sendMessage(text);
-    inputRef.current?.blur();
+
+    // ❌ DO NOT blur → keeps keyboard open like WhatsApp
   }, [input, sendMessage]);
 
   const handleRetry = useCallback(
@@ -584,58 +595,70 @@ export default function TeamYPNScreen() {
         </View>
       </BlurView>
 
-      <KeyboardAvoidingView
-        style={{ flex: 1 }}
-        behavior={Platform.OS === "ios" ? "padding" : "height"}
-        keyboardVerticalOffset={Platform.OS === "ios" ? 90 : 0}
-      >
-        <FlatList
-          ref={listRef}
-          data={grouped}
-          renderItem={renderItem}
-          keyExtractor={keyExtractor}
-          contentContainerStyle={s.listContent}
-          showsVerticalScrollIndicator={false}
-          onContentSizeChange={() => scrollToBottom(false)}
-          ListFooterComponent={aiTyping ? <TypingIndicator /> : null}
-          keyboardShouldPersistTaps="handled"
-          keyboardDismissMode="interactive"
-        />
-        {pending && <UndoToast onUndo={handleUndo} progress={undoProgress} />}
+      {/* 🔥 4. REMOVED KeyboardAvoidingView */}
 
-        <View style={s.inputBar}>
-          <BlurView intensity={88} tint="dark" style={s.inputGlass}>
-            <View style={s.inputContainer}>
-              <TextInput
-                ref={inputRef}
-                value={input}
-                onChangeText={setInput}
-                placeholder="Message..."
-                placeholderTextColor="#8E8E93"
-                multiline
-                maxLength={2000}
-                style={s.input}
-                blurOnSubmit={false}
-                onSubmitEditing={handleSend}
-                returnKeyType="send"
-              />
-            </View>
-            <TouchableOpacity
-              onPress={handleSend}
-              disabled={!input.trim()}
-              activeOpacity={0.78}
-              style={[s.sendBtn, !input.trim() && s.sendBtnOff]}
-            >
-              <Ionicons
-                name="send"
-                size={18}
-                color="#fff"
-                style={{ marginLeft: 2 }}
-              />
-            </TouchableOpacity>
-          </BlurView>
-        </View>
-      </KeyboardAvoidingView>
+      {/* 🔥 5. UPDATE FlatList (add padding) */}
+      <FlatList
+        ref={listRef}
+        data={grouped}
+        renderItem={renderItem}
+        keyExtractor={keyExtractor}
+        contentContainerStyle={[
+          s.listContent,
+          { paddingBottom: keyboardHeight + 80 }, // 🔥 KEY FIX
+        ]}
+        showsVerticalScrollIndicator={false}
+        onContentSizeChange={() => scrollToBottom(false)}
+        ListFooterComponent={aiTyping ? <TypingIndicator /> : null}
+        keyboardShouldPersistTaps="always"
+        keyboardDismissMode="interactive"
+      />
+
+      {pending && <UndoToast onUndo={handleUndo} progress={undoProgress} />}
+
+      {/* 🔥 6. MAKE INPUT BAR FLOAT (WhatsApp style) */}
+      <View
+        style={[
+          s.inputBar,
+          {
+            position: "absolute",
+            bottom: keyboardHeight, // 🔥 follows keyboard
+            left: 0,
+            right: 0,
+          },
+        ]}
+      >
+        <BlurView intensity={88} tint="dark" style={s.inputGlass}>
+          <View style={s.inputContainer}>
+            <TextInput
+              ref={inputRef}
+              value={input}
+              onChangeText={setInput}
+              placeholder="Message..."
+              placeholderTextColor="#8E8E93"
+              multiline
+              maxLength={2000}
+              style={s.input}
+              blurOnSubmit={false}
+              onSubmitEditing={handleSend}
+              returnKeyType="send"
+            />
+          </View>
+          <TouchableOpacity
+            onPress={handleSend}
+            disabled={!input.trim()}
+            activeOpacity={0.78}
+            style={[s.sendBtn, !input.trim() && s.sendBtnOff]}
+          >
+            <Ionicons
+              name="send"
+              size={18}
+              color="#fff"
+              style={{ marginLeft: 2 }}
+            />
+          </TouchableOpacity>
+        </BlurView>
+      </View>
     </View>
   );
 }
@@ -907,12 +930,12 @@ const s = StyleSheet.create({
     height: 3,
     backgroundColor: "#25D366",
   },
+  // 🔥 7. SMALL STYLE FIX (avoid jump)
   inputBar: {
     paddingHorizontal: 14,
     paddingVertical: 10,
     backgroundColor: "transparent",
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: "rgba(255,255,255,0.06)",
+    // borderTopWidth removed to avoid visual jump
   },
   inputGlass: {
     flexDirection: "row",

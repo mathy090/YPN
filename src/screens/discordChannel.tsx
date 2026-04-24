@@ -3,8 +3,9 @@
 // Key fixes:
 // 1. Profile loaded from SecureStore (app.user_data) first — always available after login
 // 2. API profile fetch runs in background only — never blocks UI
-// 3. isMe check uses username string comparison — consistent with DB
+// 3. isMe check uses uid comparison — consistent with DB and Backend
 // 4. Send button enabled as soon as local profile resolves (instant)
+// 5. Messages now use uid for sender_id to ensure correct identity alignment
 
 import { Ionicons } from "@expo/vector-icons";
 import NetInfo from "@react-native-community/netinfo";
@@ -226,10 +227,12 @@ export default function DiscordChannelScreen() {
     if (!text || !channelId || !chatProfile) return;
 
     const localId = `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    // ✅ FIX: Use uid for sender_id
     const msg: CachedMessage = {
       id: localId,
       channel_id: channelId,
-      sender_id: chatProfile.username.toLowerCase().replace(/[^a-z0-9_]/g, "_"),
+      sender_id: chatProfile.uid,
       content: text,
       media_type: null,
       media_url: null,
@@ -254,11 +257,13 @@ export default function DiscordChannelScreen() {
 
   const sendMessageToServer = async (msg: CachedMessage, localId: string) => {
     try {
+      // ✅ FIX: Send uid to backend so it can use it as the true sender_id
       const res = await fetch(`${API_URL}/api/discord/messages`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           channelId: msg.channel_id,
+          uid: msg.sender_id, // ✅ ADD THIS
           username: msg.username,
           avatarUrl: msg.avatar_url,
           content: msg.content,
@@ -300,7 +305,8 @@ export default function DiscordChannelScreen() {
 
   // ── Delete message
   const handleLongPress = (msg: Message) => {
-    const isMyMessage = msg.username === chatProfile?.username || msg.isMe;
+    // ✅ FIX: Use uid for ownership check
+    const isMyMessage = msg.sender_id === chatProfile?.uid || msg.isMe;
 
     Alert.alert(
       "Delete Message",
@@ -346,7 +352,8 @@ export default function DiscordChannelScreen() {
 
   // ── Render single message
   const renderMessage = ({ item }: { item: Message }) => {
-    const isMe = item.isMe === true || item.username === chatProfile?.username;
+    // ✅ FIX: Use uid for isMe check
+    const isMe = item.sender_id === chatProfile?.uid;
     const time = new Date(item.created_at).toLocaleTimeString([], {
       hour: "2-digit",
       minute: "2-digit",

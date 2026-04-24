@@ -24,6 +24,7 @@ const upload = multer({
 });
 
 const getSupabase = (req) => req.app.get("supabase");
+const getDb = (req) => req.app.get("db");
 
 // ── GET /api/discord/channels ────────────────────────────────────────────────
 router.get("/channels", async (_req, res) => {
@@ -58,7 +59,7 @@ router.get("/profile/:uid", async (req, res) => {
         .json({ message: "UID required", code: "MISSING_UID" });
     }
 
-    const db = req.app.get("db");
+    const db = getDb(req);
     if (!db) {
       return res
         .status(500)
@@ -94,62 +95,77 @@ router.get("/profile/:uid", async (req, res) => {
 // ── POST /api/discord/messages ───────────────────────────────────────────────
 router.post("/messages", async (req, res) => {
   const supabase = getSupabase(req);
-  if (!supabase) {
-    return res
-      .status(503)
-      .json({
-        message: "Chat service unavailable",
-        code: "SUPABASE_UNAVAILABLE",
-      });
-  }
+  const db = getDb(req);
 
-  const { channelId, username, avatarUrl, content, mediaType, mediaUrl } =
+  // ✅ FIX A: Use UID as identity everywhere
+  const { channelId, uid, username, avatarUrl, content, mediaType, mediaUrl } =
     req.body;
 
-  if (!channelId) {
+  if (!channelId || !uid) {
     return res
       .status(400)
-      .json({ message: "channelId required", code: "MISSING_CHANNEL" });
+      .json({ message: "channelId + uid required", code: "MISSING_FIELDS" });
   }
+
   if (!content && !mediaUrl) {
-    return res
-      .status(400)
-      .json({
-        message: "Message must contain text or media",
-        code: "EMPTY_MESSAGE",
-      });
+    return res.status(400).json({
+      message: "Message must contain text or media",
+      code: "EMPTY_MESSAGE",
+    });
   }
 
   const cleanUsername = (username || "Guest").trim().slice(0, 30);
-  // Use username as sender_id so isMe checks work reliably on the frontend
-  const senderId = cleanUsername.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+
+  // ✅ FIX A: ALWAYS store sender_id as uid
+  const messagePayload = {
+    channel_id: channelId,
+    sender_id: uid, // 🔥 stable identity
+    username: cleanUsername,
+    avatar_url: avatarUrl || null,
+    content: content || null,
+    media_type: mediaType || null,
+    media_url: mediaUrl || null,
+    created_at: new Date().toISOString(),
+  };
 
   try {
-    const { data, error } = await supabase
-      .from("messages")
-      .insert([
-        {
-          channel_id: channelId,
-          sender_id: senderId,
-          username: cleanUsername, // ✅ Store username in DB
-          content: content || null,
-          media_type: mediaType || null,
-          media_url: mediaUrl || null,
-          avatar_url: avatarUrl || null,
-          created_at: new Date().toISOString(),
-        },
-      ])
-      .select()
-      .single();
+    let insertedData = null;
 
-    if (error) {
-      console.error("[Supabase] Insert error:", error);
-      throw error;
+    // Primary Write: Supabase
+    if (supabase) {
+      const { data, error } = await supabase
+        .from("messages")
+        .insert([messagePayload])
+        .select()
+        .single();
+
+      if (error) {
+        console.error("[Supabase] Insert error:", error);
+        throw error;
+      }
+      insertedData = data;
+    } else {
+      console.warn("Supabase offline → using Mongo only");
     }
 
-    res.status(201).json({ ...data, username: cleanUsername });
+    // ✅ FIX C: Fallback Write: MongoDB (for reliability/offline safety)
+    if (db) {
+      // We insert a copy to Mongo so we have a backup if Supabase goes down completely later
+      // Note: We don't wait for this to respond to keep latency low
+      db.collection("messages")
+        .insertOne(messagePayload)
+        .catch((err) => {
+          console.error("[Mongo] Fallback insert failed:", err);
+        });
+    }
+
+    // Return the data (prefer Supabase response as it has the real ID)
+    res.status(201).json(insertedData || messagePayload);
   } catch (err) {
     console.error("[Discord] POST message error:", err);
+
+    // If Supabase failed but we have Mongo, we could optionally return success
+    // but for now, we report the error to ensure frontend knows it didn't sync to realtime DB
     res
       .status(500)
       .json({ message: "Failed to send message", code: "SEND_FAILED" });
@@ -157,16 +173,53 @@ router.post("/messages", async (req, res) => {
 });
 
 // ── GET /api/discord/messages/:channelId ─────────────────────────────────────
-// ✅ FIX: Was destructuring { messages, error } — Supabase returns { data, error }
 router.get("/messages/:channelId", async (req, res) => {
   const supabase = getSupabase(req);
+
+  // ✅ FIX B: NEVER block chat if Supabase fails
   if (!supabase) {
-    return res
-      .status(503)
-      .json({
-        message: "Chat service unavailable",
-        code: "SUPABASE_UNAVAILABLE",
-      });
+    console.warn("Supabase offline → attempting Mongo fallback for history");
+    const db = getDb(req);
+    if (!db) {
+      return res
+        .status(503)
+        .json({
+          message: "Chat service unavailable",
+          code: "SUPABASE_UNAVAILABLE",
+        });
+    }
+
+    // Fallback to Mongo if Supabase is down
+    try {
+      const { channelId } = req.params;
+      const { after, before, limit = 50 } = req.query;
+
+      let query = { channel_id: channelId };
+      let sort = { created_at: 1 }; // ascending
+
+      if (after) {
+        query.created_at = { $gt: after };
+      } else if (before) {
+        query.created_at = { $lt: before };
+        sort = { created_at: -1 }; // descending for "before" pagination
+      }
+
+      const msgs = await db
+        .collection("messages")
+        .find(query)
+        .sort(sort)
+        .limit(parseInt(limit))
+        .toArray();
+
+      // If we fetched "before", we need to reverse to show chronologically
+      if (before) msgs.reverse();
+
+      return res.json(msgs);
+    } catch (e) {
+      return res
+        .status(500)
+        .json({ message: "Fallback fetch failed", code: "MONGO_ERROR" });
+    }
   }
 
   const { channelId } = req.params;
@@ -197,7 +250,6 @@ router.get("/messages/:channelId", async (req, res) => {
       query = query.order("created_at", { ascending: true });
     }
 
-    // ✅ FIXED: was { messages, error } — Supabase always returns { data, error }
     const { data, error } = await query;
 
     if (error) throw error;
@@ -224,12 +276,10 @@ router.get("/messages/:channelId", async (req, res) => {
 router.delete("/messages/:messageId", async (req, res) => {
   const supabase = getSupabase(req);
   if (!supabase) {
-    return res
-      .status(503)
-      .json({
-        message: "Chat service unavailable",
-        code: "SUPABASE_UNAVAILABLE",
-      });
+    return res.status(503).json({
+      message: "Chat service unavailable",
+      code: "SUPABASE_UNAVAILABLE",
+    });
   }
 
   const { messageId } = req.params;
@@ -245,6 +295,15 @@ router.delete("/messages/:messageId", async (req, res) => {
       .delete()
       .eq("id", messageId);
     if (error) throw error;
+
+    // Optional: Delete from Mongo fallback too
+    const db = getDb(req);
+    if (db) {
+      db.collection("messages")
+        .deleteOne({ id: messageId })
+        .catch(() => {});
+    }
+
     res.json({ success: true });
   } catch (err) {
     console.error("[Discord] DELETE error:", err);
@@ -258,12 +317,10 @@ router.delete("/messages/:messageId", async (req, res) => {
 router.post("/upload-media", upload.single("file"), async (req, res) => {
   const supabase = getSupabase(req);
   if (!supabase) {
-    return res
-      .status(503)
-      .json({
-        message: "Storage service unavailable",
-        code: "SUPABASE_UNAVAILABLE",
-      });
+    return res.status(503).json({
+      message: "Storage service unavailable",
+      code: "SUPABASE_UNAVAILABLE",
+    });
   }
   if (!req.file) {
     return res
