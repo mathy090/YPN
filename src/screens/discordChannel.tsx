@@ -6,6 +6,8 @@
 // 3. isMe check uses uid comparison — consistent with DB and Backend
 // 4. Send button enabled as soon as local profile resolves (instant)
 // 5. Messages now use uid for sender_id to ensure correct identity alignment
+// 6. Added Initial Full History Fetch for new users
+// 7. Added Polling for "WhatsApp-like" sync feel
 
 import { Ionicons } from "@expo/vector-icons";
 import NetInfo from "@react-native-community/netinfo";
@@ -136,15 +138,46 @@ export default function DiscordChannelScreen() {
     setup();
   }, [channelId]);
 
+  // 🔥 FIX 1: Force initial full sync
   const loadCachedMessages = async () => {
     try {
       const cached = await getCachedMessages(channelId);
       const visible = cached.filter((m) => m.is_deleted_local !== 1);
       setMessages(visible);
-      setTimeout(() => listRef.current?.scrollToEnd({ animated: false }), 50);
-      if (isOnline) fetchNewMessages(visible);
-    } catch {
-      // ignore
+
+      setTimeout(() => {
+        listRef.current?.scrollToEnd({ animated: false });
+      }, 50);
+
+      // 🔥 ALWAYS fetch full history on first load (new users included)
+      await fetchInitialMessages();
+    } catch (e) {
+      console.warn("[Discord] cache load failed:", e);
+    }
+  };
+
+  // 🔥 FIX 2: Add proper “initial full history fetch”
+  const fetchInitialMessages = async () => {
+    if (!channelId || !isOnline) return;
+
+    try {
+      const res = await fetch(
+        `${API_URL}/api/discord/messages/${channelId}?limit=50`,
+      );
+
+      if (!res.ok) return;
+
+      const data: CachedMessage[] = await res.json();
+      const clean = data.filter((m) => m.is_deleted_local !== 1);
+
+      setMessages(clean);
+      await cacheMessages(channelId, clean);
+
+      setTimeout(() => {
+        listRef.current?.scrollToEnd({ animated: false });
+      }, 100);
+    } catch (e) {
+      console.warn("[Discord] initial sync failed:", e);
     }
   };
 
@@ -214,6 +247,17 @@ export default function DiscordChannelScreen() {
       return () => sub.remove();
     }, [router]),
   );
+
+  // 🔥 FIX 3: Real-time sync (Polling fallback)
+  useEffect(() => {
+    if (!channelId || !isOnline) return;
+
+    const interval = setInterval(() => {
+      fetchNewMessages();
+    }, 2000); // 2s “WhatsApp-like sync”
+
+    return () => clearInterval(interval);
+  }, [channelId, isOnline, messages]);
 
   useEffect(() => {
     if (messages.length > 0) {
@@ -352,7 +396,7 @@ export default function DiscordChannelScreen() {
 
   // ── Render single message
   const renderMessage = ({ item }: { item: Message }) => {
-    // ✅ FIX: Use uid for isMe check
+    // ✅ FIX: Use uid for isMe check ONLY
     const isMe = item.sender_id === chatProfile?.uid;
     const time = new Date(item.created_at).toLocaleTimeString([], {
       hour: "2-digit",

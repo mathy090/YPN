@@ -181,12 +181,10 @@ router.get("/messages/:channelId", async (req, res) => {
     console.warn("Supabase offline → attempting Mongo fallback for history");
     const db = getDb(req);
     if (!db) {
-      return res
-        .status(503)
-        .json({
-          message: "Chat service unavailable",
-          code: "SUPABASE_UNAVAILABLE",
-        });
+      return res.status(503).json({
+        message: "Chat service unavailable",
+        code: "SUPABASE_UNAVAILABLE",
+      });
     }
 
     // Fallback to Mongo if Supabase is down
