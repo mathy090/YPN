@@ -1,4 +1,3 @@
-// src/screens/discordChannel.tsx
 //
 // Key fixes:
 // 1. Profile loaded from SecureStore (app.user_data) first — always available after login
@@ -7,7 +6,8 @@
 // 4. Send button enabled as soon as local profile resolves (instant)
 // 5. Messages now use uid for sender_id to ensure correct identity alignment
 // 6. Added Initial Full History Fetch for new users
-// 7. Added Polling for "WhatsApp-like" sync feel
+// 7. FIXED: SQLite Transaction Collisions via Queue System
+// 8. FIXED: Polling Race Conditions via pollLock
 
 import { Ionicons } from "@expo/vector-icons";
 import NetInfo from "@react-native-community/netinfo";
@@ -31,7 +31,6 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import {
   addOptimisticMessage,
-  cacheMessages,
   confirmMessage,
   deleteMessageLocally,
   getCachedMessages,
@@ -44,6 +43,8 @@ import {
   getStoredUserData,
   type ChatProfile,
 } from "../utils/chatProfile";
+// Import the new queue system
+import { queueCacheDiscordMessages } from "../utils/cacheQueue";
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL;
 
@@ -81,8 +82,12 @@ export default function DiscordChannelScreen() {
 
   const listRef = useRef<FlatList>(null);
 
+  // 🔥 LOCKS
+  const pollLock = useRef(false); // Prevents overlapping poll cycles
+  const fetchLock = useRef(false); // Prevents overlapping network requests
+  const initialLoaded = useRef(false); // Prevents double initial sync
+
   // ── Step 1: Load profile from SecureStore FIRST (instant, no network)
-  // Then optionally refresh from API in the background
   useEffect(() => {
     const loadProfile = async () => {
       // Try SecureStore (always available after login)
@@ -138,8 +143,11 @@ export default function DiscordChannelScreen() {
     setup();
   }, [channelId]);
 
-  // 🔥 FIX 1: Force initial full sync
+  // 🔥 FIX 1 & 3: Force initial full sync with guard
   const loadCachedMessages = async () => {
+    if (initialLoaded.current) return;
+    initialLoaded.current = true;
+
     try {
       const cached = await getCachedMessages(channelId);
       const visible = cached.filter((m) => m.is_deleted_local !== 1);
@@ -171,7 +179,8 @@ export default function DiscordChannelScreen() {
       const clean = data.filter((m) => m.is_deleted_local !== 1);
 
       setMessages(clean);
-      await cacheMessages(channelId, clean);
+      // Use Queue System
+      queueCacheDiscordMessages(channelId, clean);
 
       setTimeout(() => {
         listRef.current?.scrollToEnd({ animated: false });
@@ -184,12 +193,18 @@ export default function DiscordChannelScreen() {
   // ── Fetch new messages from server (incremental)
   const fetchNewMessages = async (currentMessages?: Message[]) => {
     if (!channelId || !isOnline) return;
+    if (fetchLock.current) return; // Prevent overlap
+
+    fetchLock.current = true;
+
     try {
       const msgs = currentMessages ?? messages;
       const lastMsg = msgs[msgs.length - 1];
+
       const url = new URL(`${API_URL}/api/discord/messages/${channelId}`);
-      if (lastMsg?.created_at)
+      if (lastMsg?.created_at) {
         url.searchParams.append("after", lastMsg.created_at);
+      }
 
       const res = await fetch(url.toString());
       if (!res.ok) return;
@@ -206,9 +221,14 @@ export default function DiscordChannelScreen() {
       });
 
       const toCache = newMsgs.filter((m) => m.is_deleted_local !== 1);
-      if (toCache.length > 0) await cacheMessages(channelId, toCache);
+      if (toCache.length > 0) {
+        // Use Queue System
+        queueCacheDiscordMessages(channelId, toCache);
+      }
     } catch (e) {
       console.warn("[Discord] Sync failed:", e);
+    } finally {
+      fetchLock.current = false;
     }
   };
 
@@ -225,7 +245,8 @@ export default function DiscordChannelScreen() {
       const visible = older.filter((m) => m.is_deleted_local !== 1);
       if (!visible.length) return;
       setMessages((prev) => [...visible, ...prev]);
-      await cacheMessages(channelId, visible);
+      // Use Queue System for older messages too
+      queueCacheDiscordMessages(channelId, visible);
     } catch (e) {
       console.warn("[Discord] Older messages error:", e);
     }
@@ -233,7 +254,10 @@ export default function DiscordChannelScreen() {
 
   useFocusEffect(
     useCallback(() => {
-      fetchNewMessages();
+      // Only fetch if we aren't already syncing or fetching
+      if (!fetchLock.current && !pollLock.current) {
+        fetchNewMessages();
+      }
     }, [channelId, isOnline]),
   );
 
@@ -248,16 +272,23 @@ export default function DiscordChannelScreen() {
     }, [router]),
   );
 
-  // 🔥 FIX 3: Real-time sync (Polling fallback)
+  // 🔥 FIX 3: Real-time sync (Polling fallback) with pollLock
   useEffect(() => {
     if (!channelId || !isOnline) return;
 
-    const interval = setInterval(() => {
-      fetchNewMessages();
-    }, 2000); // 2s “WhatsApp-like sync”
+    const interval = setInterval(async () => {
+      if (pollLock.current) return;
+
+      pollLock.current = true;
+      try {
+        await fetchNewMessages();
+      } finally {
+        pollLock.current = false;
+      }
+    }, 4000); // 4s polling interval
 
     return () => clearInterval(interval);
-  }, [channelId, isOnline, messages]);
+  }, [channelId, isOnline]);
 
   useEffect(() => {
     if (messages.length > 0) {

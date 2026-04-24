@@ -9,14 +9,26 @@
       "distribution": "internal",
       "android": {
         "buildType": "apk"
+      },
+      "env": {
+        "EXPO_PUBLIC_API_URL": "http://localhost:3000",
+        "EXPO_PUBLIC_AI_URL": "http://localhost:4000",
+        "EXPO_PUBLIC_ENV": "development"
       }
     },
+
     "preview": {
       "distribution": "internal",
       "android": {
         "buildType": "apk"
+      },
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://ypn.onrender.com",
+        "EXPO_PUBLIC_AI_URL": "https://ypn-1.onrender.com",
+        "EXPO_PUBLIC_ENV": "preview"
       }
     },
+
     "production": {
       "autoIncrement": true,
       "android": {
@@ -25,7 +37,8 @@
       },
       "env": {
         "EXPO_PUBLIC_API_URL": "https://ypn.onrender.com",
-        "EXPO_PUBLIC_AI_URL": "https://ypn-1.onrender.com"
+        "EXPO_PUBLIC_AI_URL": "https://ypn-1.onrender.com",
+        "EXPO_PUBLIC_ENV": "production"
       }
     }
   },

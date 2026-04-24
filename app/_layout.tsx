@@ -1,4 +1,3 @@
-// app/_layout.tsx
 import {
   Stack,
   usePathname,
@@ -30,34 +29,40 @@ export default function RootLayout() {
   const pathname = usePathname();
   const navState = useRootNavigationState();
 
-  const { checkAuth, isChecking, isAuthenticated, initAuth } = useAuth();
-  const [showExpired, setShowExpired] = useState(false);
+  const { checkAuth, isChecking, initAuth } = useAuth();
 
+  const [showExpired, setShowExpired] = useState(false);
   const didBoot = useRef(false);
 
-  useSessionHeartbeat(isAuthenticated);
+  useSessionHeartbeat(true);
 
+  // ─────────────────────────────────────────────
+  // INIT SYSTEMS (DB + AUTH)
+  // ─────────────────────────────────────────────
   useEffect(() => {
     initChatDB().catch(console.warn);
     initAuth().catch(console.warn);
   }, []);
 
+  // ─────────────────────────────────────────────
+  // BOOTSTRAP NAVIGATION (MAIN FIXED LOGIC)
+  // ─────────────────────────────────────────────
   useEffect(() => {
     if (!navState?.key) return;
-    if (isPublicRoute(pathname)) return;
     if (didBoot.current) return;
 
     didBoot.current = true;
 
     const timer = setTimeout(() => {
       boot();
-    }, 50);
+    }, 80);
 
     return () => clearTimeout(timer);
   }, [navState?.key]);
 
   const boot = async () => {
     try {
+      // 1. Check refresh token exists
       const refreshToken = await SecureStore.getItemAsync(REFRESH_TOKEN_KEY);
 
       if (!refreshToken) {
@@ -65,32 +70,47 @@ export default function RootLayout() {
         return;
       }
 
+      // 2. Validate auth session
       const valid = await checkAuth();
+
       if (!valid) {
         router.replace("/welcome");
         return;
       }
 
+      // 3. Get user profile
       const user = await getUserData();
 
+      if (!user) {
+        router.replace("/auth");
+        return;
+      }
+
+      // 4. Ensure profile setup is complete
       if (!user?.hasProfile) {
         router.replace("/auth/device");
         return;
       }
 
+      // 5. Restore last route if safe
       const lastRoute = await getLastRoute();
 
       if (lastRoute && !isPublicRoute(lastRoute)) {
         router.replace(lastRoute as any);
-      } else {
-        router.replace("/(tabs)/discord");
+        return;
       }
+
+      // 6. DEFAULT: always go to Discord (your main app screen)
+      router.replace("/(tabs)/discord");
     } catch (err) {
       console.warn("Boot error:", err);
       router.replace("/welcome");
     }
   };
 
+  // ─────────────────────────────────────────────
+  // SPLASH CONTROL
+  // ─────────────────────────────────────────────
   const shouldShowSplash =
     isChecking &&
     !isPublicRoute(pathname) &&

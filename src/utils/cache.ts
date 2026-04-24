@@ -1,4 +1,3 @@
-// src/utils/cache.ts
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Crypto from "expo-crypto";
 import { openDatabaseSync, type SQLiteDatabase } from "expo-sqlite";
@@ -211,6 +210,58 @@ export const clearSecureCache = async (): Promise<void> => {
   }
 };
 
+// ── MESSAGE WRITE BUFFER (FIX RACE CONDITIONS) ───────────────────────────────
+let messageBuffer: Record<string, CachedMessage[]> = {};
+let flushTimer: any = null;
+
+const flushMessageBuffer = async () => {
+  const entries = Object.entries(messageBuffer);
+  messageBuffer = {};
+
+  if (entries.length === 0) return;
+
+  for (const [channelId, messages] of entries) {
+    try {
+      await setSecureCache(
+        CACHE_KEYS.discordChannelMessages(channelId),
+        messages,
+        DEFAULT_TTL,
+      );
+    } catch (e) {
+      console.warn("[Cache] batch flush failed:", e);
+    }
+  }
+};
+
+export const queueCacheDiscordMessages = async (
+  channelId: string,
+  messages: CachedMessage[],
+): Promise<void> => {
+  if (!messageBuffer[channelId]) {
+    messageBuffer[channelId] = [];
+  }
+
+  // merge + deduplicate
+  const existing = messageBuffer[channelId];
+
+  const map = new Map(existing.map((m) => [m.id, m]));
+  for (const m of messages) {
+    map.set(m.id, m);
+  }
+
+  messageBuffer[channelId] = Array.from(map.values());
+
+  // debounce flush
+  if (flushTimer) clearTimeout(flushTimer);
+
+  flushTimer = setTimeout(() => {
+    flushMessageBuffer();
+  }, 800); // 0.8s batch window
+};
+
+// Alias old function name to new buffered one for compatibility
+export const cacheDiscordMessages = queueCacheDiscordMessages;
+
 // ── Specialized Helpers ───────────────────────────────────────────────────────
 
 /** Save User Profile (30 Days TTL) */
@@ -268,24 +319,6 @@ export const getCachedTeamYPNMessages = async (): Promise<
 > => {
   const data = await getSecureCache(CACHE_KEYS.TEAM_YPN_MESSAGES);
   return Array.isArray(data) ? data : null;
-};
-
-/** Save Discord Messages (24 Hours) */
-export const cacheDiscordMessages = async (
-  channelId: string,
-  messages: CachedMessage[],
-): Promise<void> => {
-  await setSecureCache(
-    CACHE_KEYS.discordChannelMessages(channelId),
-    messages,
-    DEFAULT_TTL,
-  );
-};
-
-export const getCachedDiscordMessages = async (
-  channelId: string,
-): Promise<CachedMessage[] | null> => {
-  return await getSecureCache(CACHE_KEYS.discordChannelMessages(channelId));
 };
 
 /** Save Discord Channels (7 Days) */
